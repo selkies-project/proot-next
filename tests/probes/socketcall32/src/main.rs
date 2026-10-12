@@ -19,6 +19,9 @@ fn main() {
         }
         let mut buf = [0u8; 32];
         let n = libc::read(fd, buf.as_mut_ptr() as *mut _, 32);
-        println!("socketcall connect {path}: ok, server said {:?}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
+        println!(
+            "socketcall connect {path}: ok, server said {:?}",
+            String::from_utf8_lossy(&buf[..n.max(0) as usize])
+        );
     }
 }

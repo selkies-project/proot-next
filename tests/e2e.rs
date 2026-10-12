@@ -182,7 +182,7 @@ fn arm32_probe_runs() {
         "-r",
         "/",
         "-b",
-        "/tmp:/pn-x",
+        "/usr:/pn-x",
         "-k",
         "4.4.0-fake",
         p.to_str().unwrap(),
@@ -282,7 +282,7 @@ fn programs_keep_their_name() {
         "/tmp:/pn-x",
         "/bin/bash",
         "-c",
-        "sleep 1 & cat /proc/$!/comm; wait",
+        "sleep 2 & p=$!; for i in 1 2 3 4 5 6 7 8 9 10; do c=$(cat /proc/$p/comm); [ \"$c\" = sleep ] && break; sleep 0.1; done; echo $c; wait",
     ]);
     assert_eq!(stdout(&o), "sleep");
 }

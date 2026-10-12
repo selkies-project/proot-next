@@ -275,7 +275,9 @@ pub fn from_bytes(bytes: &[u8]) -> std::result::Result<Vec<SockFilter>, String> 
         return Err("program longer than BPF_MAXINSNS".into());
     }
     Ok(bytes
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|c| SockFilter {
             code: u16::from_ne_bytes([c[0], c[1]]),
             jt: c[2],

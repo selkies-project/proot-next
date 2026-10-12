@@ -48,7 +48,7 @@ impl Fs {
             .collect();
         // Stable sort: longer guest prefix first, later command-line entries first on ties.
         bindings.reverse();
-        bindings.sort_by(|a, b| b.guest.len().cmp(&a.guest.len()));
+        bindings.sort_by_key(|b| std::cmp::Reverse(b.guest.len()));
         let identity = root == b"/" && bindings.iter().all(|b| b.host == b.guest);
         let cache_enabled = std::env::var_os("PROOT_NO_PATH_CACHE").is_none();
         Fs {
