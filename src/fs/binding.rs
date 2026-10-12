@@ -41,7 +41,7 @@ impl Fs {
             .bindings
             .iter()
             .map(|b| Binding {
-                host: trim_slashes(b.host.clone()),
+                host: resolve_host(&b.host),
                 guest: trim_slashes(b.guest.clone()),
                 read_only: b.read_only,
             })
@@ -201,6 +201,22 @@ impl Fs {
     }
 }
 
+/// The real host path behind a binding, symlinks resolved.
+///
+/// A binding names a host object, not a symlink to it: `/etc/resolv.conf`
+/// pointing into `/run/systemd/resolve/` must bind the resolver file itself,
+/// or the guest would follow the link inside its own rootfs and find nothing.
+/// Same as PRoot's `realpath` on every binding.  A path that does not exist
+/// (yet) is kept as given.
+fn resolve_host(host: &[u8]) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let trimmed = trim_slashes(host.to_vec());
+    match std::fs::canonicalize(std::ffi::OsStr::from_bytes(&trimmed)) {
+        Ok(real) => trim_slashes(real.as_os_str().as_bytes().to_vec()),
+        Err(_) => trimmed,
+    }
+}
+
 /// Thread-group id of a thread, read from `/proc`.
 fn tgid_of(tid: i32) -> Option<i32> {
     let s = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
@@ -307,6 +323,23 @@ mod tests {
         );
         let g = fs("/rootfs", &[("/", "/host")]);
         assert_eq!(g.substitute_guest_to_host(b"/host/etc"), b"/etc".to_vec());
+    }
+
+    #[test]
+    fn binding_host_side_is_the_real_path() {
+        let d = std::env::temp_dir().join(format!("pn-bind-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("real")).unwrap();
+        std::fs::write(d.join("real/conf"), "x").unwrap();
+        std::os::unix::fs::symlink("real/conf", d.join("link")).unwrap();
+        let link = d.join("link").as_os_str().as_encoded_bytes().to_vec();
+        let f = fs("/rootfs", &[(std::str::from_utf8(&link).unwrap(), "/etc/conf")]);
+        let real = std::fs::canonicalize(d.join("real/conf")).unwrap();
+        assert_eq!(
+            f.substitute_guest_to_host(b"/etc/conf"),
+            real.as_os_str().as_encoded_bytes().to_vec()
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
