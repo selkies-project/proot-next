@@ -1,0 +1,63 @@
+name: Build
+
+# The binary build the release workflows share: one static musl binary per
+# architecture, built on a runner of that architecture so its tests run for
+# real (ptrace cannot be exercised under emulation).  Left as `proot-*`
+# artifacts of the calling run, with a checksum file beside them.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build; the calling run's commit when empty
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  binary:
+    name: proot (${{ matrix.target.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - arch: x86_64
+            runner: ubuntu-latest
+            triple: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.target.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target.triple }}
+
+      - name: cargo build and test
+        # The native target: the tests need ptrace and seccomp on this very kernel
+        run: cargo build && cargo test
+
+      - name: Build the static binary
+        # .cargo/config.toml makes the musl target self-contained: rustup's CRT
+        # objects and rust-lld, no system cross toolchain
+        run: cargo build --release --target ${{ matrix.target.triple }}
+
+      - name: Name and checksum
+        run: |
+          mkdir -p out
+          cp target/${{ matrix.target.triple }}/release/proot out/proot-${{ matrix.target.arch }}
+          cd out && sha256sum proot-${{ matrix.target.arch }} > proot-${{ matrix.target.arch }}.sha256
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc1ad2bb3ba3d7ac3d # v6.0.0
+        with:
+          name: proot-${{ matrix.target.arch }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,16 @@
+---
+title: "Environment variables"
+description: "Tuning and diagnostics, read by both front ends."
+---
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PROOT_THREADS` | `4` | Supervisor threads answering notifications. Four is the sweet spot measured on a 32-core host; more threads wake colder cores and get slower. |
+| `PROOT_SPIN_US` | `200` | Microseconds a supervisor thread spins for the next request before sleeping. The budget adapts: a request found while spinning restores it, each wait that had to sleep halves it, so an idle application costs nothing. |
+| `PROOT_VERBOSE` | `0` | Same as `-v`; the only way to get diagnostics in bwrap mode, which has no such flag. `1` errors and fatal signals, `2` every translation, `3` every ptrace stop. |
+| `PROOT_EXEC_DEBUG` | unset | Print every rewritten `execve` with the loader and argv it was given. |
+| `PROOT_NO_PATH_CACHE` | unset | Disable the directory cache of the path walk, for an A/B comparison. |
+| `PROOT_BWRAP_KEEP` | unset | Keep the private root bwrap mode materializes instead of removing it on exit. |
+
+Diagnostics go to stderr. Under Steam, that is the `srt-logger` and ends up
+in `~/.local/share/Steam/logs/webhelper-linux.txt` and the game's log.

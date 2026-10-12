@@ -1,0 +1,11 @@
+[package]
+name = "socketcall32"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "32-bit client that connects to a unix socket through the legacy i386 socketcall multiplexer"
+
+[dependencies]
+libc = "0.2"
+
+[workspace]

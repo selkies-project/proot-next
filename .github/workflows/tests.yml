@@ -1,0 +1,81 @@
+name: Tests
+
+# The crate's tests, clippy and the smoke script on both architectures.  This
+# is where a build error surfaces; the release workflows build again from the
+# same sources.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo:
+    name: cargo test (${{ matrix.target.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.target.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy
+
+      - name: Native libraries for the probes
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libudev-dev
+
+      - name: Build the 32-bit probes
+        # i686 on x86_64, armv7 on aarch64: static musl through rust-lld, no cross toolchain
+        run: |
+          case "${{ matrix.target.arch }}" in
+            x86_64) tests/probes/build.sh socketcall32 ;;
+            aarch64) tests/probes/build.sh armtest ;;
+          esac
+
+      - name: Fetch a proot-apps rootfs
+        run: scripts/fetch-rootfs.sh ghcr.io/linuxserver/proot-apps:debian-trixie rootfs
+
+      - name: cargo build and test
+        # Unit tests plus tests/e2e.rs, which drives the built binary through
+        # the smoke script, a real rootfs, bwrap mode and the 32-bit probes
+        env:
+          PROOT_TEST_ROOTFS: ${{ github.workspace }}/rootfs
+        run: cargo build && cargo test
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  pre-commit:
+    name: pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: rustfmt
+
+      - name: pre-commit
+        # clippy builds the crate, which the cargo jobs do
+        env:
+          SKIP: clippy
+        run: |
+          python3 -m pip install "pre-commit==4.6.*"
+          pre-commit run --all-files --show-diff-on-failure

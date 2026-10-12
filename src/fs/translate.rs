@@ -1,0 +1,114 @@
+//! Translating a tracee's `(dirfd, path)` into a host path, and back.
+//!
+//! OWNER: fs subagent.
+
+use super::Fs;
+use super::canon::canonicalize;
+use crate::sys::{PATH_MAX, Result};
+
+/// Reads the guest path of a tracee's working directory.
+///
+/// # Arguments
+/// * `fs` - Guest filesystem view.
+/// * `pid` - Tracee thread id.
+pub fn guest_cwd(fs: &Fs, pid: u32) -> Result<Vec<u8>> {
+    let host = strip_deleted(read_link(format!("/proc/{pid}/cwd").as_bytes())?);
+    Ok(detranslate_path(fs, &host))
+}
+
+/// Drops the ` (deleted)` marker `/proc` appends to links of unlinked targets.
+fn strip_deleted(mut host: Vec<u8>) -> Vec<u8> {
+    const MARK: &[u8] = b" (deleted)";
+    if host.len() > MARK.len() + 1 && host.ends_with(MARK) {
+        host.truncate(host.len() - MARK.len());
+    }
+    host
+}
+
+/// Reads the guest path of a tracee's open directory descriptor.
+///
+/// # Arguments
+/// * `fs` - Guest filesystem view.
+/// * `pid` - Tracee thread id.
+/// * `fd` - Descriptor number in the tracee.
+pub fn guest_fd_path(fs: &Fs, pid: u32, fd: i32) -> Result<Vec<u8>> {
+    if fd < 0 {
+        return Err(libc::EBADF);
+    }
+    let host = strip_deleted(read_link(format!("/proc/{pid}/fd/{fd}").as_bytes())?);
+    if host.first() != Some(&b'/') {
+        // Pipes, sockets and anonymous inodes read like `pipe:[123]`.
+        return Err(libc::ENOTDIR);
+    }
+    Ok(detranslate_path(fs, &host))
+}
+
+/// Translates a path as seen by a tracee into the host path to operate on.
+///
+/// Relative paths are resolved against `dirfd` (`AT_FDCWD` means the tracee's
+/// cwd) by reading the descriptor's own path from `/proc`, so the whole path
+/// is canonicalized inside the guest namespace before substitution.
+///
+/// # Arguments
+/// * `fs` - Guest filesystem view.
+/// * `pid` - Tracee thread id.
+/// * `dirfd` - Base descriptor for relative paths, or `libc::AT_FDCWD`.
+/// * `path` - Path bytes as read from the tracee, without NUL.
+/// * `deref_final` - Follow a symlink in the final component.
+///
+/// # Returns
+/// An absolute host path.
+///
+/// # Errors
+/// Errno from the walk, or `EBADF` when `dirfd` cannot be resolved.
+pub fn translate_path(fs: &Fs, pid: u32, dirfd: i32, path: &[u8], deref_final: bool) -> Result<Vec<u8>> {
+    let guest = if path.first() == Some(&b'/') {
+        path.to_vec()
+    } else {
+        let mut base = if dirfd == libc::AT_FDCWD {
+            guest_cwd(fs, pid)?
+        } else {
+            guest_fd_path(fs, pid, dirfd)?
+        };
+        if !path.is_empty() {
+            if base != b"/" {
+                base.push(b'/');
+            }
+            base.extend_from_slice(path);
+        }
+        base
+    };
+    let canon = canonicalize(fs, pid, &guest, deref_final)?;
+    if canon.len() >= PATH_MAX {
+        return Err(libc::ENAMETOOLONG);
+    }
+    Ok(fs.substitute_guest_to_host(&canon))
+}
+
+/// Translates a host path back into the guest's view (for `readlink` on
+/// `/proc` magic links and `getcwd`).
+///
+/// # Arguments
+/// * `fs` - Guest filesystem view.
+/// * `host` - Absolute host path.
+///
+/// # Returns
+/// The guest path; a host path outside every binding is returned unchanged.
+pub fn detranslate_path(fs: &Fs, host: &[u8]) -> Vec<u8> {
+    fs.substitute_host_to_guest(host).unwrap_or_else(|| host.to_vec())
+}
+
+/// `readlink(2)` on a host path, as bytes.
+///
+/// # Arguments
+/// * `host` - Host path to read.
+pub fn read_link(host: &[u8]) -> Result<Vec<u8>> {
+    let c = std::ffi::CString::new(host.to_vec()).map_err(|_| libc::EINVAL)?;
+    let mut buf = vec![0u8; PATH_MAX];
+    let n = unsafe { libc::readlink(c.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if n < 0 {
+        return Err(crate::sys::errno());
+    }
+    buf.truncate(n as usize);
+    Ok(buf)
+}

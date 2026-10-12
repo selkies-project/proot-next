@@ -1,0 +1,36 @@
+---
+title: "Troubleshooting"
+description: "What the common failures mean."
+---
+
+### `ptrace(PTRACE_SEIZE) refused: this process is already traced`
+
+You are starting proot-next from inside a shell that already runs under
+proot-next, or under a debugger. Nested proot is not supported yet. Open a
+fresh terminal.
+
+### `seccomp user notification is not available on this kernel or is filtered`
+
+The kernel is older than 5.0, or a seccomp policy outside Docker's default
+blocks the listener flag of the `seccomp` syscall.
+
+### A program sits there doing nothing
+
+Run with `PROOT_VERBOSE=2` (or `-v 2`) and look at the last translation before
+silence. A request that is never answered is a bug here; report it with those
+lines.
+
+### Something under Steam restarts every ten seconds
+
+The Steam client restarts its browser helper on a ten-second deadline. Set
+`PROOT_VERBOSE=1` in Steam's environment; fatal signals are reported with the
+module and offset they happened at, in
+`~/.local/share/Steam/logs/webhelper-linux.txt`.
+
+### The supervisor is at 100% CPU
+
+It should never be. Capture the per-thread state and report it:
+
+```bash
+for t in /proc/PID/task/*; do echo "$(cat $t/comm) $(cat $t/wchan)"; done
+```

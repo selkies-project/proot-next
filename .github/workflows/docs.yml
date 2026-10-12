@@ -1,0 +1,83 @@
+name: Docs
+
+# One Pages site: the fumadocs usage documentation at the root, the rustdoc
+# code reference under /rustdoc/.  Deploys through the Pages API, so the
+# repository's Pages source has to be set to "GitHub Actions".
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+
+      - name: Build the usage documentation
+        working-directory: docs
+        env:
+          NEXT_PUBLIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          NEXT_PUBLIC_GITHUB_USER: ${{ github.repository_owner }}
+          NEXT_PUBLIC_GITHUB_REPO: ${{ github.event.repository.name }}
+        # No lockfile is kept; the one transitive pin the build needs is an
+        # override in package.json.
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Build the code reference
+        # rustdoc's own index lands under the crate name; a redirect fronts it
+        run: |
+          cargo doc --no-deps
+          rm -f target/doc/.lock
+          mkdir -p docs/out/rustdoc
+          cp -r target/doc/. docs/out/rustdoc/
+          printf '<!DOCTYPE html>\n<meta http-equiv="refresh" content="0; url=proot/index.html">\n<a href="proot/index.html">Redirecting...</a>\n' > docs/out/rustdoc/index.html
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs/out
+          retention-days: 1
+
+  publish:
+    name: Publish documentation
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    if: ${{ github.ref == 'refs/heads/main' }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -1,0 +1,58 @@
+---
+title: "bwrap mode"
+description: "Stand in for bubblewrap under Steam's pressure-vessel without user namespaces."
+---
+
+The same binary speaks bubblewrap's command line when it is invoked through a
+name ending in `bwrap`, busybox style. A symlink is the whole setup:
+
+```bash
+ln -s proot bwrap
+./bwrap --version
+# bubblewrap 0.9.0 (proot-next)
+```
+
+Steam's pressure-vessel tries its bundled bwrap first, which fails without
+user namespaces, then uses `$BWRAP` or a `bwrap` on `PATH`. Point either at
+the symlink:
+
+```bash
+export BWRAP=$HOME/.local/bin/bwrap
+```
+
+Steam's own `steam-runtime-check-requirements` probes the same variable with
+`--bind / / true`, which is why the start-up check that insists on user
+namespaces is satisfied too.
+
+## What the options become
+
+There are no namespaces, so bwrap's description of a container is materialized
+as a fresh private root directory under `$XDG_RUNTIME_DIR` and a set of
+bindings:
+
+| bwrap | proot-next |
+|---|---|
+| `--bind`, `--dev-bind`, `--ro-bind`, the `-try` variants, `--bind-fd`, `--ro-bind-fd` | Bindings. Read-only ones refuse writes with `EROFS`, including `mkdir`, `unlink`, `rename` and `chmod`. |
+| `--remount-ro` | Marks the matching binding read-only. |
+| `--proc`, `--dev` | Bindings of the host's `/proc` and `/dev`. |
+| `--dir`, `--tmpfs`, `--mqueue`, `--symlink`, `--file`, `--bind-data`, `--ro-bind-data`, `--perms`, `--chmod` | Created in the private root. `--size` is ignored. |
+| `--chdir`, `--setenv`, `--unsetenv`, `--clearenv`, `--argv0`, `--args` | As in bwrap. |
+| `--seccomp`, `--add-seccomp-fd` | The program is installed in the child after proot-next's own filter. `ERRNO` outranks notification, so a caller's denials still apply. |
+| `--info-fd`, `--json-status-fd` | `{"child-pid": N}` after the fork; the status fd also gets `{"exit-code": N}`. |
+| `--die-with-parent` | Already the behavior. |
+| `--new-session` | `setsid()` in the child. |
+| `--hostname` | Reported by `uname(2)`. |
+| `--unshare-*`, `--share-net`, `--uid`, `--gid`, `--cap-*`, `--userns*`, `--pidns`, `--lock-file`, `--sync-fd`, `--block-fd`, `--as-pid-1` | Accepted and ignored. |
+| `--overlay-*` | Refused. |
+
+The private root is removed when the command exits. `PROOT_BWRAP_KEEP=1`
+keeps it for inspection.
+
+## Steam
+
+With `BWRAP` set, the Steam client's own browser helper, every Steam Linux
+Runtime container and every Proton launch run through proot-next. The things
+that made the helper impossible under PRoot are handled: a supervisor must not
+look like a debugger, so `TracerPid` is hidden and breakpoints are resumed; and
+`/proc/<pid>/fd/N` links re-open the object they name, which Chromium's shared
+memory depends on.

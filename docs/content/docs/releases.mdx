@@ -1,0 +1,20 @@
+---
+title: "Releases"
+description: "How binaries are published from this repository."
+---
+
+Two channels, both static binaries for x86_64 and aarch64 with a checksum
+file next to each.
+
+- **Pre-releases.** Every push to `main` builds on both architectures and
+  publishes a pre-release named by the commit's short hash, with the commit
+  message as its body. Images that want a specific build pin it.
+- **Releases.** A `MAJOR.MINOR.PATCH` tag on `main` builds and publishes a
+  release. Its body is `release-notes/<tag>.md`, written together with the
+  change, and `Cargo.toml` must carry the same version. A `-rc1` style tag is
+  published as a pre-release using the notes of the release it leads to. The
+  workflow can also be run by hand to name a tag and decide the "Latest"
+  badge.
+
+Each architecture is built on a runner of that architecture, so the tests run
+against a real kernel. ptrace cannot be exercised under emulation.

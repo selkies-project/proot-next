@@ -1,0 +1,72 @@
+---
+title: "Container images"
+description: "How proot-apps and the selkies baseimages ship and wire the binary."
+---
+
+This is the layout the linuxserver images move to. One binary, one symlink,
+no shim.
+
+## proot-apps
+
+proot-apps ships `proot` in its release tarball and installs it to
+`~/.local/bin`. The tarball's `proot` becomes the static proot-next binary for
+the architecture, taken from this repository's releases. The `proot-apps`
+script needs no change: every call it makes is `proot -R <image> /entrypoint`
+with `-b` bindings, and that is the supported surface.
+
+What goes away from the images themselves: nothing. The `-R`, `-b`, `-w`
+behavior matches PRoot's, including a rootfs that lives under the bound
+`$HOME`.
+
+## docker-baseimage-selkies
+
+The image ships the proot-apps release into `/proot-apps/`, `init-selkies-config`
+copies `/proot-apps/*` into `~/.local/bin` at start and sets `BWRAP` in the
+container environment, and `/steam.sh` writes the same default into the
+`/usr/bin/steam` launcher it generates. The layout that goes with proot-next:
+
+<Steps>
+<Step>
+**Ship one binary.** `/proot-apps/proot` is proot-next, from the proot-apps
+tarball or straight from this repository's releases. Nothing else is
+downloaded for bwrap.
+</Step>
+<Step>
+**Add the bwrap name.** `ln -s proot /proot-apps/bwrap`. The copy step in
+`init-selkies-config` carries it into `~/.local/bin`; use `cp -a` (or `cp -P`)
+so it stays a symlink rather than a second copy of the binary.
+</Step>
+<Step>
+**Point `BWRAP` at it.** `BWRAP=$HOME/.local/bin/bwrap` in
+`init-selkies-config`, and the same default in `/steam.sh`'s generated
+launcher. pressure-vessel also finds a `bwrap` on `PATH` by itself, so the
+variable is belt and braces, but it makes the fallback deterministic.
+</Step>
+<Step>
+**Remove fakechroot.** `libfakechroot:amd64` and `:i386` in `/steam.sh` are no
+longer used by anything.
+</Step>
+<Step>
+**Pin by release.** The pre-release named by a commit's short hash lets an
+image pin a build between tags; a tag pins a release. Either way the download
+is `proot-x86_64` or `proot-aarch64` plus its `.sha256`.
+</Step>
+</Steps>
+
+## Environment the images already provide
+
+Nothing new is required. Docker's default seccomp profile allows the seccomp
+listener, `ADDFD` and `process_vm_readv`, and ptrace is allowed on kernels
+since 4.8. The docker-default AppArmor profile is fine. A kernel of 5.14 or
+newer is needed for the single-step descriptor injection; older kernels fall
+back to a two-step injection automatically.
+
+## Checking a build
+
+Inside a running image, as the application user:
+
+```bash
+~/.local/bin/proot --version
+~/.local/bin/bwrap --version          # bubblewrap 0.9.0 (proot-next)
+~/.local/bin/bwrap --bind / / true    # the probe Steam runs
+```

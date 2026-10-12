@@ -1,0 +1,40 @@
+---
+title: "Command line"
+description: "The PRoot options proot-next accepts, and what differs."
+---
+
+The front end accepts the subset of PRoot's command line that proot-apps and
+most users rely on.
+
+| Option | Meaning |
+|---|---|
+| `-r path`, `--rootfs=path` | Use `path` as the guest root. Default `/`. |
+| `-R path` | `-r path` plus the recommended bindings: `/dev`, `/proc`, `/sys`, `/tmp`, `/run`, `/etc/{hosts,host.conf,hosts.equiv,mtab,netgroup,networks,passwd,group,nsswitch.conf,resolv.conf,localtime}`, the system D-Bus socket, and `$HOME`. Each only if it exists on the host. |
+| `-S path` | `-R` with the shorter PRoot list, plus `-0`. |
+| `-b host[:guest]`, `--bind`, `-m`, `--mount` | Make a host path visible at a guest path. Files work as well as directories. Later bindings win over earlier ones on equal prefixes; longer prefixes win over shorter. |
+| `-w path`, `--cwd`, `--pwd` | Initial working directory, as a guest path. Defaults to the host's current directory when that is visible in the guest, else `/`. |
+| `-k release`, `--kernel-release` | Report `release` from `uname(2)`. |
+| `--kill-on-exit` | Accepted for compatibility. Tracees always die with the supervisor: once it is gone their translated syscalls would fail, so an orphan is never useful. |
+| `-v n`, `--verbose` | Diagnostics on stderr. `1` reports errors from the ptrace tier and fatal signals, `2` every translation, `3` every ptrace stop. |
+| `-0`, `--root-id` | Fake root: `getuid` and friends return 0, `setuid`/`setgroups`/`capset` succeed, `chown`/`mknod` refusals read as success, your own files stat as root's, and `/proc/<pid>/status` says root. What `apt-get install` inside a rootfs needs. |
+| `-l`, `--link2symlink`, `-i`, `-p` | Accepted and ignored, with a note on stderr. |
+| `-q`, `--qemu` | Refused. |
+
+With no command, `$SHELL` runs. A bare command name is searched through `PATH`
+as seen from inside the guest, and `argv[0]` stays as typed, like a shell.
+
+## Behavior worth knowing
+
+- **Bindings are prefixes.** A path under a binding's guest prefix maps to the
+  same path under its host prefix. Symlinks inside the rootfs are followed
+  inside the guest namespace, so a link to `/usr/lib` lands in the rootfs's
+  `/usr/lib`, never the host's.
+- **The rootfs may live under a bound directory.** proot-apps keeps images
+  under `$HOME`, which `-R` binds; the longest prefix wins, so paths inside
+  the rootfs still translate to the rootfs.
+- **Mount points are not glued.** A binding whose guest path does not exist in
+  the rootfs works for every path under it, but `ls` of its parent will not
+  list it.
+- **`/proc/self/exe` is truthful.** Dynamic programs are started through their
+  own loader, so the kernel's idea of the executable is the loader; the
+  supervisor answers `readlink` with the program the tracee asked to run.

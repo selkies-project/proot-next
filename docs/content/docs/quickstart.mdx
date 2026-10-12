@@ -1,0 +1,58 @@
+---
+title: "Quickstart"
+description: "Download a static binary and run a rootfs or a proot-apps application."
+---
+
+## Install
+
+Static binaries for x86_64 and aarch64 are attached to every release. This
+installs the latest one for your architecture into `~/.local/bin`, with the
+`bwrap` name next to it:
+
+```bash
+mkdir -p ~/.local/bin && cd ~/.local/bin \
+  && curl -fsSL -o proot "https://github.com/selkies-project/proot-next/releases/latest/download/proot-$(uname -m)" \
+  && chmod +x proot && ln -sf proot bwrap && ./proot --version
+```
+
+Nothing else is needed. The binary is statically linked and has no runtime
+dependencies.
+
+## Run a root filesystem
+
+Any extracted container image is a root filesystem. The proot-apps base
+images are single-layer and extract with one `tar`:
+
+```bash
+./proot -R ./rootfs /bin/sh
+```
+
+`-R` is PRoot's alias for "use this root and bind the usual host paths into
+it": `/dev`, `/proc`, `/sys`, `/tmp`, `/run`, the resolver and account files,
+and your home directory. `-r` is the bare root with no bindings; add your own
+with `-b host:guest`.
+
+```bash
+./proot -r ./rootfs -b /tmp -b /home/me:/home/me -w / /bin/sh
+```
+
+## Use it with proot-apps
+
+proot-apps calls `~/.local/bin/proot` with exactly that shape, so dropping the
+binary in place of the one it shipped is the whole migration:
+
+```bash
+cp proot ~/.local/bin/proot
+proot-apps run ghcr.io/linuxserver/proot-apps:firefox
+```
+
+The command line it uses, `-R <image> /entrypoint`, is unchanged.
+
+## Verify
+
+`scripts/smoke.sh` in the repository runs a short functional pass. With a
+rootfs it also starts a shell and a `#!` script inside it:
+
+```bash
+scripts/smoke.sh ./proot ./rootfs
+```

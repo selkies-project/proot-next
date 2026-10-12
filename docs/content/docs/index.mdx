@@ -1,0 +1,53 @@
+---
+title: "Overview"
+description: "What proot-next is, what it replaces, and how it differs from PRoot."
+---
+
+proot-next runs a command inside a guest root filesystem, with bind mounts,
+without any privilege: no root, no user namespaces, no FUSE. It is the engine
+behind [proot-apps](https://github.com/linuxserver/proot-apps), which runs
+desktop applications from container images inside a container, and it stands
+in for bubblewrap when Steam's pressure-vessel runs in a container that has no
+user namespaces.
+
+It is a reimplementation of [PRoot](https://proot-me.github.io/) in Rust with
+one architectural change. PRoot stops every traced syscall twice with ptrace.
+proot-next routes the path syscalls through **seccomp user notification**: a
+small pool of supervisor threads reads the path out of the tracee, translates
+it, performs the real syscall itself and hands the result back, injecting a
+descriptor where one was asked for. Only the syscalls that must change the
+tracee's own state in place take a ptrace stop: `execve`, `chdir`, unix-socket
+`bind` and `connect` (including the i386 `socketcall` form), `inotify_add_watch`,
+and `O_PATH` opens. Everything else
+runs untraced at native speed.
+
+## What that buys
+
+- Syscalls with no path, such as `close`, `connect` to the network, `prctl`
+  and the socket family, cost nothing. PRoot traced several of them.
+- Results that must be written back, such as `readlink`, `getcwd` and `uname`,
+  take one round trip instead of two stops.
+- Multithreaded programs are served concurrently. A Chromium-based browser at
+  start-up is the case that motivated this.
+- A supervisor idles when the application idles. Its CPU use under a browser
+  playing video is indistinguishable from PRoot's.
+
+## Fake root
+
+`-0` (or `-S`, which adds it to the recommended bindings) makes programs
+inside the guest believe they are root: ids read as 0, `chown` and `mknod`
+succeed, your own files show as root's, and a program that drops privileges
+to another user sees the drop take. That is what `apt-get install`, `dpkg`
+and most installers need to run inside a rootfs as an ordinary user.
+
+## What it is not
+
+It is not a security boundary, and neither was PRoot. A program that goes
+looking for the host can find it. Use it to run software that needs its own
+root filesystem, not to contain software you do not trust.
+
+## Hosts and tracees
+
+x86_64 hosts run x86_64 and i386 programs. aarch64 hosts run aarch64 and
+32-bit ARM programs.
+Static binaries are published for both, with no runtime dependencies.

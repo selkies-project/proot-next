@@ -1,0 +1,71 @@
+---
+title: "Building"
+description: "Building from source, the static binaries, the tests and the documentation."
+---
+
+## Toolchain
+
+A stable Rust toolchain, edition 2024, Rust 1.89 or newer. The only crate
+dependency is `libc`, and there are no native libraries to install.
+
+```bash
+rustup component add rustfmt clippy
+cargo build --release          # target/release/proot, dynamically linked to the host glibc
+```
+
+## Static binaries
+
+Releases ship static musl binaries. `.cargo/config.toml` configures both
+targets to link self-contained with Rust's own linker, using the C runtime
+objects rustup ships, so no cross toolchain is needed on either side:
+
+```bash
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
+```
+
+The aarch64 binary cross-builds on an x86_64 machine the same way. It cannot
+be run there: ptrace does not work under emulation, so the aarch64 tests run
+on aarch64 hardware, which is also what CI does.
+
+## Tests
+
+```bash
+tests/probes/build.sh                           # 32-bit probes, static musl
+scripts/fetch-rootfs.sh ghcr.io/linuxserver/proot-apps:debian-trixie rootfs
+PROOT_TEST_ROOTFS=$PWD/rootfs cargo test        # unit tests + tests/e2e.rs
+cargo clippy --all-targets -- -D warnings
+pre-commit run --all-files                      # rustfmt, clippy, codespell
+```
+
+`tests/e2e.rs` drives the built binary: the smoke script, a real rootfs,
+bwrap mode, debugger transparency, `/proc` link semantics, unix sockets
+through bindings, the i386 `socketcall` client and the 32-bit ARM probe.
+Each case is a failure first seen in a real application. Cases whose rootfs
+or probe is absent skip with a message. A change to translation, exec or the tracer
+is also run against a desktop application through proot-apps and, when it
+touches bwrap mode, against Steam in a selkies container.
+
+### Diagnostics while developing
+
+| Variable | Effect |
+|---|---|
+| `PROOT_VERBOSE=1..3` | Errors and fatal signals with the module and address they happened at, every translation, every ptrace stop. |
+| `PROOT_EXEC_DEBUG=1` | Each rewritten `execve` with the loader and argv it was given. |
+| `PROOT_BWRAP_KEEP=1` | Keep the private root bwrap mode materializes. |
+
+## Documentation
+
+The usage site is a [fumadocs](https://fumadocs.dev) application in `docs/`,
+the code reference is rustdoc, and the docs workflow publishes both to one
+GitHub Pages site. Locally:
+
+```bash
+cd docs && npm install && npm run dev   # http://localhost:3000
+npm run build                           # static export in docs/out
+cargo doc --no-deps --open              # code reference
+```
+
+No lockfile is kept. The one transitive dependency that has to stay put,
+`mdast-util-to-markdown`, is pinned through `overrides` in `package.json`.

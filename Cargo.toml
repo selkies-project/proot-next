@@ -1,0 +1,25 @@
+[package]
+name = "proot-next"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+repository = "https://github.com/selkies-project/proot-next"
+homepage = "https://selkies-project.github.io/proot-next/"
+readme = "README.md"
+keywords = ["proot", "chroot", "bwrap", "seccomp", "ptrace"]
+categories = ["virtualization", "command-line-utilities"]
+description = "PRoot reimplemented in Rust: chroot, bind mounts and a bwrap front end without privileges, using seccomp user notification plus a thin ptrace layer."
+license = "MPL-2.0"
+
+[[bin]]
+name = "proot"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = 1

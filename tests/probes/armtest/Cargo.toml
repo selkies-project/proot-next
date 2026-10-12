@@ -1,0 +1,11 @@
+[package]
+name = "armtest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "32-bit ARM probe exercising the syscalls proot-next translates for AArch32 tracees"
+
+[dependencies]
+libc = "0.2"
+
+[workspace]

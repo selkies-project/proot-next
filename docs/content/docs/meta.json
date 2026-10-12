@@ -1,0 +1,18 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "quickstart",
+    "---Using it---",
+    "cli",
+    "bwrap",
+    "environment",
+    "---Shipping it---",
+    "baseimage",
+    "building",
+    "releases",
+    "---Reference---",
+    "how-it-works",
+    "troubleshooting"
+  ]
+}

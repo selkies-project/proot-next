@@ -1,0 +1,7 @@
+# Copied into each probe crate's .cargo/config.toml by build.sh: self-contained
+# static linking, no system cross toolchain.
+[target.i686-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "linker=rust-lld"]
+
+[target.armv7-unknown-linux-musleabihf]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "linker=rust-lld"]
