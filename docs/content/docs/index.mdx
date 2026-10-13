@@ -19,7 +19,9 @@ descriptor where one was asked for. Only the syscalls that must change the
 tracee's own state in place take a ptrace stop: `execve`, `chdir`, unix-socket
 `bind` and `connect` (including the i386 `socketcall` form), `inotify_add_watch`,
 and `O_PATH` opens. Everything else
-runs untraced at native speed.
+runs untraced at native speed. Where a container profile filters ptrace out,
+those few syscalls are served through notifications as well, see
+[how it works](/docs/how-it-works).
 
 ## What that buys
 

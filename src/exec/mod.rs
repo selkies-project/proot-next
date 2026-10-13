@@ -14,6 +14,9 @@
 //!
 //! Set `PROOT_EXEC_DEBUG=1` to print every rewritten exec on stderr.
 //!
+//! Without ptrace the same plan is carried out by a trampoline inside the
+//! tracee instead of a register rewrite, see [`shim`].
+//!
 //! Known gaps: at the kernel level `/proc/<pid>/exe` and `AT_EXECFN` name the
 //! loader; the supervisor answers `readlink` on `/proc/self/exe` from the
 //! record kept here, but a program reading `AT_EXECFN` from its auxv sees the
@@ -25,6 +28,7 @@
 
 pub mod elf;
 pub mod shebang;
+pub mod shim;
 
 use crate::fs::translate::{detranslate_path, translate_path};
 use crate::state::Ctx;
@@ -39,6 +43,142 @@ use std::sync::Mutex;
 const MAX_ARGV: usize = 1 << 18;
 /// Maximum nesting of `#!` interpreters (the kernel allows 4).
 const MAX_SHEBANG_DEPTH: usize = 4;
+
+/// What the kernel should load in place of what the tracee asked for.
+#[derive(Clone, Debug)]
+pub struct ExecPlan {
+    /// Host path to exec.
+    pub exec_path: Vec<u8>,
+    /// The complete argument vector to exec it with.
+    pub argv: Vec<Vec<u8>>,
+    /// Entries at the front of `argv` that did not come from the caller's
+    /// `argv[1..]`; the rest is the caller's tail, unchanged.
+    pub prefix: usize,
+    /// Whether `exec_path` or `argv` differ from what the tracee asked.
+    pub changed: bool,
+    /// Canonical guest path of the program (after `#!` expansion).
+    pub guest_prog: Vec<u8>,
+    /// Host path of the program (after `#!` expansion).
+    pub host_prog: Vec<u8>,
+    /// Whether the program's format was recognized (ELF or `#!`).
+    pub understood: bool,
+}
+
+/// Works out what to exec for a program the tracee named.
+///
+/// `#!` scripts are expanded into interpreter plus argument, repeatedly,
+/// until an ELF is reached; a dynamically linked ELF is re-targeted at the
+/// host copy of its loader with the program's guest path as the loader's
+/// argument.
+///
+/// # Arguments
+/// * `ctx` - Shared supervisor state.
+/// * `pid` - Tracee thread id.
+/// * `dirfd` - Base of a relative `user_path`.
+/// * `user_path` - Program path as the tracee passed it.
+/// * `argv` - The tracee's argument vector (empty when it passed NULL).
+/// * `deref_final` - Follow a symlink in the final component of the program path.
+///
+/// # Errors
+/// `ELOOP` for too many nested `#!`, otherwise the errno of translating a
+/// path.  A missing or unreadable program is not an error here: the plan
+/// names its translated path and `understood` is false.
+pub fn plan(
+    ctx: &Ctx,
+    pid: u32,
+    dirfd: i32,
+    user_path: &[u8],
+    mut argv: Vec<Vec<u8>>,
+    deref_final: bool,
+) -> Result<ExecPlan> {
+    let argv_was_null = argv.is_empty();
+    if argv.is_empty() {
+        // The kernel runs a program with an empty argv as if argv[0] were "".
+        argv.push(Vec::new());
+    }
+    let tail = argv.len() - 1;
+
+    // 1. Program path, then #! expansion.
+    let mut host_prog = translate_path(&ctx.fs, pid, dirfd, user_path, deref_final)?;
+    let mut argv0_user = user_path.to_vec();
+    let mut kind = elf::classify_file(&host_prog);
+    let mut depth = 0;
+    while let Ok(FileKind::Shebang(line)) = &kind {
+        if depth == MAX_SHEBANG_DEPTH {
+            return Err(libc::ELOOP);
+        }
+        depth += 1;
+        let sb = shebang::parse(line).ok_or(libc::ENOEXEC)?;
+        // argv becomes: interp [arg] script argv[1..]
+        let mut new_argv = vec![sb.interp.clone()];
+        if let Some(a) = &sb.arg {
+            new_argv.push(a.clone());
+        }
+        new_argv.push(argv0_user.clone());
+        new_argv.extend(argv.drain(1..));
+        argv = new_argv;
+        argv0_user = sb.interp.clone();
+        host_prog = translate_path(&ctx.fs, pid, libc::AT_FDCWD, &sb.interp, true)?;
+        kind = elf::classify_file(&host_prog);
+    }
+
+    // 2. Decide what the kernel should load.
+    let guest_prog = detranslate_path(&ctx.fs, &host_prog);
+    let mut changed = depth > 0 || argv_was_null;
+    let understood = matches!(kind, Ok(FileKind::Elf64(_)) | Ok(FileKind::Elf32(_)));
+    let (exec_path, new_argv): (Vec<u8>, Vec<Vec<u8>>) = match kind {
+        Ok(FileKind::Elf64(info)) | Ok(FileKind::Elf32(info)) => match info.interp {
+            Some(interp) if !ctx.fs.identity => {
+                let host_interp = translate_path(&ctx.fs, pid, libc::AT_FDCWD, &interp, true)?;
+                let mut v = vec![host_interp.clone()];
+                let argv0_supported = loader_supports_argv0(&host_interp);
+                if argv0_supported {
+                    v.push(b"--argv0".to_vec());
+                    v.push(argv[0].clone());
+                }
+                // The loader takes the program's `$ORIGIN` from the path it is
+                // given, where the kernel would take it from the resolved
+                // executable, so the canonical path goes to a loader that
+                // takes argv[0] separately.  A loader without --argv0 uses the
+                // path as argv[0], on which multi-call binaries (busybox)
+                // dispatch, so it gets the name as typed, unless that name is
+                // dirfd-relative and meaningless after the rewrite.
+                v.push(
+                    if !argv0_supported && (dirfd == libc::AT_FDCWD || argv0_user.first() == Some(&b'/')) {
+                        argv0_user.clone()
+                    } else {
+                        guest_prog.clone()
+                    },
+                );
+                v.extend(argv[1..].iter().cloned());
+                changed = true;
+                // Exec the loader through an alias named as the tracee named the
+                // program, which is where the kernel takes comm and AT_EXECFN from
+                // (a script keeps its own name, not its interpreter's).
+                let exec_as = loader_alias(&host_interp, exec_name(user_path, &guest_prog))
+                    .unwrap_or_else(|| host_interp.clone());
+                v[0] = exec_as.clone();
+                (exec_as, v)
+            }
+            // Static, or identity translation where the interpreter resolves as is.
+            _ => (host_prog.clone(), argv),
+        },
+        // Not something we understand (or unreadable): let the kernel decide.
+        _ => (host_prog.clone(), argv),
+    };
+    if exec_path != user_path {
+        changed = true;
+    }
+    Ok(ExecPlan {
+        prefix: new_argv.len() - tail,
+        exec_path,
+        argv: new_argv,
+        changed,
+        guest_prog,
+        host_prog,
+        understood,
+    })
+}
 
 /// Rewrites an `execve`/`execveat` so the kernel loads host-side files only.
 ///
@@ -64,97 +204,16 @@ pub fn handle_execve(ctx: &Ctx, regs: &mut Regs) -> Result<()> {
     let deref_final = at_flags & libc::AT_SYMLINK_NOFOLLOW == 0;
 
     let user_path = ctx.mem.read_cstr(pid, regs.arg(path_idx))?;
-    let argv_ptr = regs.arg(argv_idx);
-    let mut argv: Vec<Vec<u8>> = if argv_ptr == 0 {
-        Vec::new()
-    } else {
-        let ptrs = ctx.mem.read_ptr_array_sized(pid, argv_ptr, MAX_ARGV, ptr_size)?;
-        ptrs.iter()
-            .map(|&p| ctx.mem.read_cstr(pid, p))
-            .collect::<Result<_>>()?
-    };
-    if argv.is_empty() {
-        // The kernel runs a program with an empty argv as if argv[0] were "".
-        argv.push(Vec::new());
-    }
-
-    // 1. Program path, then #! expansion.
-    let mut host_prog = translate_path(&ctx.fs, pid, dirfd, &user_path, deref_final)?;
-    let mut argv0_user = user_path.clone();
-    let mut kind = elf::classify_file(&host_prog);
-    let mut depth = 0;
-    while let Ok(FileKind::Shebang(line)) = &kind {
-        if depth == MAX_SHEBANG_DEPTH {
-            return Err(libc::ELOOP);
-        }
-        depth += 1;
-        let sb = shebang::parse(line).ok_or(libc::ENOEXEC)?;
-        // argv becomes: interp [arg] script argv[1..]
-        let mut new_argv = vec![sb.interp.clone()];
-        if let Some(a) = &sb.arg {
-            new_argv.push(a.clone());
-        }
-        new_argv.push(argv0_user.clone());
-        new_argv.extend(argv.drain(1..));
-        argv = new_argv;
-        argv0_user = sb.interp.clone();
-        host_prog = translate_path(&ctx.fs, pid, libc::AT_FDCWD, &sb.interp, true)?;
-        kind = elf::classify_file(&host_prog);
-    }
-
-    // 2. Decide what the kernel should load.
-    let guest_prog = detranslate_path(&ctx.fs, &host_prog);
-    let mut argv_changed = depth > 0 || argv_ptr == 0;
-    let (exec_path, new_argv): (Vec<u8>, Vec<Vec<u8>>) = match kind {
-        Ok(FileKind::Elf64(info)) | Ok(FileKind::Elf32(info)) => match info.interp {
-            Some(interp) if !ctx.fs.identity => {
-                let host_interp = translate_path(&ctx.fs, pid, libc::AT_FDCWD, &interp, true)?;
-                let mut v = vec![host_interp.clone()];
-                if loader_supports_argv0(&host_interp) {
-                    v.push(b"--argv0".to_vec());
-                    v.push(argv[0].clone());
-                }
-                // The program is named as the tracee named it, not canonicalized:
-                // a loader without --argv0 uses this as argv[0], and multi-call
-                // binaries (busybox) dispatch on it.  The loader opens it through
-                // our translation anyway.  A dirfd-relative execveat path has no
-                // meaning after the rewrite, so that case keeps the canonical path.
-                v.push(if dirfd == libc::AT_FDCWD || argv0_user.first() == Some(&b'/') {
-                    argv0_user.clone()
-                } else {
-                    guest_prog.clone()
-                });
-                v.extend(argv[1..].iter().cloned());
-                argv_changed = true;
-                // Exec the loader through an alias named after the program, so the
-                // kernel's comm and AT_EXECFN carry the program's name, not the loader's.
-                let exec_as = loader_alias(&host_interp, &guest_prog).unwrap_or_else(|| host_interp.clone());
-                v[0] = exec_as.clone();
-                (exec_as, v)
-            }
-            // Static, or identity translation where the interpreter resolves as is.
-            _ => (host_prog.clone(), argv),
-        },
-        // Not something we understand (or unreadable): let the kernel decide.
-        _ => (host_prog.clone(), argv),
-    };
-    ctx.set_exe(Ctx::tgid(pid as i32), guest_prog, host_prog);
+    let argv = read_argv(ctx, pid, regs.arg(argv_idx), ptr_size)?;
+    let plan = plan(ctx, pid, dirfd, &user_path, argv, deref_final)?;
+    ctx.set_exe(pid as i32, plan.guest_prog.clone(), plan.host_prog.clone());
 
     // 3. Materialize path and argv in the tracee, unless nothing changed.
-    if !is_at && !argv_changed && exec_path == user_path {
+    if !is_at && !plan.changed {
         return Ok(());
     }
-    if std::env::var_os("PROOT_EXEC_DEBUG").is_some() {
-        eprintln!(
-            "proot: exec pid {pid}: {} argv={:?}",
-            String::from_utf8_lossy(&exec_path),
-            new_argv
-                .iter()
-                .map(|a| String::from_utf8_lossy(a).into_owned())
-                .collect::<Vec<_>>()
-        );
-    }
-    let (path_addr, argv_addr) = push_argv(ctx, regs, &exec_path, &new_argv, ptr_size)?;
+    debug_exec(pid, &plan);
+    let (path_addr, argv_addr) = push_argv(ctx, regs, &plan.exec_path, &plan.argv, ptr_size)?;
     if is_at {
         regs.set_arg(0, libc::AT_FDCWD as i64 as u64);
         regs.set_arg(1, path_addr);
@@ -168,6 +227,57 @@ pub fn handle_execve(ctx: &Ctx, regs: &mut Regs) -> Result<()> {
         regs.set_arg(1, argv_addr);
     }
     Ok(())
+}
+
+/// Reads the tracee's argument vector.
+///
+/// # Arguments
+/// * `ctx` - Shared supervisor state.
+/// * `pid` - Tracee thread id.
+/// * `argv_ptr` - Address of the pointer array, or 0.
+/// * `ptr_size` - Pointer width of the tracee's ABI.
+///
+/// # Returns
+/// The strings; empty for a NULL `argv`.
+pub fn read_argv(ctx: &Ctx, pid: u32, argv_ptr: u64, ptr_size: usize) -> Result<Vec<Vec<u8>>> {
+    if argv_ptr == 0 {
+        return Ok(Vec::new());
+    }
+    let ptrs = ctx.mem.read_ptr_array_sized(pid, argv_ptr, MAX_ARGV, ptr_size)?;
+    ptrs.iter().map(|&p| ctx.mem.read_cstr(pid, p)).collect()
+}
+
+/// Prints the rewritten exec when `PROOT_EXEC_DEBUG` is set.
+///
+/// # Arguments
+/// * `pid` - Tracee thread id.
+/// * `plan` - The exec about to happen.
+pub fn debug_exec(pid: u32, plan: &ExecPlan) {
+    if std::env::var_os("PROOT_EXEC_DEBUG").is_some() {
+        eprintln!(
+            "proot: exec pid {pid}: {} argv={:?}",
+            String::from_utf8_lossy(&plan.exec_path),
+            plan.argv
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The name the kernel would give a process exec'd as `user_path`: the last
+/// component of that path, or of `guest_prog` when the path is empty
+/// (`execveat` of a descriptor) or ends in a slash.
+///
+/// # Arguments
+/// * `user_path` - Program path as the tracee passed it.
+/// * `guest_prog` - Canonical guest path of what will run.
+fn exec_name<'a>(user_path: &'a [u8], guest_prog: &'a [u8]) -> &'a [u8] {
+    let base = |p: &'a [u8]| p.rsplit(|&b| b == b'/').next().unwrap_or(p);
+    match base(user_path) {
+        b"" => guest_prog,
+        name => name,
+    }
 }
 
 /// Writes a path and an argv array onto the tracee's stack.
@@ -227,18 +337,15 @@ fn push_argv(
 ///
 /// # Arguments
 /// * `host_interp` - Host path of the dynamic loader.
-/// * `guest_prog` - Guest path of the program, whose basename the alias takes.
+/// * `name` - Name to give the alias, or a path whose last component is taken.
 ///
 /// # Returns
 /// The alias path, or `None` when the directory or link cannot be created.
-fn loader_alias(host_interp: &[u8], guest_prog: &[u8]) -> Option<Vec<u8>> {
+fn loader_alias(host_interp: &[u8], name: &[u8]) -> Option<Vec<u8>> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::os::unix::ffi::OsStrExt;
-    let name = guest_prog
-        .rsplit(|&b| b == b'/')
-        .next()
-        .filter(|n| !n.is_empty())?;
+    let name = name.rsplit(|&b| b == b'/').next().filter(|n| !n.is_empty())?;
     let mut h = DefaultHasher::new();
     host_interp.hash(&mut h);
     let dir = alias_dir().join(format!("{:016x}", h.finish()));
@@ -262,16 +369,32 @@ fn loader_alias(host_interp: &[u8], guest_prog: &[u8]) -> Option<Vec<u8>> {
     Some(link.as_os_str().as_bytes().to_vec())
 }
 
+static ALIAS_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 /// Directory holding the loader aliases, private to this supervisor.
 ///
 /// Created under `$XDG_RUNTIME_DIR` or the temp dir, named by our pid, and
-/// removed by the launcher when the supervisor exits.
+/// removed by the launcher when the supervisor exits.  Without ptrace the
+/// same directory holds the exec shim and is every tracee's kernel cwd, see
+/// [`shim`].
 pub fn alias_dir() -> std::path::PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(format!("proot-next-{}", std::process::id()))
+    ALIAS_DIR
+        .get_or_init(|| {
+            let base = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(std::env::temp_dir);
+            base.join(format!("proot-next-{}", std::process::id()))
+        })
+        .clone()
+}
+
+/// Fixes the alias directory before anything used it (the shim installer).
+///
+/// # Arguments
+/// * `dir` - The directory to use from now on.
+pub fn set_alias_dir(dir: std::path::PathBuf) {
+    let _ = ALIAS_DIR.set(dir);
 }
 
 /// Whether the loader at `host_interp` understands `--argv0`.

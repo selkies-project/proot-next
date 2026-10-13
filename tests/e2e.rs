@@ -6,6 +6,11 @@
 //! CI's Linux runners provide.  Cases that need a rootfs read
 //! `PROOT_TEST_ROOTFS`; cases that need a 32-bit probe read
 //! `tests/probes/bin/`; both skip with a message when absent.
+//!
+//! The whole suite also runs with `PROOT_NO_PTRACE=1` in the environment,
+//! which the binary inherits: everything then goes through the no-ptrace
+//! mode, except the cases that are about the tracer itself, which skip.
+//! The `no_ptrace_*` cases force that mode themselves.
 
 use std::io::Write;
 use std::os::unix::net::UnixListener;
@@ -28,6 +33,31 @@ fn run(args: &[&str]) -> Output {
         .stdin(Stdio::null())
         .output()
         .expect("spawn proot")
+}
+
+/// Runs `proot` with `args` in the no-ptrace mode.
+fn run_no_ptrace(args: &[&str]) -> Output {
+    Command::new(proot())
+        .env("PROOT_NO_PTRACE", "1")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn proot")
+}
+
+/// Whether the suite runs in the no-ptrace mode, where tracer-only cases skip.
+fn no_ptrace_suite() -> bool {
+    if std::env::var_os("PROOT_NO_PTRACE").is_some_and(|v| v != "0") {
+        eprintln!("skipping: needs the ptrace tier");
+        return true;
+    }
+    false
+}
+
+/// Makes a file executable.
+fn chmod_x(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn stdout(o: &Output) -> String {
@@ -209,6 +239,9 @@ fn arm32_probe_runs() {
 fn breakpoint_is_resumed_like_a_debugger_would() {
     // Valve's assert macro executes int3 when it believes a debugger is attached.
     // This test re-runs itself under proot as the probe (see `int3_probe`).
+    if no_ptrace_suite() {
+        return;
+    }
     let me = std::env::current_exe().unwrap();
     let o = Command::new(proot())
         .args([
@@ -443,10 +476,366 @@ fn gamepad_discovery_through_libudev() {
 
 #[test]
 fn fatal_signal_report_names_the_module() {
+    if no_ptrace_suite() {
+        return;
+    }
     let o = run(&["-v", "1", "-r", "/", "/bin/sh", "-c", "kill -SEGV $$"]);
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(
         err.contains("fatal signal 11") && err.contains("mappings"),
         "{err}"
+    );
+}
+
+#[test]
+fn signals_landing_on_queued_notifications_do_not_stop_the_pool() {
+    // A child exiting sends SIGCHLD to a shell that often has a notification queued;
+    // the listener then reports ENOENT, which must not be taken for the end of the pool.
+    let mut child = Command::new(proot())
+        .args([
+            "-r",
+            "/",
+            "/bin/sh",
+            "-c",
+            "i=0; while [ $i -lt 300 ]; do echo hi | cat > /dev/null; i=$((i+1)); done; echo done-$i",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the supervisor stopped answering"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(stdout(&o), "done-300");
+}
+
+#[test]
+fn namespaces_are_refused_inside_the_guest() {
+    // A sandbox helper (bubblewrap for glycin, Firefox's content sandbox) must see the EPERM a
+    // default container gives it and fall back, since a tracee in its own mount namespace could
+    // not be served from the supervisor's.  Plain forks, through clone or clone3, keep working.
+    let script = "import os\n\
+                  try:\n    os.unshare(os.CLONE_NEWUSER); print('unshared')\n\
+                  except PermissionError: print('refused')\n\
+                  try:\n    os.unshare(os.CLONE_NEWNS); print('unshared')\n\
+                  except PermissionError: print('refused')\n\
+                  pid = os.fork()\n\
+                  if pid == 0: os._exit(3)\n\
+                  print(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))";
+    let o = run(&["-r", "/", "python3", "-c", script]);
+    assert_eq!(
+        stdout(&o),
+        "refused\nrefused\n3",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    if Path::new("/usr/bin/bwrap").exists() {
+        let o = run(&[
+            "-r",
+            "/",
+            "/usr/bin/bwrap",
+            "--unshare-all",
+            "--ro-bind",
+            "/",
+            "/",
+            "/bin/true",
+        ]);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("No permissions to create a new namespace"), "{err}");
+    }
+}
+
+#[test]
+fn nested_bwrap_mode_fails_like_bubblewrap_without_namespaces() {
+    // Images put the bwrap symlink on the guest's PATH, so GTK's glycin may pick it instead of the
+    // rootfs's bubblewrap; a nested proot-next must then fail with the words glycin recognizes.
+    let d = tmpdir("nested");
+    let bwrap = d.join("bwrap");
+    std::os::unix::fs::symlink(proot(), &bwrap).unwrap();
+    let o = run(&[
+        "-r",
+        "/",
+        bwrap.to_str().unwrap(),
+        "--ro-bind",
+        "/",
+        "/",
+        "/bin/true",
+    ]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(
+        err.starts_with("bwrap: No permissions to create a new namespace"),
+        "{err}"
+    );
+}
+
+#[test]
+fn cmdline_and_comm_read_as_the_kernel_would_give_them() {
+    // ps, pgrep -f and programs reading their own command line must not see the loader the
+    // exec was retargeted at, and a script's comm is the script's name, not its interpreter's.
+    let d = tmpdir("cmdline");
+    std::fs::write(
+        d.join("tool.sh"),
+        "#!/bin/sh\necho \"$(cat /proc/$$/comm) $(tr '\\0' ' ' < /proc/$$/cmdline)\"\n",
+    )
+    .unwrap();
+    chmod_x(&d.join("tool.sh"));
+    std::os::unix::fs::symlink("tool.sh", d.join("tool")).unwrap();
+    let bind = format!("{}:/pn-c", d.display());
+    let o = run(&[
+        "-r",
+        "/",
+        "-b",
+        &bind,
+        "/bin/sh",
+        "-c",
+        "tr '\\0' ' ' < /proc/self/cmdline; echo; /pn-c/tool one two",
+    ]);
+    assert_eq!(
+        stdout(&o),
+        "/bin/sh -c tr '\\0' ' ' < /proc/self/cmdline; echo; /pn-c/tool one two \ntool /bin/sh /pn-c/tool one two",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+#[test]
+fn origin_rpath_resolves_through_a_symlinked_program() {
+    // Electron apps find their bundled libraries through an $ORIGIN rpath and are started
+    // through a symlink in /usr/bin; the loader must see the resolved program path.
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: no C compiler for the $ORIGIN probe");
+        return;
+    }
+    let d = tmpdir("origin");
+    std::fs::create_dir_all(d.join("lib")).unwrap();
+    std::fs::create_dir_all(d.join("bin")).unwrap();
+    std::fs::write(d.join("lib.c"), "int answer(void) { return 42; }\n").unwrap();
+    std::fs::write(
+        d.join("prog.c"),
+        "#include <stdio.h>\nint answer(void);\nint main(void) { printf(\"answer %d\\n\", answer()); return 0; }\n",
+    )
+    .unwrap();
+    let cc = |args: &[&str]| {
+        let o = Command::new("cc").current_dir(&d).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    cc(&["-shared", "-fPIC", "-o", "lib/libpnorigin.so", "lib.c"]);
+    cc(&[
+        "-o",
+        "lib/prog",
+        "prog.c",
+        "-Llib",
+        "-lpnorigin",
+        "-Wl,-rpath,$ORIGIN",
+    ]);
+    std::os::unix::fs::symlink("../lib/prog", d.join("bin/prog")).unwrap();
+    let o = run(&[
+        "-r",
+        "/",
+        "-b",
+        &format!("{}:/pn-o", d.display()),
+        "/pn-o/bin/prog",
+    ]);
+    assert_eq!(stdout(&o), "answer 42", "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
+fn no_ptrace_execs_through_the_trampoline() {
+    // Dynamic programs, scripts, argv[0] and /proc/self/exe all go through the exec shim.
+    let d = tmpdir("np-exec");
+    std::fs::write(
+        d.join("s.sh"),
+        "#!/bin/sh\necho script $1 $(readlink /proc/self/exe)\n",
+    )
+    .unwrap();
+    chmod_x(&d.join("s.sh"));
+    let bind = format!("{}:/pn-e", d.display());
+    let o = run_no_ptrace(&[
+        "-r",
+        "/",
+        "-b",
+        &bind,
+        "/bin/sh",
+        "-c",
+        "/pn-e/s.sh one; sh -c 'echo $0'; cat /proc/self/comm",
+    ]);
+    let out = stdout(&o);
+    assert!(
+        out.starts_with("script one /"),
+        "{out}\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(out.ends_with("\nsh\ncat"), "{out}");
+    // A script without #! is refused with ENOEXEC so the shell runs it itself.
+    std::fs::write(d.join("plain"), "echo plain-ok\n").unwrap();
+    chmod_x(&d.join("plain"));
+    let o = run_no_ptrace(&[
+        "-r",
+        "/",
+        "-b",
+        &bind,
+        "/bin/bash",
+        "-c",
+        "/pn-e/plain; /pn-e/missing; echo rc=$?",
+    ]);
+    assert_eq!(
+        stdout(&o),
+        "plain-ok\nrc=127",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+#[test]
+fn no_ptrace_working_directory_is_virtual() {
+    let d = tmpdir("np-cwd");
+    std::fs::create_dir(d.join("sub")).unwrap();
+    std::fs::write(d.join("sub/f"), "data").unwrap();
+    let script = "import os\n\
+                  os.chdir('/pn-c/sub'); print(os.getcwd(), open('f').read(), os.readlink('/proc/self/cwd'))\n\
+                  os.chdir('..'); print(os.getcwd())\n\
+                  fd = os.open('/pn-c/sub', os.O_RDONLY); os.fchdir(fd); print(os.getcwd())\n\
+                  try:\n    os.chdir('/pn-c/sub/f')\n\
+                  except NotADirectoryError: print('notdir')";
+    let o = run_no_ptrace(&[
+        "-r",
+        "/",
+        "-b",
+        &format!("{}:/pn-c", d.display()),
+        "python3",
+        "-c",
+        script,
+    ]);
+    assert_eq!(
+        stdout(&o),
+        "/pn-c/sub data /pn-c/sub\n/pn-c\n/pn-c/sub\nnotdir",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+#[test]
+fn no_ptrace_orphans_inherit_the_working_directory() {
+    // A daemon forks twice and the middle process exits before the grandchild makes a syscall.
+    let d = tmpdir("np-orphan");
+    let script = "import os, time\n\
+                  os.chdir('/pn-o')\n\
+                  r, w = os.pipe()\n\
+                  if os.fork() == 0:\n\
+                  \x20   if os.fork() == 0:\n\
+                  \x20       time.sleep(0.3); os.write(w, os.getcwd().encode()); os._exit(0)\n\
+                  \x20   os._exit(0)\n\
+                  os.close(w); print(os.read(r, 64).decode())";
+    let o = run_no_ptrace(&[
+        "-r",
+        "/",
+        "-b",
+        &format!("{}:/pn-o", d.display()),
+        "python3",
+        "-c",
+        script,
+    ]);
+    assert_eq!(stdout(&o), "/pn-o", "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
+fn no_ptrace_unix_sockets_bind_and_connect_through_bindings() {
+    let d = tmpdir("np-sock");
+    let script = "import socket, os\n\
+                  srv = socket.socket(socket.AF_UNIX); srv.bind('/pn-s/sock'); srv.listen(1)\n\
+                  print(os.path.exists('/pn-s/sock'), flush=True)\n\
+                  if os.fork() == 0:\n\
+                  \x20   c = socket.socket(socket.AF_UNIX); c.setblocking(False)\n\
+                  \x20   try: c.connect('/pn-s/sock')\n\
+                  \x20   except BlockingIOError: pass\n\
+                  \x20   c.setblocking(True); c.send(b'hi'); print(c.recv(8).decode(), flush=True); os._exit(0)\n\
+                  a, _ = srv.accept(); a.send(a.recv(8) + b'-back'); os.wait()";
+    let o = run_no_ptrace(&[
+        "-r",
+        "/",
+        "-b",
+        &format!("{}:/pn-s", d.display()),
+        "python3",
+        "-c",
+        script,
+    ]);
+    assert_eq!(
+        stdout(&o),
+        "True\nhi-back",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(d.join("sock").exists());
+}
+
+#[test]
+fn no_ptrace_inotify_and_opath_keep_the_callers_buffer() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmpdir("np-inotify");
+    std::fs::create_dir(d.join("dir")).unwrap();
+    std::fs::write(d.join("secret"), "xyz").unwrap();
+    std::fs::set_permissions(d.join("secret"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let script = "import ctypes, os\n\
+                  libc = ctypes.CDLL(None, use_errno=True)\n\
+                  fd = libc.inotify_init1(0); buf = ctypes.create_string_buffer(b'/pn-i/dir')\n\
+                  assert libc.inotify_add_watch(fd, buf, 0x100) >= 0, os.strerror(ctypes.get_errno())\n\
+                  open('/pn-i/dir/new', 'w').close(); ev = os.read(fd, 256)\n\
+                  print(buf.value.decode(), ev[16:].rstrip(b'\\0').decode())\n\
+                  p = os.open('/pn-i/secret', os.O_PATH); print(os.fstat(p).st_size)";
+    let o = run_no_ptrace(&[
+        "-r",
+        "/",
+        "-b",
+        &format!("{}:/pn-i", d.display()),
+        "python3",
+        "-c",
+        script,
+    ]);
+    assert_eq!(
+        stdout(&o),
+        "/pn-i/dir new\n3",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+#[test]
+fn no_ptrace_spawn_and_fexecve() {
+    // posix_spawn shares the parent's memory until the exec; fexecve names no path at all.
+    let d = tmpdir("np-spawn");
+    std::fs::write(d.join("h.sh"), "#!/bin/sh\necho hello $1\n").unwrap();
+    chmod_x(&d.join("h.sh"));
+    let script = "import os, ctypes\n\
+                  p = '/pn-p/h.sh'\n\
+                  for i in range(2):\n\
+                  \x20   os.waitpid(os.posix_spawn(p, [p, str(i)], os.environ), 0)\n\
+                  print(p, flush=True)\n\
+                  if os.fork() == 0:\n\
+                  \x20   libc = ctypes.CDLL(None, use_errno=True)\n\
+                  \x20   argv = (ctypes.c_char_p * 3)(b'h', b'fd', None)\n\
+                  \x20   libc.execveat(os.open(p, os.O_RDONLY), b'', argv, None, 0x1000)\n\
+                  \x20   print('execveat failed', os.strerror(ctypes.get_errno()), flush=True); os._exit(1)\n\
+                  os.wait()";
+    let o = run_no_ptrace(&[
+        "-r",
+        "/",
+        "-b",
+        &format!("{}:/pn-p", d.display()),
+        "python3",
+        "-c",
+        script,
+    ]);
+    assert_eq!(
+        stdout(&o),
+        "hello 0\nhello 1\n/pn-p/h.sh\nhello fd",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
     );
 }

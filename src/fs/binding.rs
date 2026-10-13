@@ -1,8 +1,9 @@
 //! Binding tables: longest-prefix substitution between guest and host paths.
 
 use crate::config::{Binding, Config, trim_slashes};
-use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use crate::procs::ProcTable;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 
 /// Entries kept in the directory cache before it is cleared wholesale.
 const DIR_CACHE_MAX: usize = 65_536;
@@ -21,22 +22,33 @@ pub struct Fs {
     /// Lets the walk skip one `lstat` per intermediate component.  Flushed by
     /// [`Fs::flush_cache`] after any syscall that may replace a directory.
     dir_cache: RwLock<HashSet<Vec<u8>>>,
-    /// Canonical guest path of the program each process runs, keyed by tgid.
-    ///
-    /// The kernel's own `/proc/<pid>/exe` names the dynamic loader after an
-    /// exec rewrite, so every path through that link resolves here instead.
-    exes: RwLock<HashMap<i32, Vec<u8>>>,
+    /// Per-process records: the program each process runs, since the kernel's
+    /// own `/proc/<pid>/exe` names the dynamic loader after an exec rewrite,
+    /// and without ptrace the working directory too.
+    pub procs: Arc<ProcTable>,
     /// False when `PROOT_NO_PATH_CACHE` is set.
     cache_enabled: bool,
 }
 
 impl Fs {
-    /// Builds the view from the parsed configuration.
+    /// Builds the view from the parsed configuration with its own process table.
     ///
     /// # Arguments
     /// * `config` - Parsed command line.  Bindings are normalized and sorted.
     pub fn new(config: &Config) -> Fs {
-        let root = trim_slashes(config.root.clone());
+        Fs::with_procs(config, Arc::new(ProcTable::new(false)))
+    }
+
+    /// Builds the view from the parsed configuration over a shared process table.
+    ///
+    /// The root is made absolute, since it is used from the alias directory
+    /// as well (loader aliases, the exec shim's records).
+    ///
+    /// # Arguments
+    /// * `config` - Parsed command line.  Bindings are normalized and sorted.
+    /// * `procs` - Process table shared with the supervisor.
+    pub fn with_procs(config: &Config, procs: Arc<ProcTable>) -> Fs {
+        let root = resolve_host(&config.root);
         let mut bindings: Vec<Binding> = config
             .bindings
             .iter()
@@ -56,7 +68,7 @@ impl Fs {
             bindings,
             identity,
             dir_cache: RwLock::new(HashSet::new()),
-            exes: RwLock::new(HashMap::new()),
+            procs,
             cache_enabled,
         }
     }
@@ -96,44 +108,24 @@ impl Fs {
         }
     }
 
-    /// Records the guest path of the program process `tgid` now runs.
-    ///
-    /// # Arguments
-    /// * `tgid` - Thread-group id of the process.
-    /// * `guest` - Canonical guest path of the executable.
-    pub fn set_exe(&self, tgid: i32, guest: Vec<u8>) {
-        if let Ok(mut m) = self.exes.write() {
-            m.insert(tgid, guest);
-        }
-    }
-
-    /// Copies the recorded program from `parent` to a forked `child`.
-    pub fn fork_exe(&self, parent: i32, child: i32) {
-        if let Ok(mut m) = self.exes.write()
-            && let Some(e) = m.get(&parent).cloned()
-        {
-            m.insert(child, e);
-        }
-    }
-
-    /// Forgets a process that exited.
-    pub fn forget_exe(&self, tgid: i32) {
-        if let Ok(mut m) = self.exes.write() {
-            m.remove(&tgid);
-        }
-    }
-
-    /// The recorded guest program of thread `tid`, trying its thread group too.
+    /// The recorded guest program of thread `tid`, if any.
     ///
     /// # Arguments
     /// * `tid` - Thread or process id as it appears in a `/proc/<n>` path.
     pub fn exe_of(&self, tid: i32) -> Option<Vec<u8>> {
-        let m = self.exes.read().ok()?;
-        if let Some(e) = m.get(&tid) {
-            return Some(e.clone());
+        self.procs.exe_of(tid)
+    }
+
+    /// The virtual working directory of thread `tid`, when cwd is virtual (no ptrace).
+    ///
+    /// # Arguments
+    /// * `tid` - Thread or process id.
+    pub fn virtual_cwd(&self, tid: i32) -> Option<Vec<u8>> {
+        if self.procs.lazy {
+            self.procs.cwd_of(tid)
+        } else {
+            None
         }
-        let tgid = tgid_of(tid)?;
-        m.get(&tgid).cloned()
     }
 
     /// Finds the binding whose guest prefix covers `guest`, if any.
@@ -201,13 +193,13 @@ impl Fs {
     }
 }
 
-/// The real host path behind a binding, symlinks resolved.
+/// The real host path behind a binding or the root, symlinks resolved.
 ///
 /// A binding names a host object, not a symlink to it: `/etc/resolv.conf`
 /// pointing into `/run/systemd/resolve/` must bind the resolver file itself,
 /// or the guest would follow the link inside its own rootfs and find nothing.
-/// Same as PRoot's `realpath` on every binding.  A path that does not exist
-/// (yet) is kept as given.
+/// Same as PRoot's `realpath` on every binding.  A relative path becomes
+/// absolute the same way.  A path that does not exist (yet) is kept as given.
 fn resolve_host(host: &[u8]) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     let trimmed = trim_slashes(host.to_vec());
@@ -215,14 +207,6 @@ fn resolve_host(host: &[u8]) -> Vec<u8> {
         Ok(real) => trim_slashes(real.as_os_str().as_bytes().to_vec()),
         Err(_) => trimmed,
     }
-}
-
-/// Thread-group id of a thread, read from `/proc`.
-fn tgid_of(tid: i32) -> Option<i32> {
-    let s = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
-    s.lines()
-        .find_map(|l| l.strip_prefix("Tgid:"))
-        .and_then(|v| v.trim().parse().ok())
 }
 
 /// Whether `prefix` is `path` itself or a directory ancestor of it.

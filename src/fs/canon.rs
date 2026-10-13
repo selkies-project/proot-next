@@ -103,11 +103,18 @@ fn walk(fs: &Fs, pid: u32, base: &[u8], path: &[u8], deref_final: bool, hops: &m
                 return Ok(append_rest(candidate, &comps[idx + 1..]));
             }
             // `/proc/<n>/exe` is answered from our own record: the kernel's link
-            // names the dynamic loader after an exec rewrite.
+            // names the dynamic loader after an exec rewrite.  Without ptrace
+            // `/proc/<n>/cwd` is too, since the kernel's is pinned elsewhere.
             if candidate.ends_with(b"/exe")
                 && let Some(exe) = proc_pid(&candidate).and_then(|n| fs.exe_of(n))
             {
                 result = exe;
+                continue;
+            }
+            if candidate.ends_with(b"/cwd")
+                && let Some(cwd) = proc_pid(&candidate).and_then(|n| fs.virtual_cwd(n))
+            {
+                result = cwd;
                 continue;
             }
             // The link content is a host path (or "pipe:[n]"-style for non-files).

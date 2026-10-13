@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-struct Pool {
+/// The listener pool; see [`start`].
+pub struct Pool {
     token: Mutex<()>,
     park: Mutex<()>,
     cv: Condvar,
@@ -26,7 +27,13 @@ struct Pool {
 /// Longest a follower spins for the token before parking, in microseconds.
 const FOLLOWER_SPIN_US: u64 = 20;
 
-/// Blocking receive; `None` once the listener is closed.
+/// Blocking receive; `None` once no process uses the filter any more.
+///
+/// `ENOENT` from `RECV` has two meanings: the filter has no users left, or
+/// the notification just queued was withdrawn by a signal (a `SIGCHLD`
+/// landing on a shell in a `stat`) before it was received.  Only the former
+/// ends the pool, and only it raises `POLLHUP` on the listener, which is how
+/// the two are told apart.
 fn recv(listener: i32) -> Option<SeccompNotif> {
     loop {
         let mut req = SeccompNotif::default();
@@ -35,9 +42,17 @@ fn recv(listener: i32) -> Option<SeccompNotif> {
         }
         match errno() {
             libc::EINTR => continue,
-            // ENOENT from RECV means no task uses the filter any more: every
-            // tracee is gone, so the pool is done.  (For SEND it would mean a
-            // stale id, but that is answered elsewhere.)
+            libc::ENOENT => {
+                let mut pfd = libc::pollfd {
+                    fd: listener,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLHUP != 0 {
+                    return None;
+                }
+                continue;
+            }
             _ => return None,
         }
     }
@@ -121,12 +136,25 @@ fn thread_main(listener: i32, pool: Arc<Pool>, ctx: Arc<Ctx>, spin_us: u64) {
     }
 }
 
+impl Pool {
+    /// Blocks until the pool has shut down, i.e. no process uses the filter any more.
+    pub fn wait_closed(&self) {
+        let mut g = self.park.lock().unwrap();
+        while !self.closed.load(Ordering::Acquire) {
+            g = self.cv.wait_timeout(g, Duration::from_millis(200)).unwrap().0;
+        }
+    }
+}
+
 /// Starts the supervisor threads.  They run until the listener closes.
 ///
 /// # Arguments
 /// * `listener` - Seccomp listener descriptor received from the first tracee.
 /// * `ctx` - Shared supervisor state.
-pub fn start(listener: i32, ctx: Arc<Ctx>) {
+///
+/// # Returns
+/// The pool, to wait for its shutdown.
+pub fn start(listener: i32, ctx: Arc<Ctx>) -> Arc<Pool> {
     let pool = Arc::new(Pool {
         token: Mutex::new(()),
         park: Mutex::new(()),
@@ -144,6 +172,7 @@ pub fn start(listener: i32, ctx: Arc<Ctx>) {
             .spawn(move || thread_main(listener, pool, ctx, spin_us))
             .expect("spawn supervisor thread");
     }
+    pool
 }
 
 /// Answers a notification with a plain result or an error.
@@ -221,6 +250,36 @@ pub fn reply_fd(listener: i32, id: u64, fd: i32, cloexec: bool) {
         }
     }
     unsafe { libc::close(fd) };
+}
+
+/// Installs `fd` into the tracee at descriptor number `newfd`, closing what
+/// was there, without answering the notification.
+///
+/// Used before a `CONTINUE` so the continued syscall finds a different
+/// object behind one of its descriptor arguments.  Closes the supervisor's
+/// copy of `fd` afterwards.
+///
+/// # Arguments
+/// * `listener` - Listener descriptor.
+/// * `id` - Notification id.
+/// * `fd` - Supervisor-side descriptor to hand over.
+/// * `newfd` - Descriptor number in the tracee to install it at.
+/// * `cloexec` - Set `O_CLOEXEC` on the tracee's copy.
+///
+/// # Errors
+/// Errno from the ioctl.
+pub fn addfd_at(listener: i32, id: u64, fd: i32, newfd: i32, cloexec: bool) -> Result<()> {
+    let add = SeccompNotifAddfd {
+        id,
+        flags: SECCOMP_ADDFD_FLAG_SETFD,
+        srcfd: fd as u32,
+        newfd: newfd as u32,
+        newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+    };
+    let rc = unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_ADDFD as _, &add as *const _) };
+    let e = errno();
+    unsafe { libc::close(fd) };
+    if rc < 0 { Err(e) } else { Ok(()) }
 }
 
 /// Checks that the tracee is still blocked in this notification.

@@ -23,6 +23,29 @@ listener descriptor back over a socketpair and waits for a byte. The parent
 seizes it with ptrace, starts the pool and sends the byte. From then on every
 traced syscall of every descendant has a supervisor.
 
+## Without ptrace
+
+A hardened container profile that filters the `ptrace` syscall still allows
+the listener and memory access, and proot-next notices at start-up (or is
+told with `PROOT_NO_PTRACE=1`). The handful of syscalls the tracer used to
+rewrite are then served through notifications too: the working directory
+becomes virtual, unix sockets are connected or bound by the supervisor and
+swapped into the tracee's descriptor, and an exec goes through a tiny static
+trampoline that the supervisor installs under `$XDG_RUNTIME_DIR` and names
+in the tracee's path string in place, with the real target in a record file
+beside it. ptrace stays the first choice where it works: it costs nothing it
+does not have to, and it is what Steam is tested against.
+
+## No namespaces inside the guest
+
+Creating a user, mount or other namespace inside the guest is refused with
+`EPERM`, as a default container refuses it. A sandbox helper that got its
+own mount namespace could not be served by a supervisor doing the
+filesystem work in its own, and every such helper already handles the
+refusal: bubblewrap, which GTK's glycin image loaders and WebKit use,
+reports that namespaces are unavailable and the application carries on
+without the sandbox; Firefox's content sandbox degrades the same way.
+
 ## Why a small warm pool
 
 The kernel hands a notification to the longest-waiting receiver. On an idle

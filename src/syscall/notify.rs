@@ -17,6 +17,7 @@ use crate::note;
 use crate::seccomp::notify::{reply, reply_continue, reply_fd, still_valid};
 use crate::state::Ctx;
 use crate::sys::{Errno, Result, SeccompNotif, check};
+use crate::syscall::direct;
 use crate::syscall::nr::*;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
@@ -42,30 +43,34 @@ const SYS_FCHMODAT2_HOST: libc::c_long = 452;
 const IN_DONT_FOLLOW: u64 = 0x0200_0000;
 
 /// How a handler wants the notification answered.
-enum Outcome {
+pub(crate) enum Outcome {
     /// Plain return value or errno.
     Value(Result<i64>),
     /// Install this supervisor descriptor into the tracee and return its number.
     Fd { fd: i32, cloexec: bool },
     /// Let the kernel run the syscall untouched.
     Continue,
+    /// The handler answered the notification itself.
+    Replied,
 }
 
 /// One notification plus the shared state needed to serve it.
-struct Req<'a> {
-    ctx: &'a Ctx,
-    listener: i32,
-    id: u64,
-    pid: u32,
-    args: [u64; 6],
+pub(crate) struct Req<'a> {
+    pub ctx: &'a Ctx,
+    pub listener: i32,
+    pub id: u64,
+    pub pid: u32,
+    pub args: [u64; 6],
+    /// Syscall number as the tracee issued it, in its own ABI.
+    pub raw_nr: i32,
     /// ABI the request came through; 32-bit pointers are already zero-extended.
-    abi: Abi,
+    pub abi: Abi,
     /// How an i386 request differs from the x86_64 number it was mapped to.
-    variant: Variant,
+    pub variant: Variant,
 }
 
 impl<'a> Req<'a> {
-    fn arg(&self, i: usize) -> u64 {
+    pub fn arg(&self, i: usize) -> u64 {
         self.args[i]
     }
 
@@ -77,16 +82,21 @@ impl<'a> Req<'a> {
         self.args[i] as i32
     }
 
+    /// Thread-group id of the calling thread.
+    pub fn tgid(&self) -> i32 {
+        self.ctx.tgid(self.pid as i32)
+    }
+
     /// Reads the NUL-terminated path in argument `i`, rewriting `/proc/self`
     /// and `/proc/thread-self` to the tracee's own entries since the
     /// supervisor would otherwise see its own.
-    fn path(&self, i: usize) -> Result<Vec<u8>> {
+    pub fn path(&self, i: usize) -> Result<Vec<u8>> {
         let raw = self.ctx.mem.read_cstr(self.pid, self.arg(i))?;
         Ok(rewrite_proc_self(&raw, self.pid))
     }
 
     /// Translates `path` relative to `dirfd` into a host path.
-    fn translate(&self, dirfd: i32, path: &[u8], deref_final: bool) -> Result<Vec<u8>> {
+    pub fn translate(&self, dirfd: i32, path: &[u8], deref_final: bool) -> Result<Vec<u8>> {
         let host = translate_path(&self.ctx.fs, self.pid, dirfd, path, deref_final)?;
         note!(
             self.ctx,
@@ -100,7 +110,7 @@ impl<'a> Req<'a> {
     }
 
     /// Re-validates the notification; `Err(DROPPED)` when the tracee is gone.
-    fn valid(&self) -> Result<()> {
+    pub fn valid(&self) -> Result<()> {
         if still_valid(self.listener, self.id) {
             Ok(())
         } else {
@@ -109,7 +119,7 @@ impl<'a> Req<'a> {
     }
 
     /// Refuses with `EROFS` when `host` lies under a read-only binding.
-    fn check_writable(&self, host: &[u8]) -> Result<()> {
+    pub fn check_writable(&self, host: &[u8]) -> Result<()> {
         let guest = detranslate_path(&self.ctx.fs, host);
         match self.ctx.fs.binding_for_guest(&guest) {
             Some(b) if b.read_only => Err(libc::EROFS),
@@ -117,11 +127,11 @@ impl<'a> Req<'a> {
         }
     }
 
-    fn write(&self, addr: u64, data: &[u8]) -> Result<()> {
+    pub fn write(&self, addr: u64, data: &[u8]) -> Result<()> {
         self.ctx.mem.write(self.pid, addr, data)
     }
 
-    fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>> {
+    pub fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
         let n = self.ctx.mem.read(self.pid, addr, &mut buf)?;
         if n != len {
@@ -143,10 +153,19 @@ pub fn handle(ctx: &Ctx, listener: i32, req: &SeccompNotif) {
         reply(listener, req.id, Err(libc::ENOSYS));
         return;
     };
-    let Some((nr, variant)) = abi.to_canonical(req.data.nr as i64) else {
-        // Not a syscall we serve for this ABI: let the kernel run it.
-        reply_continue(listener, req.id);
-        return;
+    let raw_nr = req.data.nr as i64;
+    // Without ptrace an i386 `socketcall` arrives here for `bind`/`connect`.
+    let (nr, variant) = if ctx.no_ptrace && abi.socketcall_nr() == Some(raw_nr) {
+        (SOCKETCALL, Variant::Same)
+    } else {
+        match abi.to_canonical(raw_nr) {
+            Some(x) => x,
+            None => {
+                // Not a syscall we serve for this ABI: let the kernel run it.
+                reply_continue(listener, req.id);
+                return;
+            }
+        }
     };
     let r = Req {
         ctx,
@@ -154,6 +173,7 @@ pub fn handle(ctx: &Ctx, listener: i32, req: &SeccompNotif) {
         id: req.id,
         pid: req.pid,
         args: req.data.args,
+        raw_nr: req.data.nr,
         abi,
         variant,
     };
@@ -161,6 +181,7 @@ pub fn handle(ctx: &Ctx, listener: i32, req: &SeccompNotif) {
         Ok(Outcome::Value(v)) => reply(listener, req.id, v),
         Ok(Outcome::Fd { fd, cloexec }) => reply_fd(listener, req.id, fd, cloexec),
         Ok(Outcome::Continue) => reply_continue(listener, req.id),
+        Ok(Outcome::Replied) => {}
         Err(DROPPED) => {}
         Err(e) => {
             note!(
@@ -178,13 +199,31 @@ pub fn handle(ctx: &Ctx, listener: i32, req: &SeccompNotif) {
 
 /// Routes a syscall number to its handler.
 fn dispatch(r: &Req, nr: i64) -> Result<Outcome> {
+    if r.ctx.no_ptrace {
+        if let Some(o) = direct::shim_passthrough(r, nr) {
+            return Ok(o);
+        }
+        if nr == SOCKETCALL {
+            return direct::do_socketcall(r);
+        }
+        if let Some(o) = direct::dispatch(r, nr) {
+            return o;
+        }
+    }
     match nr {
-        OPEN => do_open(r, libc::AT_FDCWD, &r.path(0)?, r.arg_i64(1), r.arg_i64(2)),
+        OPEN => do_open(
+            r,
+            libc::AT_FDCWD,
+            &r.path(0)?,
+            r.arg(0),
+            r.arg_i64(1),
+            r.arg_i64(2),
+        ),
         CREAT => {
             let flags = (libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC) as i64;
-            do_open(r, libc::AT_FDCWD, &r.path(0)?, flags, r.arg_i64(1))
+            do_open(r, libc::AT_FDCWD, &r.path(0)?, r.arg(0), flags, r.arg_i64(1))
         }
-        OPENAT => do_open(r, r.dirfd(0), &r.path(1)?, r.arg_i64(2), r.arg_i64(3)),
+        OPENAT => do_open(r, r.dirfd(0), &r.path(1)?, r.arg(1), r.arg_i64(2), r.arg_i64(3)),
         OPENAT2 => do_openat2(r),
         STAT => do_stat(r, libc::AT_FDCWD, &r.path(0)?, r.arg(1), 0),
         LSTAT => do_stat(
@@ -251,6 +290,7 @@ fn dispatch(r: &Req, nr: i64) -> Result<Outcome> {
         LISTXATTR | LLISTXATTR => do_listxattr(r, nr == LLISTXATTR),
         REMOVEXATTR | LREMOVEXATTR => do_removexattr(r, nr == LREMOVEXATTR),
         INOTIFY_ADD_WATCH => do_inotify_add_watch(r),
+        CLONE3 => direct::do_clone(r, CLONE3),
         NAME_TO_HANDLE_AT => Ok(Outcome::Value(Err(libc::EOPNOTSUPP))),
         _ => Ok(Outcome::Continue),
     }
@@ -390,8 +430,14 @@ fn targets_fd(path: &[u8], flags: i64) -> bool {
 // ---- open family -----------------------------------------------------------
 
 /// `open`/`creat`/`openat`: open in the supervisor and inject the descriptor.
-fn do_open(r: &Req, dirfd: i32, path: &[u8], flags: i64, mode: i64) -> Result<Outcome> {
+///
+/// `path_addr` is where the path string lives in the tracee, for the
+/// in-place rewrite an `O_PATH` open needs without ptrace.
+fn do_open(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64, mode: i64) -> Result<Outcome> {
     let flags = r.abi.open_flags_to_host(flags);
+    if flags & libc::O_PATH as i64 != 0 && r.ctx.no_ptrace {
+        return direct::do_open_path(r, dirfd, path, path_addr, flags);
+    }
     let o_excl_create = flags & libc::O_CREAT as i64 != 0 && flags & libc::O_EXCL as i64 != 0;
     let deref = flags & libc::O_NOFOLLOW as i64 == 0 && !o_excl_create;
     let host = r.translate(dirfd, path, deref)?;
@@ -405,7 +451,8 @@ fn do_open(r: &Req, dirfd: i32, path: &[u8], flags: i64, mode: i64) -> Result<Ou
         return Ok(Outcome::Continue);
     }
     if flags & WRITE_INTENT == 0
-        && let Some(fd) = fake_proc_status(&host, fake_ids_for_status(r, &host))?
+        && let Some(fd) =
+            fake_proc_status(&host, fake_ids_for_status(r, &host))?.or(fake_proc_cmdline(&host)?)
     {
         return Ok(Outcome::Fd {
             fd,
@@ -439,7 +486,7 @@ fn do_open(r: &Req, dirfd: i32, path: &[u8], flags: i64, mode: i64) -> Result<Ou
 ///
 /// # Returns
 /// A descriptor on the rewritten copy, or `None` when the path is not a status file.
-fn fake_proc_status(host: &[u8], fake_root: Option<crate::state::Ids>) -> Result<Option<i32>> {
+fn fake_proc_status(host: &[u8], fake_root: Option<crate::procs::Ids>) -> Result<Option<i32>> {
     let Some(rest) = host.strip_prefix(b"/proc/") else {
         return Ok(None);
     };
@@ -476,28 +523,87 @@ fn fake_proc_status(host: &[u8], fake_root: Option<crate::state::Ids>) -> Result
             out.extend_from_slice(line);
         }
     }
-    let name = CString::new("proc-status").unwrap();
+    Ok(Some(readonly_memfd("proc-status", &out)?))
+}
+
+/// Serves `/proc/<pid>/cmdline` as the process was started, without the
+/// loader the exec was retargeted at.
+///
+/// The kernel's file names the loader alias, `--argv0`, the name and the
+/// program before the real arguments; `ps`, `pgrep -f` and programs reading
+/// their own command line expect the argv the tracee passed.  A process in
+/// the no-ptrace trampoline, or one that rewrote its own argv, is left as is.
+///
+/// # Arguments
+/// * `host` - Translated host path about to be opened.
+///
+/// # Returns
+/// A descriptor on the rewritten copy, or `None` when the path is not a
+/// cmdline file or the file carries no loader prefix.
+fn fake_proc_cmdline(host: &[u8]) -> Result<Option<i32>> {
+    let Some(rest) = host.strip_prefix(b"/proc/") else {
+        return Ok(None);
+    };
+    let Some(rest) = rest.strip_suffix(b"/cmdline") else {
+        return Ok(None);
+    };
+    let is_num = |b: &[u8]| !b.is_empty() && b.iter().all(|c| c.is_ascii_digit());
+    let ok = match rest.splitn(3, |&c| c == b'/').collect::<Vec<_>>().as_slice() {
+        [pid] => is_num(pid),
+        [pid, b"task", tid] => is_num(pid) && is_num(tid),
+        _ => false,
+    };
+    if !ok {
+        return Ok(None);
+    }
+    let text = std::fs::read(std::ffi::OsStr::from_bytes(host))
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+    let args: Vec<&[u8]> = text.split(|&c| c == 0).collect();
+    let alias_dir = crate::exec::alias_dir();
+    let in_alias = args
+        .first()
+        .is_some_and(|a| crate::fs::binding::is_prefix(alias_dir.as_os_str().as_bytes(), a));
+    if !in_alias {
+        return Ok(None);
+    }
+    let tail: Vec<&[u8]> = match args.as_slice() {
+        [_, b"--argv0", argv0, _, rest @ ..] => std::iter::once(*argv0).chain(rest.iter().copied()).collect(),
+        [_, prog, rest @ ..] => std::iter::once(*prog).chain(rest.iter().copied()).collect(),
+        _ => return Ok(None),
+    };
+    let out: Vec<u8> = tail.join(&0u8);
+    Ok(Some(readonly_memfd("proc-cmdline", &out)?))
+}
+
+/// A read-only descriptor on a memfd holding `content`.
+///
+/// The caller asked for a read-only file and a memfd is read-write, so the
+/// writable descriptor is re-opened read-only through `/proc/self/fd` and
+/// dropped, which keeps `F_GETFL` truthful.
+///
+/// # Arguments
+/// * `name` - Name of the memfd, for diagnostics.
+/// * `content` - Bytes the file holds.
+fn readonly_memfd(name: &str, content: &[u8]) -> Result<i32> {
+    let name = CString::new(name).unwrap();
     let fd =
         check(unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), libc::MFD_CLOEXEC) })? as i32;
     let mut off = 0;
-    while off < out.len() {
-        let n = unsafe { libc::write(fd, out[off..].as_ptr() as *const _, out.len() - off) };
+    while off < content.len() {
+        let n = unsafe { libc::write(fd, content[off..].as_ptr() as *const _, content.len() - off) };
         if n <= 0 {
             unsafe { libc::close(fd) };
             return Err(crate::sys::errno());
         }
         off += n as usize;
     }
-    // The caller asked for a read-only file; a memfd is read-write.  Re-open
-    // our own descriptor read-only so F_GETFL tells the truth, then drop the
-    // writable one.
     let link = CString::new(format!("/proc/self/fd/{fd}")).unwrap();
     let ro = unsafe { libc::open(link.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     unsafe { libc::close(fd) };
     if ro < 0 {
         return Err(crate::sys::errno());
     }
-    Ok(Some(ro))
+    Ok(ro)
 }
 
 /// `openat2`: like `openat` with a `struct open_how`.
@@ -655,7 +761,10 @@ fn do_readlink(r: &Req, dirfd: i32, path: &[u8], buf: u64, bufsiz: usize) -> Res
             Some(exe) => exe,
             None => detranslate_path(&r.ctx.fs, &read_link(&host)?),
         },
-        Some((_, false)) => detranslate_path(&r.ctx.fs, &read_link(&host)?),
+        Some((pid, false)) => match r.ctx.fs.virtual_cwd(pid).filter(|_| guest.ends_with(b"/cwd")) {
+            Some(cwd) => cwd,
+            None => detranslate_path(&r.ctx.fs, &read_link(&host)?),
+        },
         None => read_link(&host)?,
     };
     let len = target.len().min(bufsiz);
@@ -700,13 +809,13 @@ fn do_uname(r: &Req) -> Result<Outcome> {
     Ok(Outcome::Value(Ok(0)))
 }
 
-/// The identity syscalls under `-0`, over the process's virtual [`Ids`].
+/// The identity syscalls under `-0`, over the process's virtual [`crate::procs::Ids`].
 ///
 /// Getters report the virtual ids.  Setters follow the kernel's rules: with a
 /// virtual effective id of 0 any value is accepted, otherwise only the real,
 /// effective and saved ids may be chosen; a 32-bit `-1` leaves a field alone.
 fn do_identity(r: &Req, nr: i64) -> Result<Outcome> {
-    let tgid = Ctx::tgid(r.pid as i32);
+    let tgid = r.tgid();
     let mut ids = r.ctx.ids(tgid);
     let id16 = r.variant == Variant::Id16;
     let write_three = |a: u32, b: u32, c: u32| -> Result<()> {
@@ -838,7 +947,7 @@ fn do_identity(r: &Req, nr: i64) -> Result<Outcome> {
 
 /// `setgroups(size, list)` under `-0`: recorded for `getgroups`, never applied.
 fn do_setgroups(r: &Req) -> Result<Outcome> {
-    let tgid = Ctx::tgid(r.pid as i32);
+    let tgid = r.tgid();
     if r.ctx.ids(tgid).euid != 0 {
         return Err(libc::EPERM);
     }
@@ -865,7 +974,7 @@ fn do_setgroups(r: &Req) -> Result<Outcome> {
 
 /// `getgroups(size, list)` under `-0`: the recorded list, or the kernel's when none was set.
 fn do_getgroups(r: &Req) -> Result<Outcome> {
-    let tgid = Ctx::tgid(r.pid as i32);
+    let tgid = r.tgid();
     let Some(groups) = r.ctx.groups(tgid) else {
         return Ok(Outcome::Continue);
     };
@@ -927,7 +1036,7 @@ fn fake_owner(r: &Req, uid: &mut u32, gid: &mut u32) {
 }
 
 /// Under `-0`, the virtual identity to show in a `/proc/<pid>/status` being opened.
-fn fake_ids_for_status(r: &Req, host: &[u8]) -> Option<crate::state::Ids> {
+fn fake_ids_for_status(r: &Req, host: &[u8]) -> Option<crate::procs::Ids> {
     if !r.ctx.config.fake_root {
         return None;
     }
@@ -936,7 +1045,7 @@ fn fake_ids_for_status(r: &Req, host: &[u8]) -> Option<crate::state::Ids> {
         .split(|&c| c == b'/')
         .next()
         .and_then(|p| std::str::from_utf8(p).ok()?.parse().ok())?;
-    Some(r.ctx.ids(Ctx::tgid(pid)))
+    Some(r.ctx.ids(pid))
 }
 
 /// `mkdir`/`mkdirat`.

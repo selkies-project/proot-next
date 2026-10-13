@@ -39,7 +39,8 @@ Alias options:
   -R *path*                     Alias: -r *path* + a couple of recommended -b.
   -S *path*                     Alias: -0 -r *path* + a couple of recommended -b.
 
-Environment: PROOT_THREADS (default 4) and PROOT_SPIN_US (default 200) tune the supervisor pool.
+Environment: PROOT_THREADS (default 4) and PROOT_SPIN_US (default 200) tune the supervisor pool;
+PROOT_NO_PTRACE=1 forces the mode used where ptrace is filtered out.
 ";
 
 /// Host paths bound into the guest by `-R` and `-S`, when they exist.

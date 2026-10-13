@@ -5,7 +5,9 @@
 //! notification and answered by a small pool of supervisor threads; only the
 //! syscalls that must change the tracee's own state in place (`execve`,
 //! `chdir`, unix socket `bind`/`connect`) take a ptrace stop.  Everything else
-//! runs untraced at native speed.
+//! runs untraced at native speed.  Where ptrace is filtered out, those few
+//! syscalls are served through notifications too, with in-place rewrites
+//! (`syscall::direct`).
 //!
 //! The binary behaves like bubblewrap when invoked through a name ending in
 //! `bwrap`, busybox style, so a symlink is enough to make it a drop-in.
@@ -16,6 +18,7 @@ mod config;
 mod exec;
 mod fs;
 mod launch;
+mod procs;
 mod seccomp;
 mod state;
 mod sys;

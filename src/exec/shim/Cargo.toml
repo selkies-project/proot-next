@@ -1,0 +1,18 @@
+[package]
+name = "proot-shim"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Static trampoline exec'd in place of a guest program when proot-next runs without ptrace"
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]

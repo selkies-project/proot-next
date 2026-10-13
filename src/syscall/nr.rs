@@ -14,6 +14,9 @@ pub const CONNECT: i64 = 42;
 pub const SENDTO: i64 = 44;
 pub const SENDMSG: i64 = 46;
 pub const BIND: i64 = 49;
+pub const CLONE: i64 = 56;
+pub const FORK: i64 = 57;
+pub const VFORK: i64 = 58;
 pub const EXECVE: i64 = 59;
 pub const UNAME: i64 = 63;
 pub const TRUNCATE: i64 = 76;
@@ -64,6 +67,8 @@ pub const LLISTXATTR: i64 = 195;
 pub const REMOVEXATTR: i64 = 197;
 pub const LREMOVEXATTR: i64 = 198;
 pub const UTIMES: i64 = 235;
+pub const UNSHARE: i64 = 272;
+pub const SETNS: i64 = 308;
 pub const INOTIFY_ADD_WATCH: i64 = 254;
 pub const OPENAT: i64 = 257;
 pub const MKDIRAT: i64 = 258;
@@ -83,9 +88,12 @@ pub const NAME_TO_HANDLE_AT: i64 = 303;
 pub const RENAMEAT2: i64 = 316;
 pub const EXECVEAT: i64 = 322;
 pub const STATX: i64 = 332;
+pub const CLONE3: i64 = 435;
 pub const OPENAT2: i64 = 437;
 pub const FACCESSAT2: i64 = 439;
 pub const FCHMODAT2: i64 = 452;
+/// Placeholder number for the i386 `socketcall` multiplexer, which has no x86_64 equivalent.
+pub const SOCKETCALL: i64 = -102;
 
 /// Human-readable name for diagnostics.
 pub fn name(nr: i64) -> &'static str {
@@ -101,6 +109,14 @@ pub fn name(nr: i64) -> &'static str {
         TRUNCATE => "truncate",
         GETCWD => "getcwd",
         CHDIR => "chdir",
+        FCHDIR => "fchdir",
+        CLONE => "clone",
+        FORK => "fork",
+        VFORK => "vfork",
+        CLONE3 => "clone3",
+        UNSHARE => "unshare",
+        SETNS => "setns",
+        SOCKETCALL => "socketcall",
         RENAME => "rename",
         MKDIR => "mkdir",
         RMDIR => "rmdir",

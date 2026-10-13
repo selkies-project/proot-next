@@ -1,5 +1,6 @@
 //! Syscall routing: which numbers go where, and the handlers for each tier.
 
+pub mod direct;
 pub mod notify;
 pub mod nr;
 pub mod traced;
@@ -67,6 +68,38 @@ pub const FAKE_ROOT_SYSCALLS: &[i64] = &[
     GETUID, GETGID, GETEUID, GETEGID, GETRESUID, GETRESGID, SETUID, SETGID, SETREUID, SETREGID, SETRESUID,
     SETRESGID, SETFSUID, SETFSGID, SETGROUPS, GETGROUPS, CAPSET, FCHOWN,
 ];
+
+/// Syscalls served through notification instead of a ptrace stop when
+/// there is no ptrace: the trace tier plus `fchdir` (the working directory
+/// is virtual then) and the `clone` family (the child's state is snapshotted
+/// at the fork).
+pub const NO_PTRACE_SYSCALLS: &[i64] = &[
+    EXECVE,
+    EXECVEAT,
+    CHDIR,
+    FCHDIR,
+    CHROOT,
+    CONNECT,
+    BIND,
+    INOTIFY_ADD_WATCH,
+    CLONE,
+    FORK,
+    VFORK,
+    CLONE3,
+];
+
+/// Syscalls whose namespace flags are refused with `EPERM` by the filter
+/// itself, as a default container refuses them: a tracee in a mount
+/// namespace of its own could not be served by a supervisor that does the
+/// filesystem work in its own.  `clone3` carries its flags in memory and is
+/// inspected by a handler instead; `setns` is refused outright.
+pub const NAMESPACE_FLAG_SYSCALLS: &[i64] = &[CLONE, UNSHARE];
+
+/// Syscalls refused with `EPERM` unconditionally.
+pub const REFUSED_SYSCALLS: &[i64] = &[SETNS];
+
+/// `CLONE_NEW*` bits of `clone`, `clone3` and `unshare` flags.
+pub const CLONE_NEWNS_FLAGS: u64 = 0x7e02_0080;
 
 /// Syscalls that take a ptrace stop so their arguments can be edited in place.
 ///

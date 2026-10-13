@@ -44,6 +44,13 @@ since 4.8. The docker-default AppArmor profile is fine. A kernel of 5.14 or
 newer is needed for the single-step descriptor injection; older kernels fall
 back to a two-step injection automatically.
 
+A hardened profile that removes the `ptrace` syscall is fine too: proot-next
+detects it and serves the few syscalls the tracer handled through
+notifications instead, see [how it works](/docs/how-it-works). What cannot
+be worked around is a host that denies the memory access check itself (Yama
+`ptrace_scope` 2 or 3, or an LSM policy): nothing can read a path out of a
+tracee there.
+
 ## Checking a build
 
 Inside a running image, as the application user:

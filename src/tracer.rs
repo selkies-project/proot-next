@@ -82,7 +82,7 @@ pub fn run(ctx: &Arc<Ctx>, root: i32) -> i32 {
             libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
                 if let Ok(child) = ptrace::geteventmsg(pid) {
                     tracees.insert(child as i32);
-                    ctx.fork(Ctx::tgid(pid), child as i32);
+                    ctx.fork(pid, child as i32);
                 }
             }
             libc::PTRACE_EVENT_EXEC => {

@@ -2,132 +2,82 @@
 
 use crate::config::Config;
 use crate::fs::Fs;
+use crate::procs::{Ids, ProcTable, TraceeInfo};
 use crate::tracee::mem::Mem;
-use std::collections::HashMap;
-use std::sync::RwLock;
-
-/// The identity a process believes it has under `-0`.
-///
-/// Starts as root; `setuid` and friends move it with the kernel's rules
-/// (anything goes while the effective id is 0, otherwise only among the
-/// real, effective and saved ids).  Inherited across fork, kept across exec.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct Ids {
-    pub ruid: u32,
-    pub euid: u32,
-    pub suid: u32,
-    pub fsuid: u32,
-    pub rgid: u32,
-    pub egid: u32,
-    pub sgid: u32,
-    pub fsgid: u32,
-}
-
-/// What the supervisor remembers about one tracee process.
-#[derive(Clone, Debug, Default)]
-pub struct TraceeInfo {
-    /// Virtual identity under `-0`; `None` until the process changes it.
-    pub ids: Option<Ids>,
-    /// Supplementary groups set with `setgroups` under `-0`.
-    pub groups: Option<Vec<u32>>,
-    /// Canonical guest path of the running executable, for `/proc/self/exe`.
-    pub exe_guest: Option<Vec<u8>>,
-    /// Host path actually executed, for diagnostics.
-    pub exe_host: Option<Vec<u8>>,
-}
+use std::sync::Arc;
 
 /// Everything handlers need, shared read-mostly between all threads.
 pub struct Ctx {
     pub config: Config,
     pub fs: Fs,
     pub mem: Mem,
-    /// Per-process bookkeeping, keyed by thread-group id.
-    pub tracees: RwLock<HashMap<i32, TraceeInfo>>,
+    /// Per-process bookkeeping, shared with `fs` for `/proc` magic links.
+    pub procs: Arc<ProcTable>,
+    /// True when running without ptrace: the former ptrace tier is served
+    /// through notifications with in-place rewrites (see `syscall::direct`).
+    pub no_ptrace: bool,
 }
 
 impl Ctx {
     /// Builds the shared state from a configuration.
-    pub fn new(config: Config) -> Ctx {
-        let fs = Fs::new(&config);
+    ///
+    /// # Arguments
+    /// * `config` - Parsed command line.
+    /// * `no_ptrace` - Run without a ptrace tier.
+    pub fn new(config: Config, no_ptrace: bool) -> Ctx {
+        let procs = Arc::new(ProcTable::new(no_ptrace));
+        let fs = Fs::with_procs(&config, procs.clone());
         Ctx {
             config,
             fs,
             mem: Mem,
-            tracees: RwLock::new(HashMap::new()),
+            procs,
+            no_ptrace,
         }
     }
 
-    /// Returns a copy of what is known about process `pid`.
-    pub fn tracee(&self, pid: i32) -> TraceeInfo {
-        self.tracees
-            .read()
-            .unwrap()
-            .get(&pid)
-            .cloned()
-            .unwrap_or_default()
+    /// Returns a copy of what is known about the process of thread `tid`.
+    pub fn tracee(&self, tid: i32) -> TraceeInfo {
+        self.procs.info(tid)
     }
 
-    /// Records the executable a process is now running.
-    pub fn set_exe(&self, pid: i32, guest: Vec<u8>, host: Vec<u8>) {
-        self.fs.set_exe(pid, guest.clone());
-        let mut t = self.tracees.write().unwrap();
-        let e = t.entry(pid).or_default();
-        e.exe_guest = Some(guest);
-        e.exe_host = Some(host);
+    /// Records the executable the process of thread `tid` is now running.
+    pub fn set_exe(&self, tid: i32, guest: Vec<u8>, host: Vec<u8>) {
+        self.procs.set_exe(tid, guest, host);
     }
 
-    /// The virtual identity of process `tgid` (root until changed).
-    pub fn ids(&self, tgid: i32) -> Ids {
-        self.tracees
-            .read()
-            .unwrap()
-            .get(&tgid)
-            .and_then(|t| t.ids)
-            .unwrap_or_default()
+    /// The virtual identity of the process of thread `tid` (root until changed).
+    pub fn ids(&self, tid: i32) -> Ids {
+        self.procs.ids(tid)
     }
 
-    /// Replaces the virtual identity of process `tgid`.
-    pub fn set_ids(&self, tgid: i32, ids: Ids) {
-        self.tracees.write().unwrap().entry(tgid).or_default().ids = Some(ids);
+    /// Replaces the virtual identity of the process of thread `tid`.
+    pub fn set_ids(&self, tid: i32, ids: Ids) {
+        self.procs.set_ids(tid, ids);
     }
 
-    /// Supplementary groups of process `tgid`, if `setgroups` was called.
-    pub fn groups(&self, tgid: i32) -> Option<Vec<u32>> {
-        self.tracees
-            .read()
-            .unwrap()
-            .get(&tgid)
-            .and_then(|t| t.groups.clone())
+    /// Supplementary groups of the process of thread `tid`, if `setgroups` was called.
+    pub fn groups(&self, tid: i32) -> Option<Vec<u32>> {
+        self.procs.groups(tid)
     }
 
-    /// Records the supplementary groups of process `tgid`.
-    pub fn set_groups(&self, tgid: i32, groups: Vec<u32>) {
-        self.tracees.write().unwrap().entry(tgid).or_default().groups = Some(groups);
+    /// Records the supplementary groups of the process of thread `tid`.
+    pub fn set_groups(&self, tid: i32, groups: Vec<u32>) {
+        self.procs.set_groups(tid, groups);
     }
 
-    /// Copies the bookkeeping of `parent` to a newly forked `child`.
+    /// Copies the bookkeeping of the process of `parent` to a newly forked `child`.
     pub fn fork(&self, parent: i32, child: i32) {
-        self.fs.fork_exe(parent, child);
-        let mut t = self.tracees.write().unwrap();
-        let info = t.get(&parent).cloned().unwrap_or_default();
-        t.insert(child, info);
+        self.procs.fork(parent, child);
     }
 
-    /// Forgets a process that exited.
+    /// Forgets a process or thread that exited.
     pub fn forget(&self, pid: i32) {
-        self.fs.forget_exe(pid);
-        self.tracees.write().unwrap().remove(&pid);
+        self.procs.forget(pid);
     }
 
-    /// Thread-group id of a thread, from `/proc`, falling back to the tid.
-    pub fn tgid(tid: i32) -> i32 {
-        if let Ok(s) = std::fs::read_to_string(format!("/proc/{tid}/status")) {
-            for line in s.lines() {
-                if let Some(v) = line.strip_prefix("Tgid:") {
-                    return v.trim().parse().unwrap_or(tid);
-                }
-            }
-        }
-        tid
+    /// Thread-group id of a thread.
+    pub fn tgid(&self, tid: i32) -> i32 {
+        self.procs.tgid(tid)
     }
 }

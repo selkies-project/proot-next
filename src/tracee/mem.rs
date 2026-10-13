@@ -106,6 +106,30 @@ impl Mem {
         }
     }
 
+    /// Writes `buf` at `addr` through `/proc/<pid>/mem`, whatever the page's protection.
+    ///
+    /// `process_vm_writev` honours the mapping's permissions, so a string in
+    /// `.rodata` cannot be changed that way; `/proc/<pid>/mem` writes behave
+    /// like a debugger's and copy the page privately.  Used for the in-place
+    /// argument rewrites of the no-ptrace mode.
+    ///
+    /// # Arguments
+    /// * `pid` - Tracee thread id.
+    /// * `addr` - Virtual address in the tracee.
+    /// * `buf` - Bytes to write; a short write is an error.
+    pub fn write_force(&self, pid: u32, addr: u64, buf: &[u8]) -> Result<()> {
+        let fd = open_mem(pid)?;
+        let n = unsafe { libc::pwrite64(fd, buf.as_ptr() as *const _, buf.len(), addr as i64) };
+        unsafe { libc::close(fd) };
+        if n < 0 {
+            Err(errno())
+        } else if n as usize != buf.len() {
+            Err(libc::EFAULT)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Reads a NUL-terminated string of at most `PATH_MAX - 1` bytes.
     ///
     /// Reads stop at page boundaries so a short string next to an unmapped

@@ -4,16 +4,30 @@
 //! socketpair, then waits for one byte.  The parent seizes it with ptrace,
 //! starts the notification pool and sends the byte, so the child's first
 //! traced syscall already has a tracer and no `SIGSTOP` handshake is needed.
+//!
+//! Where the ptrace syscall is filtered out (a hardened container profile),
+//! or when `PROOT_NO_PTRACE` is set, there is no tracer: the filter sends the
+//! trace tier to the listener as well, the child's kernel working directory
+//! is pinned to the alias directory holding the exec shim, and the handlers
+//! in `syscall::direct` do the rest.  The process table is then lazy and a
+//! reaper thread watches pidfds for exits.
 
 use crate::config::Config;
-use crate::fs::translate::translate_path;
+use crate::exec::shim;
+use crate::fs::translate::{detranslate_path, translate_path};
+use crate::note;
+use crate::procs::{ProcTable, TraceeInfo};
 use crate::seccomp::{filter, notify};
 use crate::state::Ctx;
 use crate::sys::{errno, strerror};
-use crate::syscall::{NOTIFY_SYSCALLS, TRACE_SYSCALLS, nr};
+use crate::syscall::{
+    NAMESPACE_FLAG_SYSCALLS, NO_PTRACE_SYSCALLS, NOTIFY_SYSCALLS, REFUSED_SYSCALLS, TRACE_SYSCALLS, direct,
+    nr,
+};
 use crate::tracee::ptrace;
 use crate::tracer;
 use std::ffi::CString;
+use std::os::unix::ffi::OsStringExt;
 use std::sync::Arc;
 
 unsafe extern "C" {
@@ -37,8 +51,23 @@ pub fn run(config: Config) -> Result<i32, String> {
     }
     let mut config = config;
     resolve_command_in_path(&mut config);
-    let ctx = Arc::new(Ctx::new(config));
+    let no_ptrace = no_ptrace_mode();
+    let ctx = Arc::new(Ctx::new(config, no_ptrace));
+    if no_ptrace {
+        note!(
+            ctx,
+            1,
+            "running without ptrace: the trace tier is served through notifications"
+        );
+    }
     let mut notify_list: Vec<i64> = NOTIFY_SYSCALLS.to_vec();
+    notify_list.push(nr::CLONE3);
+    let trace_list: &[i64] = if no_ptrace {
+        notify_list.extend_from_slice(NO_PTRACE_SYSCALLS);
+        &[]
+    } else {
+        TRACE_SYSCALLS
+    };
     if ctx.config.kernel_release.is_some() || ctx.config.hostname.is_some() {
         notify_list.push(nr::UNAME);
     }
@@ -46,25 +75,34 @@ pub fn run(config: Config) -> Result<i32, String> {
         notify_list.extend_from_slice(crate::syscall::FAKE_ROOT_SYSCALLS);
     }
     let (native, compat) = (crate::abi::Abi::native(), crate::abi::Abi::compat());
-    let (notify64, trace64) = (
-        native.numbers_for(&notify_list),
-        native.numbers_for(TRACE_SYSCALLS),
-    );
-    let (notify32, trace32) = (
-        compat.numbers_for(&notify_list),
-        compat.numbers_for(TRACE_SYSCALLS),
+    let (notify64, trace64) = (native.numbers_for(&notify_list), native.numbers_for(trace_list));
+    let (notify32, trace32) = (compat.numbers_for(&notify_list), compat.numbers_for(trace_list));
+    let ns_list: Vec<i64> = NAMESPACE_FLAG_SYSCALLS
+        .iter()
+        .copied()
+        .filter(|nr| !notify_list.contains(nr))
+        .collect();
+    let (ns64, ns32) = (native.numbers_for(&ns_list), compat.numbers_for(&ns_list));
+    let (refused64, refused32) = (
+        native.numbers_for(REFUSED_SYSCALLS),
+        compat.numbers_for(REFUSED_SYSCALLS),
     );
     let program = filter::build(
         &filter::Table {
             abi: native,
             notify: &notify64,
             trace: &trace64,
+            ns_flags: &ns64,
+            refused: &refused64,
         },
         &filter::Table {
             abi: compat,
             notify: &notify32,
             trace: &trace32,
+            ns_flags: &ns32,
+            refused: &refused32,
         },
+        no_ptrace,
     );
 
     // argv[0] may be overridden (bwrap --argv0); the program path is always command[0].
@@ -106,6 +144,19 @@ pub fn run(config: Config) -> Result<i32, String> {
         );
     }
     let slash = CString::new("/").unwrap();
+    let pinned_cwd: Option<CString> = if no_ptrace {
+        let dir = shim::install()?;
+        Some(CString::new(dir.into_os_string().into_vec()).map_err(|_| "alias directory contains NUL")?)
+    } else {
+        None
+    };
+    let initial_cwd: Vec<u8> = if host_cwd_exists {
+        translate_path(&ctx.fs, std::process::id(), libc::AT_FDCWD, &ctx.config.cwd, true)
+            .map(|h| detranslate_path(&ctx.fs, &h))
+            .unwrap_or_else(|_| b"/".to_vec())
+    } else {
+        b"/".to_vec()
+    };
     // Caller-supplied seccomp programs (bwrap --seccomp): converted before fork so the child does not allocate.
     let extra_programs: Vec<Vec<filter::SockFilter>> = ctx
         .config
@@ -135,11 +186,19 @@ pub fn run(config: Config) -> Result<i32, String> {
         // Child: nothing here may allocate.
         unsafe {
             libc::close(sv[0]);
+            if let Some(dir) = &pinned_cwd {
+                // Before the filter, which makes chdir a notified syscall.
+                if libc::chdir(dir.as_ptr()) < 0 {
+                    libc::_exit(121);
+                }
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+            }
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
                 libc::_exit(120);
             }
             let fd = match filter::install(&program) {
                 Ok(fd) => fd,
+                Err(libc::EBUSY) => libc::_exit(119),
                 Err(_) => libc::_exit(122),
             };
             if !send_fd(sv[1], fd) {
@@ -161,7 +220,7 @@ pub fn run(config: Config) -> Result<i32, String> {
             }
             libc::close(sv[1]);
             // From here on every traced syscall is served by the parent.
-            if !host_cwd_exists || libc::chdir(cwd.as_ptr()) < 0 {
+            if pinned_cwd.is_none() && (!host_cwd_exists || libc::chdir(cwd.as_ptr()) < 0) {
                 libc::chdir(slash.as_ptr());
             }
             libc::execve(program_path, argv.as_ptr(), envp);
@@ -171,12 +230,26 @@ pub fn run(config: Config) -> Result<i32, String> {
     }
     unsafe { libc::close(sv[1]) };
     // Seize first: the child blocks on the handshake byte until we have.
-    if let Err(e) = ptrace::seize(pid, tracer::options(&ctx)) {
+    if no_ptrace {
+        ctx.procs.register_root(
+            pid,
+            TraceeInfo {
+                cwd: Some(initial_cwd),
+                ..Default::default()
+            },
+        );
+        if let Err(e) = ProcTable::start_reaper(&ctx.procs) {
+            eprintln!("proot: cannot watch process exits: {}", strerror(e));
+        }
+    } else if let Err(e) = ptrace::seize(pid, tracer::options(&ctx)) {
         unsafe {
             libc::kill(pid, libc::SIGKILL);
             libc::close(sv[0]);
             let mut st = 0;
             libc::waitpid(pid, &mut st, libc::__WALL);
+        }
+        if e == libc::EPERM && ctx.config.bwrap_mode {
+            exit_like_bwrap_without_namespaces();
         }
         return Err(match e {
             libc::EPERM => "ptrace(PTRACE_SEIZE) refused: this process is already traced (proot inside proot, or a debugger) or ptrace is disallowed here; nested proot is not supported yet".into(),
@@ -190,7 +263,10 @@ pub fn run(config: Config) -> Result<i32, String> {
             let mut st = 0;
             unsafe { libc::waitpid(pid, &mut st, libc::__WALL) };
             return Err(match libc::WEXITSTATUS(st) {
+                119 if ctx.config.bwrap_mode => exit_like_bwrap_without_namespaces(),
+                119 => "proot-next inside proot-next is not supported".into(),
                 120 => "PR_SET_NO_NEW_PRIVS refused".into(),
+                121 => "cannot enter the alias directory".into(),
                 124 => "the caller's --seccomp program was refused by the kernel".into(),
                 122 => "seccomp user notification is not available on this kernel or is filtered".into(),
                 _ => "child failed before handing over the seccomp listener".into(),
@@ -202,13 +278,19 @@ pub fn run(config: Config) -> Result<i32, String> {
         &ctx.config.json_status_fds,
         &format!("{{\"child-pid\": {pid}}}\n"),
     );
-    notify::start(listener, ctx.clone());
+    let pool = notify::start(listener, ctx.clone());
     let go = 1u8;
     if unsafe { libc::write(sv[0], &go as *const u8 as *const _, 1) } != 1 {
         return Err("could not release the first tracee".into());
     }
     unsafe { libc::close(sv[0]) };
-    let code = tracer::run(&ctx, pid);
+    let code = if no_ptrace {
+        let code = wait_root(pid);
+        pool.wait_closed();
+        code
+    } else {
+        tracer::run(&ctx, pid)
+    };
     unsafe { libc::close(listener) };
     report_status(
         &ctx.config.json_status_fds,
@@ -221,6 +303,55 @@ pub fn run(config: Config) -> Result<i32, String> {
         let _ = std::fs::remove_dir_all(std::ffi::OsStr::from_bytes_hack(dir));
     }
     Ok(code)
+}
+
+/// Whether to run without a ptrace tier.
+///
+/// `PROOT_NO_PTRACE` forces it (any value but `0`); otherwise the probe in
+/// `syscall::direct` decides.
+fn no_ptrace_mode() -> bool {
+    match std::env::var_os("PROOT_NO_PTRACE") {
+        Some(v) => v != "0",
+        None => !direct::ptrace_usable(),
+    }
+}
+
+/// Exits the way bubblewrap exits when it cannot create its namespaces.
+///
+/// A nested proot-next cannot work (the filter chain already has a listener,
+/// or the outer tracer owns the child), and in bwrap mode its caller is a
+/// program that started it as bubblewrap.  Those programs know this message
+/// (GTK's glycin runs its image loaders unsandboxed on seeing it), so it is
+/// the one to give.
+fn exit_like_bwrap_without_namespaces() -> ! {
+    eprintln!("bwrap: No permissions to create a new namespace: proot-next cannot nest");
+    std::process::exit(1);
+}
+
+/// Waits for the first tracee and returns the exit code to report.
+///
+/// Without ptrace the first tracee is the supervisor's only child; the pool
+/// then closes once no process uses the filter any more, the point at which
+/// the tracer loop would have run out of tracees.
+///
+/// # Arguments
+/// * `pid` - The first tracee.
+fn wait_root(pid: i32) -> i32 {
+    loop {
+        let mut status = 0;
+        if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+            if errno() == libc::EINTR {
+                continue;
+            }
+            return 1;
+        }
+        if libc::WIFEXITED(status) {
+            return libc::WEXITSTATUS(status);
+        }
+        if libc::WIFSIGNALED(status) {
+            return 128 + libc::WTERMSIG(status);
+        }
+    }
 }
 
 /// Writes one status line to each of bubblewrap's `--info-fd`/`--json-status-fd` descriptors.

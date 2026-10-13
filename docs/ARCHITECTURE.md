@@ -47,8 +47,89 @@ programs at the 32-bit loader.
 | notify | listener pool | open/stat/access/readlink/getcwd/mkdir/unlink/rename/link/symlink/chmod/chown/utimensat/truncate/statfs/xattr/inotify/openat2/statx... | result can be produced by the supervisor and written back or injected with ADDFD |
 | trace | ptrace stop | execve, execveat, chdir, chroot, connect, bind | must change the tracee's own state; args rewritten on its stack |
 | allow | none | everything else | no path involved |
+| refuse | `EPERM` from the filter | `clone`/`unshare` with a `CLONE_NEW*` flag, `setns`; `clone3` via a handler | see below |
 
 `uname` joins the notify tier only when `-k` fakes a kernel release.
+
+## No namespaces inside the guest
+
+The supervisor does the filesystem work in its own mount namespace.  A
+tracee that created one of its own (bubblewrap run by glycin for GTK's image
+loaders, Firefox's content sandbox, a nested bwrap) would get its `mkdir`s
+and `open`s served from the wrong namespace: bwrap's `newroot` landed in the
+host's `/tmp` and its loaders then failed.  So namespace creation is refused
+with `EPERM`, which is what a default Docker container answers too and what
+every such helper already handles: bwrap prints "No permissions to create a
+new namespace" and glycin falls back to running its loaders unsandboxed.
+`clone` and `unshare` are checked in BPF on their flags argument; `clone3`
+keeps its flags in memory, so it is notified in both modes and checked by
+`syscall::direct::do_clone`; `setns` is refused outright.
+
+The images also put the `bwrap` symlink on the guest's `PATH`, so a program
+inside a guest may run proot-next itself as its bubblewrap.  Nesting is not
+supported (a second listener on the filter chain is `EBUSY`, and with ptrace
+the outer tracer already owns the child), so in bwrap mode that failure is
+worded as bubblewrap words a sandbox it cannot build, for the same callers.
+
+## Without ptrace
+
+A container profile that filters the `ptrace` syscall still allows the
+listener, `process_vm_readv` and `/proc/<pid>/mem` (the kernel's access check
+for those is separate from the syscall), so the trace tier is served through
+notifications instead.  `launch.rs` probes with `PTRACE_PEEKUSER` on itself,
+which a working ptrace answers with `ESRCH` and a filter with its own errno;
+`PROOT_NO_PTRACE=1` forces the mode for testing.  A notification cannot
+change registers, only answer, continue, or install a descriptor, so
+(`syscall/direct.rs`):
+
+* `chdir`, `fchdir` and `chroot` are answered without running.  Each process
+  has a virtual cwd in `procs.rs`, path translation resolves relative paths
+  against it, and the kernel's own cwd of every tracee is pinned to the alias
+  directory under `$XDG_RUNTIME_DIR`.
+* `connect` and `bind` are done by the supervisor on a socket of the same
+  type and `O_NONBLOCK`/`O_CLOEXEC` (read from `/proc/net/unix` and
+  `fdinfo`), which replaces the tracee's descriptor through `ADDFD` with
+  `SETFD`.  Options set before the call and a `bind` before a `connect` are
+  lost; `SO_PEERCRED` names the supervisor.
+* `execve` cannot be retargeted from outside, so the path string is
+  overwritten in place through `/proc/<pid>/mem` (which, unlike
+  `process_vm_writev`, writes read-only pages) with `e`, a two-byte name that
+  resolves in the pinned cwd to a static trampoline (`exec/shim/`, embedded).
+  The supervisor writes `r<pid>` next to it with the planned exec path and
+  leading arguments, lets the exec continue, passes the trampoline's own
+  syscalls through untranslated while `/proc/<pid>/exe` is the trampoline,
+  and records the program at the trampoline's exec of the real target.  A
+  program the kernel would refuse is refused before the rewrite with the
+  kernel's errno (a shell depends on `ENOEXEC` to run `#!`-less scripts
+  itself; `binfmt_misc` entries are matched the kernel's way).  `execveat`
+  with `AT_EMPTY_PATH` replaces the descriptor with one on the trampoline;
+  a dirfd-relative path also replaces the dirfd with the alias directory.
+* `inotify_add_watch` and the `O_PATH` opens that cannot be served with a
+  read-only descriptor (sockets, devices, unreadable files, symlinks with
+  `O_NOFOLLOW`) get the same in-place rewrite to a transient one-character
+  symlink.  The original bytes are put back once the task has consumed the
+  argument, judged by CPU time from `/proc/<pid>/schedstat`
+  (`/proc/<pid>/syscall` reads `running` both before and after the copy), and
+  only if the memory still holds exactly what was written: a freed or reused
+  buffer is left alone.  A `vfork`/`posix_spawn` child's exec path lives in
+  the parent and is restored there under the same rule.
+* Without fork events, `procs.rs` discovers a process at its first
+  notification and copies its parent's state from `/proc`.  `clone` and
+  relatives are notified only to queue a snapshot of the parent for the
+  child, and a parent that exits first leaves its snapshots to an orphan
+  list, so a daemon's double fork inherits the right cwd.  Exits come from
+  pidfds polled by a reaper thread.  Thread-to-process mappings are cached
+  for a second.
+
+Nothing of the "looking like nothing is there" work applies: there is no
+tracer to hide, breakpoints and fatal signals are the kernel's business, and
+a guest can be debugged again.
+
+The cost is confined to the former trace tier.  One `bench/run.sh` run on
+the host above, same rootfs, ptrace mode against the no-ptrace mode: path
+lookups identical within noise, unix socket connect 3.2x against 2.3x,
+fork+wait 1.2x against 0.9x, fork+exec 1.4x against 1.9x (two execs per
+exec), `getcwd` 29x against 40x.
 
 ## Why a small warm pool
 
@@ -73,10 +154,18 @@ canonicalizes the joined guest path.
 The kernel resolves `PT_INTERP` itself, which would escape the guest.  The
 exec handler translates the program, expands `#!` interpreters, reads
 `PT_INTERP`, and re-targets the exec at the host path of the guest's dynamic
-loader with the program as its argument (`--argv0` on glibc).  The guest path
-of the program is remembered per process so `readlink(/proc/self/exe)` is
-answered truthfully.  Known gap: `AT_EXECFN` and the kernel's own notion of
-the exe point at the loader.
+loader with the program as its argument (`--argv0` on glibc).  Three things
+the kernel would have taken from the program are taken care of: the loader is
+given the resolved program path, since that is where it takes `$ORIGIN`
+from (Electron apps started through a `/usr/bin` symlink find their bundled
+libraries that way); it is reached through an alias named as the tracee
+named the program, so `comm` reads as the kernel would set it, a script
+keeping its own name (glibc's loader reports the program path in
+`AT_EXECFN` by itself); and `/proc/<pid>/cmdline` is served
+with the loader prefix removed, so `ps` and `pgrep -f` see the argv the
+tracee passed.  The guest path of the program is remembered per process so
+`readlink(/proc/self/exe)` is answered truthfully.  Known gap: the kernel's
+own notion of the exe, seen from outside the guest, is the alias.
 
 ## Looking like nothing is there
 
@@ -161,10 +250,17 @@ lookups.
   by construction, but untranslated).
 * Mount points for bindings are not "glued" into the rootfs listing: `ls /`
   only shows entries that physically exist in the rootfs.
-* Kernel-level `/proc/<pid>/exe`, `/proc/<pid>/comm` and `AT_EXECFN` name the
-  dynamic loader; `readlink` is answered from our own record.  A glibc older
-  than 2.33 in a rootfs loses `--argv0`.
+* Kernel-level `/proc/<pid>/exe` names the loader alias; `readlink` is
+  answered from our own record and `cmdline` is served, but a tool outside
+  the guest sees the alias.  A glibc older than 2.33 in a rootfs loses
+  `--argv0`, and with it the resolved `$ORIGIN`.
+* `execveat` of a memfd (`AT_EMPTY_PATH` on a descriptor without a path)
+  fails; PRoot refuses it too.
 * bwrap: `--dev` binds the host `/dev`; `--uid/--gid`, `--unshare-*` and the
   capability options are no-ops; `--hostname` only affects `uname`.
 * Opening a FIFO through a non-identity binding blocks a supervisor thread.
 * `name_to_handle_at` returns `EOPNOTSUPP`.
+* Without ptrace: a buffer refilled by the program between a rewrite and its
+  restore is not restored; `connect` after a `bind` on the same socket loses
+  the bind; a failed `execve` whose failure the kernel reported (not one
+  refused here) leaves `e` in the caller's path string.

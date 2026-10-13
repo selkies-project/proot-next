@@ -10,3 +10,5 @@
 /tests/probes/*/.cargo
 .usage
 sysbench
+/src/exec/shim/target
+/src/exec/shim/.cargo

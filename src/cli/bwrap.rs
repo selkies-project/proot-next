@@ -175,6 +175,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Config, CliError> {
         .map(|a| CString::new(a).unwrap_or_default())
         .collect();
     cfg.argv0 = argv0.map(|a| CString::new(a).unwrap_or_default());
+    cfg.bwrap_mode = true;
     Ok(cfg)
 }
 

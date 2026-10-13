@@ -2,9 +2,12 @@
 //!
 //! Three tiers: syscalls answered by the supervisor (`USER_NOTIF`), syscalls
 //! that need a ptrace stop to edit the tracee in place (`TRACE`), and
-//! everything else (`ALLOW`).  The host's 64-bit ABI and its 32-bit compat
-//! ABI each get a number table; any other audit arch (x32) is refused with
-//! `ENOSYS`.  A compat table may be empty, which refuses that ABI too.
+//! everything else (`ALLOW`).  Namespace creation is refused with `EPERM`,
+//! as a default container refuses it, because a tracee in a mount namespace
+//! of its own cannot be served from the supervisor's.  The host's 64-bit ABI
+//! and its 32-bit compat ABI each get a number table; any other audit arch
+//! (x32) is refused with `ENOSYS`.  A compat table may be empty, which
+//! refuses that ABI too.
 
 use crate::abi::Abi;
 use crate::sys::*;
@@ -42,6 +45,11 @@ pub struct Table<'a> {
     pub abi: Abi,
     pub notify: &'a [i64],
     pub trace: &'a [i64],
+    /// Syscalls whose first argument is refused with `EPERM` when it carries
+    /// a `CLONE_NEW*` bit (`clone`, `unshare`).
+    pub ns_flags: &'a [i64],
+    /// Syscalls refused with `EPERM` outright (`setns`).
+    pub refused: &'a [i64],
 }
 
 fn stmt(code: u16, k: u32) -> SockFilter {
@@ -68,6 +76,8 @@ enum Sub {
     OPath { arg: usize },
     /// `socketcall`: calls 2 (`bind`) and 3 (`connect`) go to the tracer, the rest are allowed.
     Socketcall,
+    /// `clone`/`unshare`: a `CLONE_NEW*` bit in the first argument is refused.
+    NsFlags,
 }
 
 impl Sub {
@@ -75,6 +85,7 @@ impl Sub {
         match self {
             Sub::OPath { .. } => 3,
             Sub::Socketcall => 4,
+            Sub::NsFlags => 3,
         }
     }
 }
@@ -83,15 +94,18 @@ impl Sub {
 ///
 /// `O_PATH` opens are routed to the tracer by inspecting the flags argument,
 /// because such descriptors cannot be injected with ADDFD; an i386
-/// `socketcall` is routed there for `bind` and `connect` only.
+/// `socketcall` is routed there for `bind` and `connect` only.  Without a
+/// tracer (`no_trace`) both go to the listener instead, like every entry of
+/// the trace lists.
 ///
 /// # Arguments
 /// * `t64` - The host's 64-bit ABI and its syscall lists.
 /// * `t32` - The host's 32-bit compat ABI and its lists (may be empty).
+/// * `no_trace` - Serve the trace tier through user notification.
 ///
 /// # Returns
 /// The instruction list, ready for `seccomp(2)`.
-pub fn build(t64: &Table, t32: &Table) -> Vec<SockFilter> {
+pub fn build(t64: &Table, t32: &Table, no_trace: bool) -> Vec<SockFilter> {
     // Per table: the (nr, sub) entries placed after the plain notify/trace lists.
     let subs_for = |t: &Table| -> Vec<(i64, Sub)> {
         let mut v: Vec<(i64, Sub)> = t
@@ -102,6 +116,7 @@ pub fn build(t64: &Table, t32: &Table) -> Vec<SockFilter> {
         if let Some(nr) = t.abi.socketcall_nr() {
             v.push((nr, Sub::Socketcall));
         }
+        v.extend(t.ns_flags.iter().map(|nr| (*nr, Sub::NsFlags)));
         v
     };
     let (subs64, subs32) = (subs_for(t64), subs_for(t32));
@@ -118,17 +133,17 @@ pub fn build(t64: &Table, t32: &Table) -> Vec<SockFilter> {
         .copied()
         .filter(|nr| t32.abi.open_flags_arg(*nr).is_none())
         .collect();
-    let n64 = plain64.len() + t64.trace.len() + subs64.len();
-    let n32 = plain32.len() + t32.trace.len() + subs32.len();
+    let n64 = plain64.len() + t64.trace.len() + t64.refused.len() + subs64.len();
+    let n32 = plain32.len() + t32.trace.len() + t32.refused.len() + subs32.len();
     let sub_len: usize = subs64.iter().chain(subs32.iter()).map(|(_, s)| s.len()).sum();
-    let total = 4 + n64 + 2 + n32 + 1 + sub_len + 4;
+    let total = 4 + n64 + 2 + n32 + 1 + sub_len + 5;
     assert!(total < 255, "filter too large for 8-bit jump offsets");
     // Layout (indices):
     //   0      ld arch
     //   1      jeq arch64 -> 3 ; else -> 2
     //   2      jeq arch32 -> T32 ; else -> E
     //   3      ld nr
-    //   4..    64-bit table: plain notify, trace, sub entries
+    //   4..    64-bit table: plain notify, trace, refused, sub entries
     //   A      ret ALLOW
     //   T32    ld nr
     //   T32+1.. 32-bit table
@@ -137,13 +152,17 @@ pub fn build(t64: &Table, t32: &Table) -> Vec<SockFilter> {
     //   N      ret NOTIF
     //   T      ret TRACE
     //   E      ret ERRNO(ENOSYS)
+    //   P      ret ERRNO(EPERM)
+    //   A3     ret ALLOW (for sub-blocks, which cannot jump backwards)
     let a = 4 + n64;
     let t32_idx = a + 1;
     let a2 = t32_idx + 1 + n32;
     let sub_base = a2 + 1;
     let n_idx = sub_base + sub_len;
-    let t_idx = n_idx + 1;
+    let t_idx = if no_trace { n_idx } else { n_idx + 1 };
     let e_idx = n_idx + 2;
+    let p_idx = e_idx + 1;
+    let a3_idx = e_idx + 2;
     let off = |from: usize, to: usize| (to - from - 1) as u8;
     // Start index of sub-block k (over the concatenation of subs64 and subs32).
     let sub_index = |k: usize| -> usize {
@@ -168,6 +187,7 @@ pub fn build(t64: &Table, t32: &Table) -> Vec<SockFilter> {
                       start: usize,
                       plain: &[i64],
                       trace: &[i64],
+                      refused: &[i64],
                       subs: &[(i64, Sub)],
                       k0: usize| {
         let mut i = start;
@@ -179,15 +199,27 @@ pub fn build(t64: &Table, t32: &Table) -> Vec<SockFilter> {
             f.push(jump(*nr as u32, off(i, t_idx), 0));
             i += 1;
         }
+        for nr in refused {
+            f.push(jump(*nr as u32, off(i, p_idx), 0));
+            i += 1;
+        }
         for (k, (nr, _)) in subs.iter().enumerate() {
             f.push(jump(*nr as u32, off(i, sub_index(k0 + k)), 0));
             i += 1;
         }
     };
-    emit_table(&mut f, 4, &plain64, t64.trace, &subs64, 0);
+    emit_table(&mut f, 4, &plain64, t64.trace, t64.refused, &subs64, 0);
     f.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
     f.push(stmt(BPF_LD_W_ABS, 0));
-    emit_table(&mut f, t32_idx + 1, &plain32, t32.trace, &subs32, subs64.len());
+    emit_table(
+        &mut f,
+        t32_idx + 1,
+        &plain32,
+        t32.trace,
+        t32.refused,
+        &subs32,
+        subs64.len(),
+    );
     f.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
     for (k, (_, sub)) in subs64.iter().chain(subs32.iter()).enumerate() {
         let here = sub_index(k);
@@ -212,12 +244,27 @@ pub fn build(t64: &Table, t32: &Table) -> Vec<SockFilter> {
                 f.push(jump(2, off(here + 1, t_idx), 0)); // SYS_BIND
                 f.push(jump(3, off(here + 2, t_idx), 0)); // SYS_CONNECT
                 // BPF cannot jump backwards to the table's ALLOW, so the other
-                // calls go forward to the trailing ALLOW after E.
+                // calls go forward to the trailing ALLOW.
                 f.push(SockFilter {
                     code: BPF_JA,
                     jt: 0,
                     jf: 0,
-                    k: off(here + 3, e_idx + 1) as u32,
+                    k: off(here + 3, a3_idx) as u32,
+                });
+            }
+            Sub::NsFlags => {
+                f.push(stmt(BPF_LD_W_ABS, arg_offset(0)));
+                f.push(SockFilter {
+                    code: BPF_JSET_K,
+                    jt: off(here + 1, p_idx),
+                    jf: 0,
+                    k: crate::syscall::CLONE_NEWNS_FLAGS as u32,
+                });
+                f.push(SockFilter {
+                    code: BPF_JA,
+                    jt: 0,
+                    jf: 0,
+                    k: off(here + 2, a3_idx) as u32,
                 });
             }
         }
@@ -225,9 +272,10 @@ pub fn build(t64: &Table, t32: &Table) -> Vec<SockFilter> {
     f.push(stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF));
     f.push(stmt(BPF_RET_K, SECCOMP_RET_TRACE));
     f.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
-    // Trailing ALLOW for sub-blocks that fall through (socketcall other than bind/connect).
+    f.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
+    // Trailing ALLOW for sub-blocks that fall through.
     f.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
-    debug_assert_eq!(f.len(), e_idx + 2);
+    debug_assert_eq!(f.len(), a3_idx + 1);
     f
 }
 
@@ -354,12 +402,43 @@ mod tests {
                 abi: Abi::X86_64,
                 notify: &[2, 257],
                 trace: &[59, 80],
+                ns_flags: &[56, 272],
+                refused: &[308],
             },
             &Table {
                 abi: Abi::I386,
                 notify: &[5, 295],
                 trace: &[11, 12],
+                ns_flags: &[120, 310],
+                refused: &[346],
             },
+            false,
+        );
+        let eperm = SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_X86_64, 56, [0x1200011, 0, 0, 0, 0, 0]),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_X86_64, 56, [0x10000011, 0, 0, 0, 0, 0]),
+            eperm
+        );
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_X86_64, 272, [0x20000, 0, 0, 0, 0, 0]),
+            eperm
+        );
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_X86_64, 272, [0x200, 0, 0, 0, 0, 0]),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(run_args(&p, AUDIT_ARCH_X86_64, 308, [0; 6]), eperm);
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_I386, 120, [0x10000011, 0, 0, 0, 0, 0]),
+            eperm
+        );
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_I386, 102, [1, 0, 0, 0, 0, 0]),
+            SECCOMP_RET_ALLOW
         );
         assert_eq!(run(&p, AUDIT_ARCH_X86_64, 2), SECCOMP_RET_USER_NOTIF);
         assert_eq!(run(&p, AUDIT_ARCH_X86_64, 257), SECCOMP_RET_USER_NOTIF);
@@ -400,12 +479,17 @@ mod tests {
                 abi: Abi::Aarch64,
                 notify: &[56, 79],
                 trace: &[221],
+                ns_flags: &[],
+                refused: &[],
             },
             &Table {
                 abi: Abi::Arm,
                 notify: &[],
                 trace: &[],
+                ns_flags: &[],
+                refused: &[],
             },
+            false,
         );
         assert_eq!(
             run_args(&q, AUDIT_ARCH_AARCH64, 56, [0, 0, 0, 0, 0, 0]),
@@ -421,5 +505,41 @@ mod tests {
             run(&q, AUDIT_ARCH_ARM, 5),
             SECCOMP_RET_ERRNO | libc::ENOSYS as u32
         );
+    }
+
+    #[test]
+    fn without_a_tracer_everything_is_notified() {
+        let p = build(
+            &Table {
+                abi: Abi::X86_64,
+                notify: &[2, 59, 257],
+                trace: &[],
+                ns_flags: &[272],
+                refused: &[],
+            },
+            &Table {
+                abi: Abi::I386,
+                notify: &[5, 11, 295],
+                trace: &[],
+                ns_flags: &[],
+                refused: &[],
+            },
+            true,
+        );
+        let opath = libc::O_PATH as u64;
+        assert_eq!(run(&p, AUDIT_ARCH_X86_64, 59), SECCOMP_RET_USER_NOTIF);
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_X86_64, 257, [0, 0, opath, 0, 0, 0]),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_I386, 102, [3, 0, 0, 0, 0, 0]),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_I386, 102, [1, 0, 0, 0, 0, 0]),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(run(&p, AUDIT_ARCH_I386, 11), SECCOMP_RET_USER_NOTIF);
     }
 }

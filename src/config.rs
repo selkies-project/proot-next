@@ -55,6 +55,8 @@ pub struct Config {
     pub hostname: Option<Vec<u8>>,
     /// `argv[0]` to give the command when it differs from `command[0]` (bwrap `--argv0`).
     pub argv0: Option<CString>,
+    /// Invoked through the bubblewrap front end: failures are worded as bwrap words them.
+    pub bwrap_mode: bool,
 }
 
 impl Default for Config {
@@ -92,6 +94,7 @@ impl Default for Config {
             new_session: false,
             hostname: None,
             argv0: None,
+            bwrap_mode: false,
         }
     }
 }

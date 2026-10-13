@@ -6,12 +6,19 @@ use super::Fs;
 use super::canon::canonicalize;
 use crate::sys::{PATH_MAX, Result};
 
-/// Reads the guest path of a tracee's working directory.
+/// The guest path of a tracee's working directory.
+///
+/// Without ptrace the kernel's cwd of every tracee is pinned to the alias
+/// directory and the real one is kept in the process table; otherwise it is
+/// read from `/proc`.
 ///
 /// # Arguments
 /// * `fs` - Guest filesystem view.
 /// * `pid` - Tracee thread id.
 pub fn guest_cwd(fs: &Fs, pid: u32) -> Result<Vec<u8>> {
+    if let Some(cwd) = fs.virtual_cwd(pid as i32) {
+        return Ok(cwd);
+    }
     let host = strip_deleted(read_link(format!("/proc/{pid}/cwd").as_bytes())?);
     Ok(detranslate_path(fs, &host))
 }

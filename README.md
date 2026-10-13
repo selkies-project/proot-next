@@ -19,7 +19,9 @@ supervisor threads reads the path out of the tracee, translates it, performs
 the real syscall itself and hands the result (or an injected descriptor) back.
 Only `execve`, `chdir`, `chroot` and unix-socket `bind`/`connect` take a
 ptrace stop, because they must change the tracee's own state in place.
-Everything else runs untraced at native speed.
+Everything else runs untraced at native speed.  Where a container's seccomp
+profile filters ptrace out, those few are served through notifications as
+well, with an exec trampoline and a virtual working directory.
 
 Measured against PRoot 5.5.0 on the same host with `-R` on the same rootfs
 (`bench/` has the harness and `docs/ARCHITECTURE.md` the table): path lookups

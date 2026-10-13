@@ -9,6 +9,30 @@ You are starting proot-next from inside a shell that already runs under
 proot-next, or under a debugger. Nested proot is not supported yet. Open a
 fresh terminal.
 
+In bwrap mode the same situation reads `bwrap: No permissions to create a
+new namespace: proot-next cannot nest` and exits 1: the images put the
+`bwrap` symlink on the guest's `PATH`, so a program inside a guest that
+looks for bubblewrap (GTK's glycin image loaders, WebKit) may find proot-next
+instead, and that wording is the one such programs take as "no sandbox
+here" before carrying on without one.
+
+A container whose seccomp profile filters the `ptrace` syscall does not reach
+this message: proot-next notices at start-up and runs without the ptrace
+tier. `PROOT_NO_PTRACE=1` selects that mode by hand; `proot -v 1` (or
+`PROOT_VERBOSE=1`) says `running without ptrace` when it is in effect.
+
+### `cannot install the exec shim`
+
+Without ptrace, an exec goes through a small static program that proot-next
+writes under `$XDG_RUNTIME_DIR`, then `$TMPDIR`, then `~/.cache`. Every
+candidate was on a `noexec` mount or not writable. Point `XDG_RUNTIME_DIR` at
+a directory where programs may run.
+
+### `proot: exec shim: cannot execute ...`
+
+The trampoline could not exec the real program: the message carries the
+errno. The process exits 126, or 127 for a missing file, as a shell would.
+
 ### `seccomp user notification is not available on this kernel or is filtered`
 
 The kernel is older than 5.0, or a seccomp policy outside Docker's default
