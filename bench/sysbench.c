@@ -15,6 +15,7 @@
  * Each test is self-contained and runs in a temp directory.
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -80,39 +81,81 @@ static void die(const char *what)
 	exit(1);
 }
 
+static void join_path(char *dst, size_t size, const char *dir, const char *name)
+{
+	int n = snprintf(dst, size, "%s/%s", dir, name);
+	if (n < 0 || (size_t) n >= size) {
+		fprintf(stderr, "path too long: %s/%s\n", dir, name);
+		exit(1);
+	}
+}
+
 static void setup_tree(void)
 {
 	const char *tmp = getenv("TMPDIR");
+	char name[32];
 	char cur[PATH_MAX];
 	int fd;
 
-	if (tmp == NULL)
+	if (tmp == NULL || *tmp == '\0')
 		tmp = "/tmp";
-	snprintf(base, sizeof(base), "%s/sysbench.%d", tmp, (int) getpid());
+	snprintf(name, sizeof(name), "sysbench.%d", (int) getpid());
+	join_path(base, sizeof(base), tmp, name);
 	if (mkdir(base, 0700) < 0)
 		die("mkdir base");
-	strcpy(cur, base);
+	memcpy(cur, base, sizeof(cur));
 	for (int d = 0; d < 8; d++) {
-		strcat(cur, "/dir");
+		char next[PATH_MAX];
+		join_path(next, sizeof(next), cur, "dir");
+		memcpy(cur, next, sizeof(cur));
 		if (mkdir(cur, 0700) < 0)
 			die("mkdir depth");
 	}
-	snprintf(deep_file, sizeof(deep_file), "%s/file", cur);
-	fd = open(deep_file, O_WRONLY | O_CREAT, 0600);
+	join_path(deep_file, sizeof(deep_file), cur, "file");
+	fd = open(deep_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	if (fd < 0)
 		die("create deep file");
 	write(fd, "x", 1);
 	close(fd);
-	snprintf(link_path, sizeof(link_path), "%s/link", base);
+	join_path(link_path, sizeof(link_path), base, "link");
 	if (symlink(deep_file, link_path) < 0)
 		die("symlink");
 }
 
+/* Removes everything below dirfd without following symlinks, then dirfd itself is closed. */
+static void remove_tree_at(int dirfd)
+{
+	DIR *dir = fdopendir(dirfd);
+	struct dirent *ent;
+
+	if (dir == NULL) {
+		close(dirfd);
+		return;
+	}
+	while ((ent = readdir(dir)) != NULL) {
+		struct stat st;
+		if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+			continue;
+		if (fstatat(dirfd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0)
+			continue;
+		if (S_ISDIR(st.st_mode)) {
+			int sub = openat(dirfd, ent->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+			if (sub >= 0)
+				remove_tree_at(sub);
+			unlinkat(dirfd, ent->d_name, AT_REMOVEDIR);
+		} else {
+			unlinkat(dirfd, ent->d_name, 0);
+		}
+	}
+	closedir(dir);
+}
+
 static void teardown_tree(void)
 {
-	char cmd[PATH_MAX + 16];
-	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", base);
-	system(cmd);
+	int fd = open(base, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	if (fd >= 0)
+		remove_tree_at(fd);
+	rmdir(base);
 }
 
 /* ---- threaded stat storm: shows tracer serialisation ---- */
@@ -195,6 +238,7 @@ int main(int argc, char **argv)
 		}
 	}
 	signal(SIGPIPE, SIG_IGN);
+	atexit(teardown_tree);
 	setup_tree();
 	printf("# sysbench: %ld iterations, deep path %s\n", iterations, deep_file);
 
@@ -280,8 +324,12 @@ int main(int argc, char **argv)
 		char sp[PATH_MAX];
 		int lfd;
 		struct sockaddr_un sa = { .sun_family = AF_UNIX };
-		snprintf(sp, sizeof(sp), "%s/sock", base);
-		strncpy(sa.sun_path, sp, sizeof(sa.sun_path) - 1);
+		join_path(sp, sizeof(sp), base, "sock");
+		if (strlen(sp) >= sizeof(sa.sun_path)) {
+			fprintf(stderr, "socket path too long: %s\n", sp);
+			exit(1);
+		}
+		memcpy(sa.sun_path, sp, strlen(sp) + 1);
 		lfd = socket(AF_UNIX, SOCK_STREAM, 0);
 		bind(lfd, (struct sockaddr *) &sa, sizeof(sa));
 		listen(lfd, 64);
@@ -302,7 +350,5 @@ int main(int argc, char **argv)
 
 	/* --- process creation --- */
 	bench_fork();
-
-	teardown_tree();
 	return 0;
 }
