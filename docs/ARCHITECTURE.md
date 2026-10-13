@@ -113,6 +113,10 @@ change registers, only answer, continue, or install a descriptor, so
   only if the memory still holds exactly what was written: a freed or reused
   buffer is left alone.  A `vfork`/`posix_spawn` child's exec path lives in
   the parent and is restored there under the same rule.
+* The supervisor reads and writes tracee memory on its own authority, which
+  Yama's default `ptrace_scope` of 1 (Ubuntu) grants only towards
+  descendants, so it makes itself a child subreaper: a double-forked daemon
+  is adopted rather than handed to init, and reaped by the launcher.
 * Without fork events, `procs.rs` discovers a process at its first
   notification and copies its parent's state from `/proc`.  `clone` and
   relatives are notified only to queue a snapshot of the parent for the
@@ -261,6 +265,7 @@ lookups.
 * Opening a FIFO through a non-identity binding blocks a supervisor thread.
 * `name_to_handle_at` returns `EOPNOTSUPP`.
 * Without ptrace: a buffer refilled by the program between a rewrite and its
-  restore is not restored; `connect` after a `bind` on the same socket loses
+  restore is not restored, and one read back in the microseconds before the
+  restore shows the alias; `connect` after a `bind` on the same socket loses
   the bind; a failed `execve` whose failure the kernel reported (not one
   refused here) leaves `e` in the caller's path string.

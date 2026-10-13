@@ -487,10 +487,11 @@ fn fatal_signal_report_names_the_module() {
     );
 }
 
+/// A child exiting sends SIGCHLD to a shell that often has a notification
+/// queued; the listener then reports ENOENT, which must not be taken for the
+/// end of the pool.
 #[test]
 fn signals_landing_on_queued_notifications_do_not_stop_the_pool() {
-    // A child exiting sends SIGCHLD to a shell that often has a notification queued;
-    // the listener then reports ENOENT, which must not be taken for the end of the pool.
     let mut child = Command::new(proot())
         .args([
             "-r",
@@ -515,11 +516,12 @@ fn signals_landing_on_queued_notifications_do_not_stop_the_pool() {
     assert_eq!(stdout(&o), "done-300");
 }
 
+/// A sandbox helper (bubblewrap for glycin, Firefox's content sandbox) must
+/// see the EPERM a default container gives it and fall back, since a tracee
+/// in its own mount namespace could not be served from the supervisor's.
+/// Plain forks, through clone or clone3, keep working.
 #[test]
 fn namespaces_are_refused_inside_the_guest() {
-    // A sandbox helper (bubblewrap for glycin, Firefox's content sandbox) must see the EPERM a
-    // default container gives it and fall back, since a tracee in its own mount namespace could
-    // not be served from the supervisor's.  Plain forks, through clone or clone3, keep working.
     let script = "import os\n\
                   try:\n    os.unshare(os.CLONE_NEWUSER); print('unshared')\n\
                   except PermissionError: print('refused')\n\
@@ -551,10 +553,11 @@ fn namespaces_are_refused_inside_the_guest() {
     }
 }
 
+/// Images put the bwrap symlink on the guest's PATH, so GTK's glycin may pick
+/// it instead of the rootfs's bubblewrap; a nested proot-next must then fail
+/// with the words glycin recognizes.
 #[test]
 fn nested_bwrap_mode_fails_like_bubblewrap_without_namespaces() {
-    // Images put the bwrap symlink on the guest's PATH, so GTK's glycin may pick it instead of the
-    // rootfs's bubblewrap; a nested proot-next must then fail with the words glycin recognizes.
     let d = tmpdir("nested");
     let bwrap = d.join("bwrap");
     std::os::unix::fs::symlink(proot(), &bwrap).unwrap();
@@ -575,10 +578,11 @@ fn nested_bwrap_mode_fails_like_bubblewrap_without_namespaces() {
     );
 }
 
+/// ps, pgrep -f and programs reading their own command line must not see the
+/// loader the exec was retargeted at, and a script's comm is the script's
+/// name, not its interpreter's.
 #[test]
 fn cmdline_and_comm_read_as_the_kernel_would_give_them() {
-    // ps, pgrep -f and programs reading their own command line must not see the loader the
-    // exec was retargeted at, and a script's comm is the script's name, not its interpreter's.
     let d = tmpdir("cmdline");
     std::fs::write(
         d.join("tool.sh"),
@@ -605,10 +609,11 @@ fn cmdline_and_comm_read_as_the_kernel_would_give_them() {
     );
 }
 
+/// Electron apps find their bundled libraries through an $ORIGIN rpath and
+/// are started through a symlink in /usr/bin; the loader must see the
+/// resolved program path.
 #[test]
 fn origin_rpath_resolves_through_a_symlinked_program() {
-    // Electron apps find their bundled libraries through an $ORIGIN rpath and are started
-    // through a symlink in /usr/bin; the loader must see the resolved program path.
     if Command::new("cc").arg("--version").output().is_err() {
         eprintln!("skipping: no C compiler for the $ORIGIN probe");
         return;
@@ -646,9 +651,11 @@ fn origin_rpath_resolves_through_a_symlinked_program() {
     assert_eq!(stdout(&o), "answer 42", "{}", String::from_utf8_lossy(&o.stderr));
 }
 
+/// Dynamic programs, scripts, argv[0] and /proc/self/exe all go through the
+/// exec shim; a script without `#!` is refused with ENOEXEC so the shell
+/// runs it itself.
 #[test]
 fn no_ptrace_execs_through_the_trampoline() {
-    // Dynamic programs, scripts, argv[0] and /proc/self/exe all go through the exec shim.
     let d = tmpdir("np-exec");
     std::fs::write(
         d.join("s.sh"),
@@ -673,7 +680,6 @@ fn no_ptrace_execs_through_the_trampoline() {
         String::from_utf8_lossy(&o.stderr)
     );
     assert!(out.ends_with("\nsh\ncat"), "{out}");
-    // A script without #! is refused with ENOEXEC so the shell runs it itself.
     std::fs::write(d.join("plain"), "echo plain-ok\n").unwrap();
     chmod_x(&d.join("plain"));
     let o = run_no_ptrace(&[
@@ -721,9 +727,10 @@ fn no_ptrace_working_directory_is_virtual() {
     );
 }
 
+/// A daemon forks twice and the middle process exits before the grandchild
+/// makes a syscall.
 #[test]
 fn no_ptrace_orphans_inherit_the_working_directory() {
-    // A daemon forks twice and the middle process exits before the grandchild makes a syscall.
     let d = tmpdir("np-orphan");
     let script = "import os, time\n\
                   os.chdir('/pn-o')\n\
@@ -775,6 +782,8 @@ fn no_ptrace_unix_sockets_bind_and_connect_through_bindings() {
     assert!(d.join("sock").exists());
 }
 
+/// The buffer is put back shortly after the syscall returns, so the check
+/// waits a moment before reading it.
 #[test]
 fn no_ptrace_inotify_and_opath_keep_the_callers_buffer() {
     use std::os::unix::fs::PermissionsExt;
@@ -782,11 +791,12 @@ fn no_ptrace_inotify_and_opath_keep_the_callers_buffer() {
     std::fs::create_dir(d.join("dir")).unwrap();
     std::fs::write(d.join("secret"), "xyz").unwrap();
     std::fs::set_permissions(d.join("secret"), std::fs::Permissions::from_mode(0o000)).unwrap();
-    let script = "import ctypes, os\n\
+    let script = "import ctypes, os, time\n\
                   libc = ctypes.CDLL(None, use_errno=True)\n\
                   fd = libc.inotify_init1(0); buf = ctypes.create_string_buffer(b'/pn-i/dir')\n\
                   assert libc.inotify_add_watch(fd, buf, 0x100) >= 0, os.strerror(ctypes.get_errno())\n\
                   open('/pn-i/dir/new', 'w').close(); ev = os.read(fd, 256)\n\
+                  time.sleep(0.2)\n\
                   print(buf.value.decode(), ev[16:].rstrip(b'\\0').decode())\n\
                   p = os.open('/pn-i/secret', os.O_PATH); print(os.fstat(p).st_size)";
     let o = run_no_ptrace(&[
@@ -806,9 +816,10 @@ fn no_ptrace_inotify_and_opath_keep_the_callers_buffer() {
     );
 }
 
+/// posix_spawn shares the parent's memory until the exec; fexecve names no
+/// path at all.
 #[test]
 fn no_ptrace_spawn_and_fexecve() {
-    // posix_spawn shares the parent's memory until the exec; fexecve names no path at all.
     let d = tmpdir("np-spawn");
     std::fs::write(d.join("h.sh"), "#!/bin/sh\necho hello $1\n").unwrap();
     chmod_x(&d.join("h.sh"));

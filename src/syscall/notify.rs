@@ -154,7 +154,6 @@ pub fn handle(ctx: &Ctx, listener: i32, req: &SeccompNotif) {
         return;
     };
     let raw_nr = req.data.nr as i64;
-    // Without ptrace an i386 `socketcall` arrives here for `bind`/`connect`.
     let (nr, variant) = if ctx.no_ptrace && abi.socketcall_nr() == Some(raw_nr) {
         (SOCKETCALL, Variant::Same)
     } else {

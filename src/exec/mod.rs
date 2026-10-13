@@ -69,7 +69,15 @@ pub struct ExecPlan {
 /// `#!` scripts are expanded into interpreter plus argument, repeatedly,
 /// until an ELF is reached; a dynamically linked ELF is re-targeted at the
 /// host copy of its loader with the program's guest path as the loader's
-/// argument.
+/// argument.  The loader takes the program's `$ORIGIN` from the path it is
+/// given, where the kernel would take it from the resolved executable, so a
+/// loader that accepts `--argv0` gets the canonical path and the name as
+/// typed separately; a loader without it uses the path as `argv[0]`, on
+/// which multi-call binaries (busybox) dispatch, so it gets the name as
+/// typed unless that name is dirfd-relative and meaningless after the
+/// rewrite.  The loader is reached through an alias named as the tracee
+/// named the program, which is where the kernel takes `comm` from, so a
+/// script keeps its own name rather than its interpreter's.
 ///
 /// # Arguments
 /// * `ctx` - Shared supervisor state.
@@ -136,13 +144,6 @@ pub fn plan(
                     v.push(b"--argv0".to_vec());
                     v.push(argv[0].clone());
                 }
-                // The loader takes the program's `$ORIGIN` from the path it is
-                // given, where the kernel would take it from the resolved
-                // executable, so the canonical path goes to a loader that
-                // takes argv[0] separately.  A loader without --argv0 uses the
-                // path as argv[0], on which multi-call binaries (busybox)
-                // dispatch, so it gets the name as typed, unless that name is
-                // dirfd-relative and meaningless after the rewrite.
                 v.push(
                     if !argv0_supported && (dirfd == libc::AT_FDCWD || argv0_user.first() == Some(&b'/')) {
                         argv0_user.clone()
@@ -152,9 +153,6 @@ pub fn plan(
                 );
                 v.extend(argv[1..].iter().cloned());
                 changed = true;
-                // Exec the loader through an alias named as the tracee named the
-                // program, which is where the kernel takes comm and AT_EXECFN from
-                // (a script keeps its own name, not its interpreter's).
                 let exec_as = loader_alias(&host_interp, exec_name(user_path, &guest_prog))
                     .unwrap_or_else(|| host_interp.clone());
                 v[0] = exec_as.clone();

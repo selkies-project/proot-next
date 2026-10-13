@@ -146,6 +146,7 @@ pub fn run(config: Config) -> Result<i32, String> {
     let slash = CString::new("/").unwrap();
     let pinned_cwd: Option<CString> = if no_ptrace {
         let dir = shim::install()?;
+        become_subreaper();
         Some(CString::new(dir.into_os_string().into_vec()).map_err(|_| "alias directory contains NUL")?)
     } else {
         None
@@ -187,7 +188,6 @@ pub fn run(config: Config) -> Result<i32, String> {
         unsafe {
             libc::close(sv[0]);
             if let Some(dir) = &pinned_cwd {
-                // Before the filter, which makes chdir a notified syscall.
                 if libc::chdir(dir.as_ptr()) < 0 {
                     libc::_exit(121);
                 }
@@ -328,30 +328,60 @@ fn exit_like_bwrap_without_namespaces() -> ! {
     std::process::exit(1);
 }
 
-/// Waits for the first tracee and returns the exit code to report.
+/// Makes the supervisor the parent of every orphan among its descendants.
 ///
-/// Without ptrace the first tracee is the supervisor's only child; the pool
-/// then closes once no process uses the filter any more, the point at which
-/// the tracer loop would have run out of tracees.
+/// Without ptrace the supervisor reads and writes tracee memory on its own
+/// authority, which Yama's default `ptrace_scope` of 1 grants only towards
+/// descendants.  A daemon that double-forks would be reparented to init and
+/// lose that standing; as a child subreaper the supervisor adopts it
+/// instead, and [`wait_root`] reaps it.
+fn become_subreaper() {
+    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+}
+
+/// Waits for the first tracee and returns the exit code to report, reaping
+/// every other child along the way.
+///
+/// Without ptrace the first tracee is the supervisor's own child and, with
+/// [`become_subreaper`], so is every orphaned descendant.  Once the first
+/// tracee is gone a thread keeps reaping until the process exits; the pool
+/// closes when no process uses the filter any more, the point at which the
+/// tracer loop would have run out of tracees.
 ///
 /// # Arguments
 /// * `pid` - The first tracee.
 fn wait_root(pid: i32) -> i32 {
-    loop {
+    let code = loop {
         let mut status = 0;
-        if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
-            if errno() == libc::EINTR {
-                continue;
+        let got = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if got < 0 {
+            match errno() {
+                libc::EINTR => continue,
+                _ => break 1,
             }
-            return 1;
+        }
+        if got != pid {
+            continue;
         }
         if libc::WIFEXITED(status) {
-            return libc::WEXITSTATUS(status);
+            break libc::WEXITSTATUS(status);
         }
         if libc::WIFSIGNALED(status) {
-            return 128 + libc::WTERMSIG(status);
+            break 128 + libc::WTERMSIG(status);
         }
-    }
+    };
+    std::thread::Builder::new()
+        .name("subreaper".into())
+        .spawn(|| {
+            loop {
+                let mut status = 0;
+                if unsafe { libc::waitpid(-1, &mut status, 0) } < 0 && errno() == libc::ECHILD {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        })
+        .expect("spawn subreaper thread");
+    code
 }
 
 /// Writes one status line to each of bubblewrap's `--info-fd`/`--json-status-fd` descriptors.
