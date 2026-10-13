@@ -9,3 +9,4 @@
 /tests/probes/*/target
 /tests/probes/*/.cargo
 .usage
+sysbench

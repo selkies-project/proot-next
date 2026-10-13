@@ -21,10 +21,11 @@ Only `execve`, `chdir`, `chroot` and unix-socket `bind`/`connect` take a
 ptrace stop, because they must change the tracee's own state in place.
 Everything else runs untraced at native speed.
 
-Measured in an unprivileged default Docker container (see `docs/ARCHITECTURE.md`
-for the methodology): path lookups 1.3x to 2.5x faster than PRoot's perf
-branch, result-returning calls like `readlink`/`getcwd`/`uname` 2x to 3x faster,
-and `connect`/`prctl`/`close` at native speed.
+Measured against PRoot 5.5.0 on the same host with `-R` on the same rootfs
+(`bench/` has the harness and `docs/ARCHITECTURE.md` the table): path lookups
+1.1x to 1.6x faster, `readlink`/`getcwd` 1.7x to 2.8x faster, `stat` from 16
+threads 2x faster, and `uname`/`prctl` at native speed where PRoot
+stops them.
 
 ## Install
 

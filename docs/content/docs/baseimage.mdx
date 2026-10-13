@@ -1,57 +1,40 @@
 ---
 title: "Container images"
-description: "How proot-apps and the selkies baseimages ship and wire the binary."
+description: "Why proot-next exists and how the selkies images use it."
 ---
 
-This is the layout the linuxserver images move to. One binary, one symlink,
-no shim.
+proot-next was written for the [selkies](https://github.com/selkies-project)
+desktop images and for [proot-apps](https://github.com/linuxserver/proot-apps),
+which runs desktop applications from container images inside those images.
+They run on hosts the image author does not control: a default Docker install,
+Kubernetes, a NAS. Three things are usually missing there, and this project
+is the answer to all three.
 
-## proot-apps
+- **No user namespaces.** Docker's default seccomp and AppArmor profiles stop
+  `unshare(CLONE_NEWUSER)`, so bubblewrap cannot create a sandbox, and Steam's
+  pressure-vessel refuses to launch a game without one. proot-next answers to
+  the `bwrap` name and runs the game's container the way bubblewrap would, see
+  [bwrap mode](/docs/bwrap).
+- **No FUSE and no `chroot`.** The application user cannot mount anything, so
+  a rootfs pulled from a registry has to be entered by path translation.
+- **Browsers.** Chromium-based applications open tens of thousands of files at
+  start-up from several threads at once. PRoot's two ptrace stops per syscall
+  made them slow to start and visibly slow to run. The notify pool serves
+  those threads concurrently, see [how it works](/docs/how-it-works).
 
-proot-apps ships `proot` in its release tarball and installs it to
-`~/.local/bin`. The tarball's `proot` becomes the static proot-next binary for
-the architecture, taken from this repository's releases. The `proot-apps`
-script needs no change: every call it makes is `proot -R <image> /entrypoint`
-with `-b` bindings, and that is the supported surface.
+## What the images ship
 
-What goes away from the images themselves: nothing. The `-R`, `-b`, `-w`
-behavior matches PRoot's, including a rootfs that lives under the bound
-`$HOME`.
+One binary and one symlink in the application user's `~/.local/bin`:
 
-## docker-baseimage-selkies
+```
+proot            the static proot-next binary for the architecture
+bwrap -> proot   the same binary under the bubblewrap name
+```
 
-The image ships the proot-apps release into `/proot-apps/`, `init-selkies-config`
-copies `/proot-apps/*` into `~/.local/bin` at start and sets `BWRAP` in the
-container environment, and `/steam.sh` writes the same default into the
-`/usr/bin/steam` launcher it generates. The layout that goes with proot-next:
-
-<Steps>
-<Step>
-**Ship one binary.** `/proot-apps/proot` is proot-next, from the proot-apps
-tarball or straight from this repository's releases. Nothing else is
-downloaded for bwrap.
-</Step>
-<Step>
-**Add the bwrap name.** `ln -s proot /proot-apps/bwrap`. The copy step in
-`init-selkies-config` carries it into `~/.local/bin`; use `cp -a` (or `cp -P`)
-so it stays a symlink rather than a second copy of the binary.
-</Step>
-<Step>
-**Point `BWRAP` at it.** `BWRAP=$HOME/.local/bin/bwrap` in
-`init-selkies-config`, and the same default in `/steam.sh`'s generated
-launcher. pressure-vessel also finds a `bwrap` on `PATH` by itself, so the
-variable is belt and braces, but it makes the fallback deterministic.
-</Step>
-<Step>
-**Remove fakechroot.** `libfakechroot:amd64` and `:i386` in `/steam.sh` are no
-longer used by anything.
-</Step>
-<Step>
-**Pin by release.** The pre-release named by a commit's short hash lets an
-image pin a build between tags; a tag pins a release. Either way the download
-is `proot-x86_64` or `proot-aarch64` plus its `.sha256`.
-</Step>
-</Steps>
+proot-apps calls `proot -R <image> /entrypoint` with `-b` bindings and that is
+the supported surface. The images export `BWRAP=$HOME/.local/bin/bwrap`, which
+pressure-vessel and `steam-runtime-check-requirements` honour, so Steam finds
+the stand-in without any change to Steam.
 
 ## Environment the images already provide
 

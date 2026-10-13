@@ -81,8 +81,7 @@ the exe point at the loader.
 ## Looking like nothing is there
 
 A ptrace supervisor is indistinguishable from a debugger unless it works at
-it.  Three things learned from Steam's webhelper, which the old shim could
-never run under PRoot:
+it.  Three things learned from Steam's webhelper:
 
 * `/proc/<pid>/status` is served from a read-only memfd with `TracerPid`
   zeroed.  Valve's assert macro checks that field and executes `int3` when a
@@ -117,28 +116,37 @@ never reads a pre-exec address space.
 
 ## Measurements
 
-`~/dev/notify-spike` holds the throwaway spike and raw numbers from
-`debian:trixie` and `lsiobase/selkies:debiantrixie` containers; the PRoot
-repository's `bench/` directory has the benchmark sources.
+`bench/run.sh` builds `bench/sysbench.c`, runs it natively and under one or
+two proot binaries, and prints ns per operation with the slowdown against
+native.  The table is one run on an x86_64 host (Linux 6.12), both binaries
+with `-R` on the proot-apps debian-trixie rootfs, PRoot 5.5.0 being the
+static x86_64 release from proot-me.  Figures are slowdown over native, so
+lower is better.
 
-## First numbers (host, `-R` on the proot-apps debian-trixie rootfs, x native)
-
-| test | proot-next | PRoot perf branch |
+| test | proot-next | PRoot 5.5.0 |
 |---|---|---|
-| stat deep path | 13.5x | 11.1x |
-| stat x16 threads | 40x | 72x |
-| readlink /proc/self/exe | 11.5x | 22x |
-| getcwd | 47x | 69x |
-| uname / prctl | 1.2x | 70x+ |
-| unix socket connect | 4.3x | 6.5x |
-| fork+exec sh | 1.6x | 1.8x |
+| stat deep path | 18.5x | 24.8x |
+| access deep path | 18.3x | 29.6x |
+| open+close deep path | 9.1x | 14.3x |
+| stat ENOENT | 35.2x | 31.9x |
+| readlink | 22.6x | 39.2x |
+| readlink /proc/self/exe | 8.9x | 22.3x |
+| getcwd | 29.9x | 82.2x |
+| unix socket connect | 4.1x | 6.7x |
+| uname | 1.3x | 69.2x |
+| prctl | 1.5x | 61.7x |
+| stat x4 threads | 23.1x | 47.3x |
+| stat x16 threads | 53.8x | 110.6x |
+| fork+exec /bin/true | 1.5x | 1.6x |
 
-Single-threaded deep lookups are behind because every path component does a
-linear prefix scan over the binding table (`-R` installs ~15 bindings) and the
-read-only check detranslates once more per call.  Identity (`-r /`) is at 6x,
-so that is the headroom.  Replace the scan with a sorted/trie lookup and pass
-the canonical guest path from `translate_path` to the handlers instead of
-recomputing it.
+Lookups that fail with `ENOENT` are the one place PRoot is ahead: it lets the
+kernel fail the call on the tracee's behalf after a ptrace stop, where
+proot-next pays a full notify round trip to learn the same thing.  Exec is
+within noise of PRoot, since both have to stop the tracee for it.  Every path
+component does a linear prefix scan over the binding table (`-R` installs
+about fifteen bindings), and the read-only check detranslates once more per
+call; identity (`-r /`) runs at about 6x, so that is the headroom left in
+lookups.
 
 ## Known gaps
 
