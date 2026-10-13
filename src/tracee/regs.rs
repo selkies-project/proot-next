@@ -139,15 +139,15 @@ mod arch {
         let n = ptrace::getregset(pid, NT_PRSTATUS, buf.as_mut_ptr(), REGS64_LEN)?;
         if n == REGS32_LEN {
             r.compat = true;
-            for (i, w) in buf[..REGS32_LEN].chunks_exact(4).enumerate() {
-                r.regs[i] = u32::from_ne_bytes(w.try_into().unwrap()) as u64;
+            for (i, w) in buf[..REGS32_LEN].as_chunks::<4>().0.iter().enumerate() {
+                r.regs[i] = u32::from_ne_bytes(*w) as u64;
             }
             r.sp = r.regs[13];
             r.pc = r.regs[15];
             r.pstate = r.regs[16];
         } else {
-            for (i, w) in buf[..31 * 8].chunks_exact(8).enumerate() {
-                r.regs[i] = u64::from_ne_bytes(w.try_into().unwrap());
+            for (i, w) in buf[..31 * 8].as_chunks::<8>().0.iter().enumerate() {
+                r.regs[i] = u64::from_ne_bytes(*w);
             }
             r.sp = u64::from_ne_bytes(buf[248..256].try_into().unwrap());
             r.pc = u64::from_ne_bytes(buf[256..264].try_into().unwrap());
