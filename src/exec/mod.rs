@@ -15,7 +15,9 @@
 //! Set `PROOT_EXEC_DEBUG=1` to print every rewritten exec on stderr.
 //!
 //! Without ptrace the same plan is carried out by a trampoline inside the
-//! tracee instead of a register rewrite, see [`shim`].
+//! tracee instead of a register rewrite, see [`shim`].  An exec of proot or
+//! bwrap themselves is a nested launch, planned by [`nested`] and carried out
+//! by the trampoline in both modes.
 //!
 //! Known gaps: at the kernel level `/proc/<pid>/exe` and `AT_EXECFN` name the
 //! loader; the supervisor answers `readlink` on `/proc/self/exe` from the
@@ -27,17 +29,21 @@
 //! 32-bit ELF is re-targeted at its own 32-bit loader.
 
 pub mod elf;
+pub mod nested;
 pub mod shebang;
 pub mod shim;
 
 use crate::fs::translate::{detranslate_path, translate_path};
-use crate::state::Ctx;
+use crate::procs::PendingExec;
+use crate::state::{Ctx, View};
 use crate::sys::Result;
 use crate::syscall::nr::EXECVEAT;
 use crate::tracee::regs::Regs;
 use elf::FileKind;
+use nested::EnvSource;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::os::unix::ffi::OsStrExt;
+use std::sync::{Arc, Mutex};
 
 /// Upper bound on argv entries read from the tracee.
 const MAX_ARGV: usize = 1 << 18;
@@ -62,6 +68,58 @@ pub struct ExecPlan {
     pub host_prog: Vec<u8>,
     /// Whether the program's format was recognized (ELF or `#!`).
     pub understood: bool,
+    /// Process setup the trampoline carries out before the exec (a nested
+    /// launch); `None` for an ordinary exec, which only takes the trampoline
+    /// without ptrace.
+    pub trampoline: Option<Trampoline>,
+}
+
+/// What the trampoline does inside the tracee before exec'ing the plan.
+#[derive(Clone, Debug, Default)]
+pub struct Trampoline {
+    /// The view the process enters at the real exec, with its working
+    /// directory there as a guest path.
+    pub enter: Option<(Arc<View>, Vec<u8>)>,
+    /// Host directory to `chdir` to first (with ptrace, where the kernel's
+    /// cwd is the real one).
+    pub chdir: Option<Vec<u8>>,
+    /// Environment to exec with, replacing the inherited one.
+    pub env: Option<Vec<Vec<u8>>>,
+    /// `setsid` before the exec.
+    pub new_session: bool,
+    /// Die with `SIGKILL` when the parent dies.
+    pub die_with_parent: bool,
+    /// Classic BPF programs (raw `sock_filter` bytes) to install before the exec.
+    pub seccomp_programs: Vec<Vec<u8>>,
+    /// Descriptors that receive `{"child-pid": N}` and are closed.
+    pub info_fds: Vec<i32>,
+    /// Descriptors that receive `{"child-pid": N}` then `{"exit-code": N}`:
+    /// the trampoline forks, and its parent stays to report.
+    pub json_status_fds: Vec<i32>,
+    /// Lines printed on stderr before anything else.
+    pub warnings: Vec<Vec<u8>>,
+    /// Print this and exit with the code instead of exec'ing: on stdout when
+    /// the flag is set, else stderr.
+    pub exit: Option<(i32, Vec<u8>, bool)>,
+}
+
+impl ExecPlan {
+    /// A plan that only runs the trampoline for its message and exit code.
+    ///
+    /// # Arguments
+    /// * `trampoline` - The setup, with `exit` set.
+    pub fn message(trampoline: Trampoline) -> ExecPlan {
+        ExecPlan {
+            exec_path: Vec::new(),
+            argv: Vec::new(),
+            prefix: 0,
+            changed: true,
+            guest_prog: Vec::new(),
+            host_prog: Vec::new(),
+            understood: true,
+            trampoline: Some(trampoline),
+        }
+    }
 }
 
 /// Works out what to exec for a program the tracee named.
@@ -79,6 +137,9 @@ pub struct ExecPlan {
 /// named the program, which is where the kernel takes `comm` from, so a
 /// script keeps its own name rather than its interpreter's.
 ///
+/// An exec of proot or bwrap is a nested launch and is planned by
+/// [`nested::plan`] in the view it describes.
+///
 /// # Arguments
 /// * `ctx` - Shared supervisor state.
 /// * `pid` - Tracee thread id.
@@ -86,6 +147,7 @@ pub struct ExecPlan {
 /// * `user_path` - Program path as the tracee passed it.
 /// * `argv` - The tracee's argument vector (empty when it passed NULL).
 /// * `deref_final` - Follow a symlink in the final component of the program path.
+/// * `env` - The tracee's environment, read only for a nested launch.
 ///
 /// # Errors
 /// `ELOOP` for too many nested `#!`, otherwise the errno of translating a
@@ -96,9 +158,40 @@ pub fn plan(
     pid: u32,
     dirfd: i32,
     user_path: &[u8],
+    argv: Vec<Vec<u8>>,
+    deref_final: bool,
+    env: EnvSource,
+) -> Result<ExecPlan> {
+    let view = ctx.view(pid as i32);
+    plan_in(ctx, &view, pid, dirfd, user_path, argv, deref_final, env)
+}
+
+/// [`plan`] in a given view.
+///
+/// # Arguments
+/// * `ctx` - Shared supervisor state.
+/// * `view` - The view to translate in.
+/// * `pid` - Tracee thread id.
+/// * `dirfd` - Base of a relative `user_path`.
+/// * `user_path` - Program path as the tracee passed it.
+/// * `argv` - The tracee's argument vector (empty when it passed NULL).
+/// * `deref_final` - Follow a symlink in the final component of the program path.
+/// * `env` - The tracee's environment, read only for a nested launch.
+///
+/// # Errors
+/// As [`plan`].
+#[allow(clippy::too_many_arguments)]
+pub fn plan_in(
+    ctx: &Ctx,
+    view: &View,
+    pid: u32,
+    dirfd: i32,
+    user_path: &[u8],
     mut argv: Vec<Vec<u8>>,
     deref_final: bool,
+    env: EnvSource,
 ) -> Result<ExecPlan> {
+    let fs = &view.fs;
     let argv_was_null = argv.is_empty();
     if argv.is_empty() {
         // The kernel runs a program with an empty argv as if argv[0] were "".
@@ -107,7 +200,7 @@ pub fn plan(
     let tail = argv.len() - 1;
 
     // 1. Program path, then #! expansion.
-    let mut host_prog = translate_path(&ctx.fs, pid, dirfd, user_path, deref_final)?;
+    let mut host_prog = translate_path(fs, pid, dirfd, user_path, deref_final)?;
     let mut argv0_user = user_path.to_vec();
     let mut kind = elf::classify_file(&host_prog);
     let mut depth = 0;
@@ -126,18 +219,27 @@ pub fn plan(
         new_argv.extend(argv.drain(1..));
         argv = new_argv;
         argv0_user = sb.interp.clone();
-        host_prog = translate_path(&ctx.fs, pid, libc::AT_FDCWD, &sb.interp, true)?;
+        host_prog = translate_path(fs, pid, libc::AT_FDCWD, &sb.interp, true)?;
         kind = elf::classify_file(&host_prog);
     }
 
     // 2. Decide what the kernel should load.
-    let guest_prog = detranslate_path(&ctx.fs, &host_prog);
-    let mut changed = depth > 0 || argv_was_null;
+    let guest_prog = detranslate_path(fs, &host_prog);
     let understood = matches!(kind, Ok(FileKind::Elf64(_)) | Ok(FileKind::Elf32(_)));
+    if let Some(front) = nested::detect(
+        &host_prog,
+        user_path,
+        &guest_prog,
+        &argv[0],
+        understood && depth == 0,
+    ) {
+        return nested::plan(ctx, view, pid, front, argv, env);
+    }
+    let mut changed = depth > 0 || argv_was_null;
     let (exec_path, new_argv): (Vec<u8>, Vec<Vec<u8>>) = match kind {
         Ok(FileKind::Elf64(info)) | Ok(FileKind::Elf32(info)) => match info.interp {
-            Some(interp) if !ctx.fs.identity => {
-                let host_interp = translate_path(&ctx.fs, pid, libc::AT_FDCWD, &interp, true)?;
+            Some(interp) if !fs.identity => {
+                let host_interp = translate_path(fs, pid, libc::AT_FDCWD, &interp, true)?;
                 let mut v = vec![host_interp.clone()];
                 let argv0_supported = loader_supports_argv0(&host_interp);
                 if argv0_supported {
@@ -175,6 +277,7 @@ pub fn plan(
         guest_prog,
         host_prog,
         understood,
+        trampoline: None,
     })
 }
 
@@ -203,7 +306,11 @@ pub fn handle_execve(ctx: &Ctx, regs: &mut Regs) -> Result<()> {
 
     let user_path = ctx.mem.read_cstr(pid, regs.arg(path_idx))?;
     let argv = read_argv(ctx, pid, regs.arg(argv_idx), ptr_size)?;
-    let plan = plan(ctx, pid, dirfd, &user_path, argv, deref_final)?;
+    let env = EnvSource::Address {
+        envp: regs.arg(argv_idx + 1),
+        ptr_size,
+    };
+    let plan = plan(ctx, pid, dirfd, &user_path, argv, deref_final, env)?;
     ctx.set_exe(pid as i32, plan.guest_prog.clone(), plan.host_prog.clone());
 
     // 3. Materialize path and argv in the tracee, unless nothing changed.
@@ -211,7 +318,16 @@ pub fn handle_execve(ctx: &Ctx, regs: &mut Regs) -> Result<()> {
         return Ok(());
     }
     debug_exec(pid, &plan);
-    let (path_addr, argv_addr) = push_argv(ctx, regs, &plan.exec_path, &plan.argv, ptr_size)?;
+    let (exec_path, argv): (Vec<u8>, Vec<Vec<u8>>) = if plan.trampoline.is_some() {
+        let shim_path = shim::install().map_err(|_| libc::ENOENT)?.join(shim::SHIM_NAME);
+        let shim_path = shim_path.as_os_str().as_bytes().to_vec();
+        shim::write_record(ctx.tgid(pid as i32), &plan)?;
+        ctx.procs.shim_enter(pid as i32, pending_of(&plan));
+        (shim_path.clone(), vec![shim_path])
+    } else {
+        (plan.exec_path.clone(), plan.argv.clone())
+    };
+    let (path_addr, argv_addr) = push_argv(ctx, regs, &exec_path, &argv, ptr_size)?;
     if is_at {
         regs.set_arg(0, libc::AT_FDCWD as i64 as u64);
         regs.set_arg(1, path_addr);
@@ -225,6 +341,38 @@ pub fn handle_execve(ctx: &Ctx, regs: &mut Regs) -> Result<()> {
         regs.set_arg(1, argv_addr);
     }
     Ok(())
+}
+
+/// What to remember about a process between its exec of the trampoline and
+/// the trampoline's exec of the real target.
+///
+/// # Arguments
+/// * `plan` - The exec being carried out.
+pub fn pending_of(plan: &ExecPlan) -> PendingExec {
+    PendingExec {
+        guest: plan.guest_prog.clone(),
+        host: plan.host_prog.clone(),
+        restore: None,
+        enter: plan
+            .trampoline
+            .as_ref()
+            .filter(|t| t.exit.is_none())
+            .and_then(|t| t.enter.clone()),
+    }
+}
+
+/// Completes a pending exec at the trampoline's exec of the real target:
+/// records the program and moves the process into its new view, if any.
+///
+/// # Arguments
+/// * `ctx` - Shared supervisor state.
+/// * `tgid` - The process.
+/// * `pending` - What was recorded at the rewritten exec.
+pub fn finish_pending(ctx: &Ctx, tgid: i32, pending: PendingExec) {
+    ctx.set_exe(tgid, pending.guest, pending.host);
+    if let Some((view, cwd)) = pending.enter {
+        ctx.enter_view(tgid, view, cwd);
+    }
 }
 
 /// Reads the tracee's argument vector.
@@ -270,7 +418,7 @@ pub fn debug_exec(pid: u32, plan: &ExecPlan) {
 /// # Arguments
 /// * `user_path` - Program path as the tracee passed it.
 /// * `guest_prog` - Canonical guest path of what will run.
-fn exec_name<'a>(user_path: &'a [u8], guest_prog: &'a [u8]) -> &'a [u8] {
+pub(super) fn exec_name<'a>(user_path: &'a [u8], guest_prog: &'a [u8]) -> &'a [u8] {
     let base = |p: &'a [u8]| p.rsplit(|&b| b == b'/').next().unwrap_or(p);
     match base(user_path) {
         b"" => guest_prog,
@@ -342,7 +490,6 @@ fn push_argv(
 fn loader_alias(host_interp: &[u8], name: &[u8]) -> Option<Vec<u8>> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    use std::os::unix::ffi::OsStrExt;
     let name = name.rsplit(|&b| b == b'/').next().filter(|n| !n.is_empty())?;
     let mut h = DefaultHasher::new();
     host_interp.hash(&mut h);
@@ -410,7 +557,6 @@ fn loader_supports_argv0(host_interp: &[u8]) -> bool {
     if let Some(&v) = cache.get(host_interp) {
         return v;
     }
-    use std::os::unix::ffi::OsStrExt;
     let data = std::fs::read(std::ffi::OsStr::from_bytes(host_interp)).unwrap_or_default();
     let supported = data.windows(8).any(|w| w == b"--argv0\0") || data.windows(7).any(|w| w == b"\0argv0\0");
     cache.insert(host_interp.to_vec(), supported);

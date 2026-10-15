@@ -12,15 +12,18 @@
 //! is dropped silently.
 
 use crate::abi::{Abi, Variant};
+use crate::fs::Fs;
 use crate::fs::translate::{detranslate_path, guest_cwd, read_link, translate_path};
 use crate::note;
 use crate::seccomp::notify::{reply, reply_continue, reply_fd, still_valid};
-use crate::state::Ctx;
+use crate::state::{Ctx, View};
 use crate::sys::{Errno, Result, SeccompNotif, check};
 use crate::syscall::direct;
 use crate::syscall::nr::*;
+use std::cell::OnceCell;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::Arc;
 
 /// Sentinel errno meaning "the notification is stale, do not answer".
 const DROPPED: Errno = -1;
@@ -67,11 +70,23 @@ pub(crate) struct Req<'a> {
     pub abi: Abi,
     /// How an i386 request differs from the x86_64 number it was mapped to.
     pub variant: Variant,
+    /// The caller's view, looked up once per request.
+    view: OnceCell<Arc<View>>,
 }
 
 impl<'a> Req<'a> {
     pub fn arg(&self, i: usize) -> u64 {
         self.args[i]
+    }
+
+    /// The view the calling process lives in.
+    pub fn view(&self) -> &View {
+        self.view.get_or_init(|| self.ctx.view(self.pid as i32))
+    }
+
+    /// The calling process's filesystem view.
+    pub fn fs(&self) -> &Fs {
+        &self.view().fs
     }
 
     fn arg_i64(&self, i: usize) -> i64 {
@@ -97,7 +112,7 @@ impl<'a> Req<'a> {
 
     /// Translates `path` relative to `dirfd` into a host path.
     pub fn translate(&self, dirfd: i32, path: &[u8], deref_final: bool) -> Result<Vec<u8>> {
-        let host = translate_path(&self.ctx.fs, self.pid, dirfd, path, deref_final)?;
+        let host = translate_path(self.fs(), self.pid, dirfd, path, deref_final)?;
         note!(
             self.ctx,
             2,
@@ -120,8 +135,8 @@ impl<'a> Req<'a> {
 
     /// Refuses with `EROFS` when `host` lies under a read-only binding.
     pub fn check_writable(&self, host: &[u8]) -> Result<()> {
-        let guest = detranslate_path(&self.ctx.fs, host);
-        match self.ctx.fs.binding_for_guest(&guest) {
+        let guest = detranslate_path(self.fs(), host);
+        match self.fs().binding_for_guest(&guest) {
             Some(b) if b.read_only => Err(libc::EROFS),
             _ => Ok(()),
         }
@@ -175,6 +190,7 @@ pub fn handle(ctx: &Ctx, listener: i32, req: &SeccompNotif) {
         raw_nr: req.data.nr,
         abi,
         variant,
+        view: OnceCell::new(),
     };
     match dispatch(&r, nr) {
         Ok(Outcome::Value(v)) => reply(listener, req.id, v),
@@ -198,10 +214,10 @@ pub fn handle(ctx: &Ctx, listener: i32, req: &SeccompNotif) {
 
 /// Routes a syscall number to its handler.
 fn dispatch(r: &Req, nr: i64) -> Result<Outcome> {
+    if let Some(o) = direct::shim_passthrough(r, nr) {
+        return Ok(o);
+    }
     if r.ctx.no_ptrace {
-        if let Some(o) = direct::shim_passthrough(r, nr) {
-            return Ok(o);
-        }
         if nr == SOCKETCALL {
             return direct::do_socketcall(r);
         }
@@ -243,6 +259,14 @@ fn dispatch(r: &Req, nr: i64) -> Result<Outcome> {
         GETCWD => do_getcwd(r),
         UNAME => do_uname(r),
         // -0: the tracee is root as far as it can tell, with a virtual identity it can drop.
+        // A nested view without -0 inside a launch with it is left to the kernel.
+        GETUID | GETGID | GETEUID | GETEGID | GETRESUID | GETRESGID | SETUID | SETGID | SETREUID
+        | SETREGID | SETRESUID | SETRESGID | SETFSUID | SETFSGID | SETGROUPS | GETGROUPS | CAPSET
+        | FCHOWN
+            if !r.view().fake_root =>
+        {
+            Ok(Outcome::Continue)
+        }
         GETUID | GETGID | GETEUID | GETEGID | GETRESUID | GETRESGID | SETUID | SETGID | SETREUID
         | SETREGID | SETRESUID | SETRESGID | SETFSUID | SETFSGID => do_identity(r, nr),
         SETGROUPS => do_setgroups(r),
@@ -754,15 +778,15 @@ fn do_access(r: &Req, dirfd: i32, path: &[u8], mode: i64, flags: i64) -> Result<
 fn do_readlink(r: &Req, dirfd: i32, path: &[u8], buf: u64, bufsiz: usize) -> Result<Outcome> {
     let host = r.translate(dirfd, path, false)?;
     r.valid()?;
-    let guest = lexical_clean(&detranslate_path(&r.ctx.fs, &host));
+    let guest = lexical_clean(&detranslate_path(r.fs(), &host));
     let target = match proc_magic_link(&guest) {
         Some((pid, true)) => match r.ctx.tracee(pid).exe_guest {
             Some(exe) => exe,
-            None => detranslate_path(&r.ctx.fs, &read_link(&host)?),
+            None => detranslate_path(r.fs(), &read_link(&host)?),
         },
-        Some((pid, false)) => match r.ctx.fs.virtual_cwd(pid).filter(|_| guest.ends_with(b"/cwd")) {
+        Some((pid, false)) => match r.fs().virtual_cwd(pid).filter(|_| guest.ends_with(b"/cwd")) {
             Some(cwd) => cwd,
-            None => detranslate_path(&r.ctx.fs, &read_link(&host)?),
+            None => detranslate_path(r.fs(), &read_link(&host)?),
         },
         None => read_link(&host)?,
     };
@@ -775,7 +799,7 @@ fn do_readlink(r: &Req, dirfd: i32, path: &[u8], buf: u64, bufsiz: usize) -> Res
 
 /// `getcwd`: the tracee's cwd as a guest path, NUL-terminated.
 fn do_getcwd(r: &Req) -> Result<Outcome> {
-    let mut cwd = guest_cwd(&r.ctx.fs, r.pid)?;
+    let mut cwd = guest_cwd(r.fs(), r.pid)?;
     r.valid()?;
     cwd.push(0);
     if cwd.len() > r.arg(1) as usize {
@@ -792,12 +816,12 @@ fn do_uname(r: &Req) -> Result<Outcome> {
     let mut bytes = [0u8; 390];
     let src = unsafe { std::slice::from_raw_parts(&u as *const _ as *const u8, 390) };
     bytes.copy_from_slice(src);
-    if let Some(rel) = &r.ctx.config.kernel_release {
+    if let Some(rel) = &r.view().kernel_release {
         let n = rel.len().min(64);
         bytes[130..195].fill(0);
         bytes[130..130 + n].copy_from_slice(&rel[..n]);
     }
-    if let Some(host) = &r.ctx.config.hostname {
+    if let Some(host) = &r.view().hostname {
         // utsname.nodename sits at offset 65.
         let n = host.len().min(64);
         bytes[65..130].fill(0);
@@ -1017,14 +1041,14 @@ fn do_fchown(r: &Req) -> Result<Outcome> {
 /// Under `-0`, an ownership or device-node refusal reads as success, like PRoot's fake_id0.
 fn forgive_as_root(r: &Req, rc: Result<i64>) -> Result<i64> {
     match rc {
-        Err(libc::EPERM) | Err(libc::EACCES) if r.ctx.config.fake_root => Ok(0),
+        Err(libc::EPERM) | Err(libc::EACCES) if r.view().fake_root => Ok(0),
         other => other,
     }
 }
 
 /// Under `-0`, files owned by the supervisor's own ids belong to root.
 fn fake_owner(r: &Req, uid: &mut u32, gid: &mut u32) {
-    if r.ctx.config.fake_root {
+    if r.view().fake_root {
         if *uid == unsafe { libc::getuid() } {
             *uid = 0;
         }
@@ -1036,7 +1060,7 @@ fn fake_owner(r: &Req, uid: &mut u32, gid: &mut u32) {
 
 /// Under `-0`, the virtual identity to show in a `/proc/<pid>/status` being opened.
 fn fake_ids_for_status(r: &Req, host: &[u8]) -> Option<crate::procs::Ids> {
-    if !r.ctx.config.fake_root {
+    if !r.view().fake_root {
         return None;
     }
     let pid: i32 = host
@@ -1054,7 +1078,7 @@ fn do_mkdir(r: &Req, dirfd: i32, path: &[u8], mode: i64) -> Result<Outcome> {
     r.check_writable(&host)?;
     let c = cstr(&host)?;
     let rc = check(unsafe { libc::syscall(libc::SYS_mkdirat, libc::AT_FDCWD, c.as_ptr(), mode) });
-    r.ctx.fs.flush_cache();
+    r.fs().flush_cache();
     Ok(Outcome::Value(rc))
 }
 
@@ -1065,7 +1089,7 @@ fn do_unlink(r: &Req, dirfd: i32, path: &[u8], flags: i64) -> Result<Outcome> {
     r.check_writable(&host)?;
     let c = cstr(&host)?;
     let rc = check(unsafe { libc::syscall(libc::SYS_unlinkat, libc::AT_FDCWD, c.as_ptr(), flags) });
-    r.ctx.fs.flush_cache();
+    r.fs().flush_cache();
     Ok(Outcome::Value(rc))
 }
 
@@ -1087,7 +1111,7 @@ fn do_rename(r: &Req, olddirfd: i32, old: &[u8], newdirfd: i32, new: &[u8], flag
             flags,
         )
     });
-    r.ctx.fs.flush_cache();
+    r.fs().flush_cache();
     Ok(Outcome::Value(rc))
 }
 
@@ -1120,7 +1144,7 @@ fn do_link(r: &Req, olddirfd: i32, old: &[u8], newdirfd: i32, new: &[u8], flags:
             host_flags,
         )
     });
-    r.ctx.fs.flush_cache();
+    r.fs().flush_cache();
     Ok(Outcome::Value(rc))
 }
 
@@ -1131,7 +1155,7 @@ fn do_symlink(r: &Req, target: &[u8], newdirfd: i32, linkpath: &[u8]) -> Result<
     r.check_writable(&host)?;
     let (ct, cl) = (cstr(target)?, cstr(&host)?);
     let rc = check(unsafe { libc::syscall(libc::SYS_symlinkat, ct.as_ptr(), libc::AT_FDCWD, cl.as_ptr()) });
-    r.ctx.fs.flush_cache();
+    r.fs().flush_cache();
     Ok(Outcome::Value(rc))
 }
 

@@ -1,16 +1,18 @@
 //! PRoot command-line front end (the subset proot-apps and users rely on).
 
 pub mod bwrap;
+pub mod host;
 
 use crate::config::{Binding, Config, trim_slashes};
+use host::Host;
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt;
 
 /// Why parsing stopped.
 #[derive(Debug)]
 pub enum CliError {
-    /// Print nothing more and exit with this code (`--help`, `--version`).
-    Exit(i32),
+    /// Print `text` on stdout and exit with `code` (`--help`, `--version`).
+    Exit { code: i32, text: String },
     /// A usage error with its message.
     Usage(String),
 }
@@ -77,15 +79,20 @@ const RECOMMENDED_S: &[&str] = &[
 
 /// Parses PRoot-style arguments (without `argv[0]`).
 ///
+/// Host-side paths (the root, the host side of a binding) are resolved
+/// through `host` into host paths; the working directory and the command
+/// stay guest paths.
+///
 /// # Arguments
 /// * `args` - Command-line arguments.
+/// * `host` - The process the command line is interpreted for.
 ///
 /// # Returns
 /// The configuration to launch.
 ///
 /// # Errors
 /// [`CliError::Exit`] after `--help`/`--version`, [`CliError::Usage`] otherwise.
-pub fn parse(args: Vec<OsString>) -> Result<Config, CliError> {
+pub fn parse(args: Vec<OsString>, host: &dyn Host) -> Result<Config, CliError> {
     let mut cfg = Config::default();
     let mut it = args.into_iter().peekable();
     let mut cwd_set = false;
@@ -113,21 +120,21 @@ pub fn parse(args: Vec<OsString>) -> Result<Config, CliError> {
                 })
             };
         match &opt[..] {
-            b"-r" | b"--rootfs" => cfg.root = value(&mut it)?,
+            b"-r" | b"--rootfs" => cfg.root = host.host_path(&value(&mut it)?),
             b"-R" | b"-S" => {
-                cfg.root = value(&mut it)?;
+                cfg.root = host.host_path(&value(&mut it)?);
                 let list = if opt == b"-R" {
                     RECOMMENDED_R
                 } else {
                     RECOMMENDED_S
                 };
                 for p in list {
-                    if std::path::Path::new(p).exists() {
-                        cfg.bindings.push(bind(p.as_bytes(), None));
+                    if host.exists(p.as_bytes()) {
+                        cfg.bindings.push(bind(host, p.as_bytes(), None));
                     }
                 }
-                if let Some(home) = std::env::var_os("HOME") {
-                    cfg.bindings.push(bind(home.as_bytes(), None));
+                if let Some(home) = host.var(b"HOME") {
+                    cfg.bindings.push(bind(host, &home, None));
                 }
                 if opt == b"-S" {
                     cfg.fake_root = true;
@@ -136,8 +143,8 @@ pub fn parse(args: Vec<OsString>) -> Result<Config, CliError> {
             b"-b" | b"--bind" | b"-m" | b"--mount" => {
                 let v = value(&mut it)?;
                 match v.iter().position(|&c| c == b':') {
-                    Some(i) => cfg.bindings.push(bind(&v[..i], Some(&v[i + 1..]))),
-                    None => cfg.bindings.push(bind(&v, None)),
+                    Some(i) => cfg.bindings.push(bind(host, &v[..i], Some(&v[i + 1..]))),
+                    None => cfg.bindings.push(bind(host, &v, None)),
                 }
             }
             b"-w" | b"--cwd" | b"--pwd" => {
@@ -164,14 +171,18 @@ pub fn parse(args: Vec<OsString>) -> Result<Config, CliError> {
             }
             b"-q" | b"--qemu" => return Err(CliError::Usage("qemu support is not implemented".into())),
             b"-V" | b"--version" => {
-                println!(
-                    "proot-next {VERSION}\nA Rust reimplementation of PRoot (seccomp user notification + ptrace)."
-                );
-                return Err(CliError::Exit(0));
+                return Err(CliError::Exit {
+                    code: 0,
+                    text: format!(
+                        "proot-next {VERSION}\nA Rust reimplementation of PRoot (seccomp user notification + ptrace).\n"
+                    ),
+                });
             }
             b"-h" | b"--help" | b"--usage" => {
-                print!("proot-next {VERSION}\n\n{USAGE}");
-                return Err(CliError::Exit(0));
+                return Err(CliError::Exit {
+                    code: 0,
+                    text: format!("proot-next {VERSION}\n\n{USAGE}"),
+                });
             }
             _ => {
                 return Err(CliError::Usage(format!(
@@ -185,23 +196,23 @@ pub fn parse(args: Vec<OsString>) -> Result<Config, CliError> {
         .map(|a| CString::new(a.as_bytes()).unwrap_or_default())
         .collect();
     if cfg.command.is_empty() {
-        let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-        cfg.command = vec![CString::new(shell.as_bytes()).unwrap()];
+        let shell = host.var(b"SHELL").unwrap_or_else(|| b"/bin/sh".to_vec());
+        cfg.command = vec![CString::new(shell).unwrap_or_default()];
     }
     if !cwd_set {
         // PRoot: the initial cwd is the host cwd, as a guest path, when it is visible there.
-        cfg.cwd = std::env::current_dir()
-            .map(|p| p.as_os_str().as_bytes().to_vec())
-            .unwrap_or_else(|_| b"/".to_vec());
+        cfg.cwd = host.cwd();
+        cfg.cwd_default = true;
     }
     Ok(cfg)
 }
 
-fn bind(host: &[u8], guest: Option<&[u8]>) -> Binding {
-    let host = trim_slashes(host.to_vec());
-    let guest = trim_slashes(guest.map(|g| g.to_vec()).unwrap_or_else(|| host.clone()));
+/// A binding of `path`, as `host` names it, at `guest` (the same path by default).
+fn bind(host: &dyn Host, path: &[u8], guest: Option<&[u8]>) -> Binding {
+    let path = trim_slashes(path.to_vec());
+    let guest = trim_slashes(guest.map(|g| g.to_vec()).unwrap_or_else(|| path.clone()));
     Binding {
-        host,
+        host: trim_slashes(host.host_path(&path)),
         guest,
         read_only: false,
     }

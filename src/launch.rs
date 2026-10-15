@@ -130,13 +130,19 @@ pub fn run(config: Config) -> Result<i32, String> {
     // The initial cwd is a guest path; the child's chdir(2) is a traced syscall
     // so the tracer translates it like any other.
     let cwd = CString::new(ctx.config.cwd.clone()).map_err(|_| "cwd contains NUL")?;
-    let host_cwd_exists = translate_path(&ctx.fs, std::process::id(), libc::AT_FDCWD, &ctx.config.cwd, true)
-        .map(|h| {
-            std::fs::metadata(std::ffi::OsStr::from_bytes_hack(&h))
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
+    let host_cwd_exists = translate_path(
+        &ctx.root.fs,
+        std::process::id(),
+        libc::AT_FDCWD,
+        &ctx.config.cwd,
+        true,
+    )
+    .map(|h| {
+        std::fs::metadata(std::ffi::OsStr::from_bytes_hack(&h))
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+    })
+    .unwrap_or(false);
     if !host_cwd_exists {
         eprintln!(
             "proot: can't chdir to {} in the guest rootfs, using /",
@@ -152,9 +158,15 @@ pub fn run(config: Config) -> Result<i32, String> {
         None
     };
     let initial_cwd: Vec<u8> = if host_cwd_exists {
-        translate_path(&ctx.fs, std::process::id(), libc::AT_FDCWD, &ctx.config.cwd, true)
-            .map(|h| detranslate_path(&ctx.fs, &h))
-            .unwrap_or_else(|_| b"/".to_vec())
+        translate_path(
+            &ctx.root.fs,
+            std::process::id(),
+            libc::AT_FDCWD,
+            &ctx.config.cwd,
+            true,
+        )
+        .map(|h| detranslate_path(&ctx.root.fs, &h))
+        .unwrap_or_else(|_| b"/".to_vec())
     } else {
         b"/".to_vec()
     };
@@ -252,7 +264,7 @@ pub fn run(config: Config) -> Result<i32, String> {
             exit_like_bwrap_without_namespaces();
         }
         return Err(match e {
-            libc::EPERM => "ptrace(PTRACE_SEIZE) refused: this process is already traced (proot inside proot, or a debugger) or ptrace is disallowed here; nested proot is not supported yet".into(),
+            libc::EPERM => "ptrace(PTRACE_SEIZE) refused: this process is already traced (a debugger, or a supervisor other than proot-next) or ptrace is disallowed here".into(),
             e => format!("ptrace(PTRACE_SEIZE): {}", strerror(e)),
         });
     }
@@ -264,7 +276,8 @@ pub fn run(config: Config) -> Result<i32, String> {
             unsafe { libc::waitpid(pid, &mut st, libc::__WALL) };
             return Err(match libc::WEXITSTATUS(st) {
                 119 if ctx.config.bwrap_mode => exit_like_bwrap_without_namespaces(),
-                119 => "proot-next inside proot-next is not supported".into(),
+                119 => "the seccomp filter chain already has a listener (a supervisor other than proot-next)"
+                    .into(),
                 120 => "PR_SET_NO_NEW_PRIVS refused".into(),
                 121 => "cannot enter the alias directory".into(),
                 124 => "the caller's --seccomp program was refused by the kernel".into(),
@@ -299,6 +312,9 @@ pub fn run(config: Config) -> Result<i32, String> {
     // PROOT_BWRAP_KEEP=1 leaves the materialized root behind for inspection.
     let keep = std::env::var_os("PROOT_BWRAP_KEEP").is_some();
     let _ = std::fs::remove_dir_all(crate::exec::alias_dir());
+    if let Some(dir) = shim::path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
     for dir in ctx.config.cleanup_dirs.iter().filter(|_| !keep) {
         let _ = std::fs::remove_dir_all(std::ffi::OsStr::from_bytes_hack(dir));
     }
@@ -318,13 +334,15 @@ fn no_ptrace_mode() -> bool {
 
 /// Exits the way bubblewrap exits when it cannot create its namespaces.
 ///
-/// A nested proot-next cannot work (the filter chain already has a listener,
-/// or the outer tracer owns the child), and in bwrap mode its caller is a
-/// program that started it as bubblewrap.  Those programs know this message
-/// (GTK's glycin runs its image loaders unsandboxed on seeing it), so it is
-/// the one to give.
+/// A supervisor cannot start under another tracer or another listener.
+/// Inside proot-next that never happens, since an exec of bwrap is served
+/// as a nested launch (see `exec::nested`); under anything else the caller
+/// is a program that started us as bubblewrap, and those programs know this
+/// message (GTK's glycin runs its image loaders unsandboxed on seeing it).
 fn exit_like_bwrap_without_namespaces() -> ! {
-    eprintln!("bwrap: No permissions to create a new namespace: proot-next cannot nest");
+    eprintln!(
+        "bwrap: No permissions to create a new namespace: proot-next cannot run under another supervisor"
+    );
     std::process::exit(1);
 }
 

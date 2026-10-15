@@ -537,8 +537,10 @@ fn namespaces_are_refused_inside_the_guest() {
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );
+    // A real bubblewrap in the guest is intercepted by name and served as a
+    // nested launch; with that turned off it fails as it always did.
     if Path::new("/usr/bin/bwrap").exists() {
-        let o = run(&[
+        let args = [
             "-r",
             "/",
             "/usr/bin/bwrap",
@@ -547,34 +549,156 @@ fn namespaces_are_refused_inside_the_guest() {
             "/",
             "/",
             "/bin/true",
-        ]);
+        ];
+        let o = run(&args);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let o = Command::new(proot())
+            .env("PROOT_NEST", "0")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
         let err = String::from_utf8_lossy(&o.stderr);
         assert!(err.contains("No permissions to create a new namespace"), "{err}");
     }
 }
 
-/// Images put the bwrap symlink on the guest's PATH, so GTK's glycin may pick
-/// it instead of the rootfs's bubblewrap; a nested proot-next must then fail
-/// with the words glycin recognizes.
+/// proot-apps' GUI installer runs `proot -R app /install` from inside its own
+/// guest.  The inner proot gets a view of its own: its bindings and working
+/// directory, inherited by its children, invisible to the outer guest, and
+/// composable one more level down.
 #[test]
-fn nested_bwrap_mode_fails_like_bubblewrap_without_namespaces() {
-    let d = tmpdir("nested");
+fn nested_proot_runs_in_a_view_of_its_own() {
+    let d = tmpdir("nested-proot");
+    std::fs::write(d.join("f"), "hello\n").unwrap();
+    let p = proot();
+    let p = p.to_str().unwrap();
+    let inner = format!(
+        "{p} -r / -b {d}:/pn-nested -w /pn-nested /bin/sh -c 'cat /pn-nested/f; pwd; readlink /proc/self/exe; cat f; sh -c \"cat /pn-nested/f\"'; ls /pn-nested 2>&1 | head -1",
+        d = d.display()
+    );
+    let o = run(&["-r", "/", "/bin/sh", "-c", &inner]);
+    let out = stdout(&o);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 6, "{out}\n{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(lines[0], "hello");
+    assert_eq!(lines[1], "/pn-nested");
+    assert!(lines[2].ends_with("readlink"), "{out}");
+    assert_eq!(lines[3], "hello");
+    assert_eq!(lines[4], "hello");
+    assert!(lines[5].contains("No such file"), "{out}");
+
+    let two_levels = format!(
+        "{p} -r / -b {d}:/l1 {p} -r / -b /l1:/l2 /bin/sh -c 'cat /l2/f; ls /l1 2>&1 | head -1'",
+        d = d.display()
+    );
+    let o = run(&["-r", "/", "/bin/sh", "-c", &two_levels]);
+    let out = stdout(&o);
+    assert!(
+        out.starts_with("hello\n") && out.contains("No such file"),
+        "{out}"
+    );
+
+    // Messages reach the caller's own stdout and stderr, with proot's exit codes.
+    let messages = format!(
+        "{p} -r / /nonexistent-cmd; echo rc=$?; {p} -V | head -1; {p} -k 1.2.3 /bin/true; echo rc=$?"
+    );
+    let o = run(&["-r", "/", "/bin/sh", "-c", &messages]);
+    let out = stdout(&o);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(out, "rc=127\nproot-next 0.3.0\nrc=1", "{out}\n{err}");
+    assert!(
+        err.contains("proot: cannot execute /nonexistent-cmd: No such file or directory"),
+        "{err}"
+    );
+    assert!(
+        err.contains("-k inside proot-next needs the outer proot started with -k"),
+        "{err}"
+    );
+}
+
+/// GTK's glycin runs its image loaders through bwrap.  Inside a guest the
+/// symlink on the images' PATH, or the rootfs's own bubblewrap, is served as
+/// a nested launch: the container is materialized as at top level, the
+/// status descriptors get the same JSON, and the exit code comes back.
+#[test]
+fn nested_bwrap_builds_a_container() {
+    let d = tmpdir("nested-bwrap");
     let bwrap = d.join("bwrap");
     std::os::unix::fs::symlink(proot(), &bwrap).unwrap();
-    let o = run(&[
+    std::fs::write(
+        d.join("t.sh"),
+        "#!/bin/sh\necho FOO=$FOO; touch /usr/x 2>/dev/null || echo ro-ok; touch /tmp/ok && echo tmp-ok; pwd; exit 3\n",
+    )
+    .unwrap();
+    let script = format!(
+        "exec 7>{d}/info 8>{d}/json; {bwrap} --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/bin /bin --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --ro-bind {d}/t.sh /t.sh --chdir / --clearenv --setenv FOO bar --setenv PATH /usr/bin:/bin --unshare-all --die-with-parent --new-session --info-fd 7 --json-status-fd 8 -- /bin/sh /t.sh; echo rc=$?; exec 7>&- 8>&-; cat {d}/info {d}/json; {bwrap} --version",
+        d = d.display(),
+        bwrap = bwrap.display()
+    );
+    let o = run(&["-r", "/", "/bin/bash", "-c", &script]);
+    let out = stdout(&o);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        out.starts_with("FOO=bar\nro-ok\ntmp-ok\n/\nrc=3\n"),
+        "{out}\n{err}"
+    );
+    assert!(out.contains("{\"child-pid\": "), "{out}");
+    assert!(out.contains("{\"exit-code\": 3}"), "{out}");
+    assert!(out.ends_with("bubblewrap 0.9.0 (proot-next)"), "{out}");
+
+    // Any ELF named bwrap is intercepted, unless PROOT_NEST=0.
+    let fake = d.join("fake");
+    std::fs::create_dir_all(&fake).unwrap();
+    std::fs::copy("/bin/false", fake.join("bwrap")).unwrap();
+    let by_name = [
         "-r",
         "/",
-        bwrap.to_str().unwrap(),
-        "--ro-bind",
-        "/",
-        "/",
-        "/bin/true",
+        "/bin/sh",
+        "-c",
+        &format!(
+            "{}/bwrap --bind / / /bin/echo by-name; echo rc=$?",
+            fake.display()
+        ),
+    ];
+    assert_eq!(stdout(&run(&by_name)), "by-name\nrc=0");
+    let o = Command::new(proot())
+        .env("PROOT_NEST", "0")
+        .args(by_name)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&o), "rc=1");
+}
+
+/// The installer's own case: a rootfs guest launching another rootfs guest.
+#[test]
+fn nested_proot_inside_a_rootfs() {
+    let Some(rootfs) = rootfs() else { return };
+    let p = proot();
+    let bin_dir = p.parent().unwrap().to_str().unwrap().to_string();
+    let bind = format!("{bin_dir}:{bin_dir}");
+    let inner = format!(
+        "{p} -R {rootfs} /bin/sh -c 'head -1 /etc/os-release; ls -d $HOME; cat /proc/self/comm'",
+        p = p.display(),
+        rootfs = rootfs.display()
+    );
+    let o = run(&[
+        "-R",
+        rootfs.to_str().unwrap(),
+        "-b",
+        &bind,
+        "/bin/sh",
+        "-c",
+        &inner,
     ]);
+    let out = stdout(&o);
     let err = String::from_utf8_lossy(&o.stderr);
-    assert_eq!(o.status.code(), Some(1), "{err}");
-    assert!(
-        err.starts_with("bwrap: No permissions to create a new namespace"),
-        "{err}"
+    let home = std::env::var("HOME").unwrap();
+    assert_eq!(
+        out,
+        format!("PRETTY_NAME=\"Debian GNU/Linux 13 (trixie)\"\n{home}\ncat"),
+        "{out}\n{err}"
     );
 }
 

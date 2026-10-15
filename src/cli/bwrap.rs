@@ -18,11 +18,11 @@
 //! `uname` handler.  Overlay options are refused.
 
 use super::CliError;
+use super::host::Host;
 use crate::config::{Binding, Config, trim_slashes};
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
 use std::fs;
-use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -118,6 +118,8 @@ pub struct Op {
 ///
 /// # Arguments
 /// * `args` - Command-line arguments as bubblewrap would receive them.
+/// * `host` - The process the command line is interpreted for: bind sources
+///   are its paths, descriptors are its descriptors, the environment is its.
 ///
 /// # Returns
 /// A [`Config`] whose root is a freshly materialized directory.
@@ -125,19 +127,23 @@ pub struct Op {
 /// # Errors
 /// [`CliError::Exit`] after `--help`/`--version`, [`CliError::Usage`] for
 /// unknown options, missing arguments, unreadable descriptors or overlays.
-pub fn parse(args: Vec<OsString>) -> Result<Config, CliError> {
-    let (ops, command) = parse_ops(args.into_iter().map(|a| a.into_vec()).collect())?;
+pub fn parse(args: Vec<OsString>, host: &dyn Host) -> Result<Config, CliError> {
+    let (ops, command) = parse_ops(args.into_iter().map(|a| a.into_vec()).collect(), host)?;
     for op in &ops {
         match op.option.as_str() {
             "--help" => {
-                print!(
-                    "{BWRAP_VERSION}\n\nusage: bwrap [OPTIONS...] [--] COMMAND [ARGS...]\n\nbubblewrap-compatible front end of proot-next: binds and generated entries are\nmaterialized in a private root and the command runs under ptrace/seccomp\ntranslation instead of namespaces.\n"
-                );
-                return Err(CliError::Exit(0));
+                return Err(CliError::Exit {
+                    code: 0,
+                    text: format!(
+                        "{BWRAP_VERSION}\n\nusage: bwrap [OPTIONS...] [--] COMMAND [ARGS...]\n\nbubblewrap-compatible front end of proot-next: binds and generated entries are\nmaterialized in a private root and the command runs under ptrace/seccomp\ntranslation instead of namespaces.\n"
+                    ),
+                });
             }
             "--version" => {
-                println!("{BWRAP_VERSION}");
-                return Err(CliError::Exit(0));
+                return Err(CliError::Exit {
+                    code: 0,
+                    text: format!("{BWRAP_VERSION}\n"),
+                });
             }
             _ => {}
         }
@@ -153,11 +159,9 @@ pub fn parse(args: Vec<OsString>) -> Result<Config, CliError> {
         cwd: b"/".to_vec(),
         ..Config::default()
     };
-    let mut env: BTreeMap<Vec<u8>, Vec<u8>> = std::env::vars_os()
-        .map(|(k, v)| (k.into_vec(), v.into_vec()))
-        .collect();
+    let mut env: BTreeMap<Vec<u8>, Vec<u8>> = host.vars().into_iter().collect();
     let mut argv0: Option<Vec<u8>> = None;
-    if let Err(e) = apply_ops(&ops, &root, &mut cfg, &mut env, &mut argv0) {
+    if let Err(e) = apply_ops(&ops, &root, &mut cfg, &mut env, &mut argv0, host) {
         let _ = fs::remove_dir_all(&root);
         return Err(e);
     }
@@ -186,13 +190,14 @@ pub fn parse(args: Vec<OsString>) -> Result<Config, CliError> {
 ///
 /// # Arguments
 /// * `args` - Raw argument bytes, `argv[0]` excluded.
+/// * `host` - The process whose descriptor `--args` names.
 ///
 /// # Returns
 /// The operations in order and the command (possibly empty).
 ///
 /// # Errors
 /// [`CliError::Usage`] on an unknown option or a missing argument.
-pub fn parse_ops(mut args: Vec<Vec<u8>>) -> Result<(Vec<Op>, Vec<Vec<u8>>), CliError> {
+pub fn parse_ops(mut args: Vec<Vec<u8>>, host: &dyn Host) -> Result<(Vec<Op>, Vec<Vec<u8>>), CliError> {
     let mut ops = Vec::new();
     let mut perms: Option<u32> = None;
     let mut i = 0;
@@ -208,9 +213,9 @@ pub fn parse_ops(mut args: Vec<Vec<u8>>) -> Result<(Vec<Op>, Vec<Vec<u8>>), CliE
         let name = String::from_utf8_lossy(&arg).into_owned();
         if name == "--args" {
             let fd = parse_fd(args.get(i + 1).map(|v| v.as_slice()), "--args")?;
-            let data =
-                read_fd(fd).map_err(|e| CliError::Usage(format!("--args: cannot read fd {fd}: {e}")))?;
-            unsafe { libc::close(fd) };
+            let data = host
+                .read_fd(fd)
+                .map_err(|e| CliError::Usage(format!("--args: cannot read fd {fd}: {e}")))?;
             let spliced: Vec<Vec<u8>> = data
                 .split(|&b| b == 0)
                 .filter(|s| !s.is_empty())
@@ -265,6 +270,7 @@ fn apply_ops(
     cfg: &mut Config,
     env: &mut BTreeMap<Vec<u8>, Vec<u8>>,
     argv0: &mut Option<Vec<u8>>,
+    host: &dyn Host,
 ) -> Result<(), CliError> {
     for op in ops {
         let a = |n: usize| -> &[u8] { &op.args[n] };
@@ -272,7 +278,7 @@ fn apply_ops(
             "--bind" | "--dev-bind" | "--ro-bind" | "--bind-try" | "--dev-bind-try" | "--ro-bind-try" => {
                 let src = a(0);
                 let dest = a(1);
-                if !Path::new(os(src)).exists() {
+                if !host.exists(src) {
                     if op.option.ends_with("-try") {
                         continue;
                     }
@@ -281,16 +287,18 @@ fn apply_ops(
                         String::from_utf8_lossy(src)
                     )));
                 }
-                let src_abs = absolutize(src);
-                ensure_mount_point(root, dest, Path::new(os(&src_abs)).is_dir());
-                cfg.bindings
-                    .push(bind(&src_abs, dest, op.option.starts_with("--ro-bind")));
+                ensure_mount_point(root, dest, host.is_dir(src));
+                cfg.bindings.push(bind(
+                    &host.host_path(src),
+                    dest,
+                    op.option.starts_with("--ro-bind"),
+                ));
             }
             "--bind-fd" | "--ro-bind-fd" => {
                 let fd = parse_fd(Some(a(0)), &op.option)?;
-                let src = fs::read_link(format!("/proc/self/fd/{fd}"))
+                let src = host
+                    .fd_path(fd)
                     .map_err(|e| CliError::Usage(format!("bwrap: {}: fd {fd}: {e}", op.option)))?;
-                let src = src.as_os_str().as_bytes().to_vec();
                 ensure_mount_point(root, a(1), Path::new(os(&src)).is_dir());
                 cfg.bindings.push(bind(&src, a(1), op.option == "--ro-bind-fd"));
             }
@@ -342,9 +350,9 @@ fn apply_ops(
             }
             "--file" | "--bind-data" | "--ro-bind-data" => {
                 let fd = parse_fd(Some(a(0)), &op.option)?;
-                let data = read_fd(fd)
+                let data = host
+                    .read_fd(fd)
                     .map_err(|e| CliError::Usage(format!("bwrap: {}: fd {fd}: {e}", op.option)))?;
-                unsafe { libc::close(fd) };
                 let p = under_root_path(root, a(1));
                 if let Some(parent) = p.parent() {
                     let _ = fs::create_dir_all(parent);
@@ -374,7 +382,7 @@ fn apply_ops(
                     .map_err(|_| CliError::Usage(format!("bwrap: bad --chmod {s}")))?;
                 set_mode(&under_root_path(root, a(1)), mode);
             }
-            _ => map_op(op, cfg, env, argv0)?,
+            _ => map_op(op, cfg, env, argv0, host)?,
         }
     }
     Ok(())
@@ -387,6 +395,7 @@ fn apply_ops(
 /// * `cfg` - Configuration being built.
 /// * `env` - Environment being built for the command.
 /// * `argv0` - Receives `--argv0`.
+/// * `host` - The process whose descriptors `--seccomp` and `--add-seccomp-fd` name.
 ///
 /// # Errors
 /// [`CliError::Usage`] for unreadable descriptors and unsupported overlays.
@@ -395,6 +404,7 @@ pub fn map_op(
     cfg: &mut Config,
     env: &mut BTreeMap<Vec<u8>, Vec<u8>>,
     argv0: &mut Option<Vec<u8>>,
+    host: &dyn Host,
 ) -> Result<(), CliError> {
     let a = |n: usize| -> &[u8] { &op.args[n] };
     match op.option.as_str() {
@@ -412,9 +422,9 @@ pub fn map_op(
         "--hostname" => cfg.hostname = Some(a(0).to_vec()),
         "--seccomp" | "--add-seccomp-fd" => {
             let fd = parse_fd(Some(a(0)), &op.option)?;
-            let data =
-                read_fd(fd).map_err(|e| CliError::Usage(format!("bwrap: {}: fd {fd}: {e}", op.option)))?;
-            unsafe { libc::close(fd) };
+            let data = host
+                .read_fd(fd)
+                .map_err(|e| CliError::Usage(format!("bwrap: {}: fd {fd}: {e}", op.option)))?;
             if op.option == "--seccomp" {
                 cfg.seccomp_programs.clear();
             }
@@ -532,20 +542,6 @@ fn bind(host: &[u8], guest: &[u8], read_only: bool) -> Binding {
     }
 }
 
-fn absolutize(p: &[u8]) -> Vec<u8> {
-    if p.first() == Some(&b'/') {
-        return p.to_vec();
-    }
-    let mut cwd = std::env::current_dir()
-        .map(|c| c.as_os_str().as_bytes().to_vec())
-        .unwrap_or_else(|_| b"/".to_vec());
-    if cwd != b"/" {
-        cwd.push(b'/');
-    }
-    cwd.extend_from_slice(p);
-    cwd
-}
-
 fn os(b: &[u8]) -> &std::ffi::OsStr {
     std::ffi::OsStr::from_bytes(b)
 }
@@ -574,25 +570,10 @@ fn parse_fd(v: Option<&[u8]>, option: &str) -> Result<i32, CliError> {
     })
 }
 
-/// Reads an inherited descriptor to its end from its current position.
-fn read_fd(fd: i32) -> std::io::Result<Vec<u8>> {
-    use std::os::unix::io::FromRawFd;
-    if fd < 0 {
-        return Err(std::io::Error::from_raw_os_error(libc::EBADF));
-    }
-    let dup = unsafe { libc::dup(fd) };
-    if dup < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut f = unsafe { fs::File::from_raw_fd(dup) };
-    let mut out = Vec::new();
-    f.read_to_end(&mut out)?;
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::host::Local;
 
     fn v(s: &[&str]) -> Vec<Vec<u8>> {
         s.iter().map(|x| x.as_bytes().to_vec()).collect()
@@ -600,19 +581,22 @@ mod tests {
 
     #[test]
     fn splits_ops_and_command_with_perms() {
-        let (ops, cmd) = parse_ops(v(&[
-            "--perms",
-            "0700",
-            "--dir",
-            "/x",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--",
-            "/bin/sh",
-            "-c",
-            "--die-with-parent",
-        ]))
+        let (ops, cmd) = parse_ops(
+            v(&[
+                "--perms",
+                "0700",
+                "--dir",
+                "/x",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--",
+                "/bin/sh",
+                "-c",
+                "--die-with-parent",
+            ]),
+            &Local,
+        )
         .unwrap();
         assert_eq!(ops.len(), 2);
         assert_eq!(
@@ -664,7 +648,7 @@ mod tests {
                 perms: None,
             },
         ] {
-            map_op(&op, &mut cfg, &mut env, &mut argv0).unwrap();
+            map_op(&op, &mut cfg, &mut env, &mut argv0, &Local).unwrap();
         }
         assert!(cfg.kill_on_exit && cfg.new_session);
         assert_eq!(cfg.cwd, b"/app".to_vec());
@@ -674,16 +658,19 @@ mod tests {
 
     #[test]
     fn ro_bind_is_read_only_and_root_is_private() {
-        let cfg = parse(vec![
-            "--ro-bind".into(),
-            "/usr".into(),
-            "/usr".into(),
-            "--symlink".into(),
-            "usr/lib".into(),
-            "/lib".into(),
-            "--".into(),
-            "/bin/true".into(),
-        ])
+        let cfg = parse(
+            vec![
+                "--ro-bind".into(),
+                "/usr".into(),
+                "/usr".into(),
+                "--symlink".into(),
+                "usr/lib".into(),
+                "/lib".into(),
+                "--".into(),
+                "/bin/true".into(),
+            ],
+            &Local,
+        )
         .unwrap();
         let b = cfg.bindings.iter().find(|b| b.guest == b"/usr").unwrap();
         assert!(b.read_only && b.host == b"/usr");
@@ -696,6 +683,9 @@ mod tests {
 
     #[test]
     fn unknown_option_is_an_error() {
-        assert!(matches!(parse_ops(v(&["--bogus", "x"])), Err(CliError::Usage(_))));
+        assert!(matches!(
+            parse_ops(v(&["--bogus", "x"]), &Local),
+            Err(CliError::Usage(_))
+        ));
     }
 }

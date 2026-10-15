@@ -12,6 +12,7 @@ description: "Tuning and diagnostics, read by both front ends."
 | `PROOT_EXEC_DEBUG` | unset | Print every rewritten `execve` with the loader and argv it was given. |
 | `PROOT_NO_PATH_CACHE` | unset | Disable the directory cache of the path walk, for an A/B comparison. |
 | `PROOT_BWRAP_KEEP` | unset | Keep the private root bwrap mode materializes instead of removing it on exit. |
+| `PROOT_NEST` | unset | `0` stops programs named `proot`, `proot-next` or `bwrap` from being served as nested launches; an exec of proot-next's own binary always is. |
 
 Diagnostics go to stderr. Under Steam, that is the `srt-logger` and ends up
 in `~/.local/share/Steam/logs/webhelper-linux.txt` and the game's log.

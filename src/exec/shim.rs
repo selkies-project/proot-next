@@ -1,12 +1,17 @@
-//! The exec trampoline of the no-ptrace mode: a static binary installed in
-//! the alias directory as `e`, and the record files that tell it what to run.
+//! The exec trampoline: a static binary installed in the alias directory as
+//! `e`, and the record files that tell it what to run.
 //!
-//! Every tracee has the alias directory as its kernel working directory, so
-//! the two-byte path `e` names the trampoline from any process, whatever
-//! length the original path string had.  The supervisor writes `r<pid>` next
-//! to it with the plan (see [`write_record`]), rewrites the path string to
-//! `e`, lets the exec proceed, and the trampoline execs the real target with
-//! the arguments rebuilt from the record and its own, untouched, `argv[1..]`.
+//! Without ptrace every tracee has the alias directory as its kernel working
+//! directory, so the two-byte path `e` names the trampoline from any
+//! process, whatever length the original path string had.  The supervisor
+//! writes `r<pid>` next to it with the plan (see [`write_record`]), rewrites
+//! the path string to `e`, lets the exec proceed, and the trampoline execs
+//! the real target with the arguments rebuilt from the record and its own,
+//! untouched, `argv[1..]`.  A nested launch (see [`super::nested`]) takes
+//! the trampoline in both modes, exec'd by its full path with ptrace, and
+//! its record carries the process setup as well: a complete argument vector,
+//! an environment, a directory to enter, session and death-signal flags,
+//! seccomp programs, status descriptors, or a message to print and exit with.
 //!
 //! The binaries under `shim/bin/` are built by `shim/build.sh` from the
 //! `no_std` crate in `shim/` and embedded here; one per host architecture.
@@ -107,8 +112,17 @@ pub fn running(tid: u32) -> bool {
 
 /// Writes the record the trampoline will read for process `tgid`.
 ///
-/// Format: NUL-separated fields, the count of leading arguments as decimal
-/// text, the path to exec, then those arguments.
+/// The record is a sequence of netstrings (`<length>:<bytes>,`), each
+/// holding a one-byte tag and its value; text values carry their
+/// terminating NUL so the trampoline can hand them to `execve` in place.
+/// The first field is `v2`.  Then either `A<n>` (leading arguments, the
+/// trampoline's own `argv[1..]` follow) or `a<n>` (the complete vector),
+/// each followed by `n` fields tagged `-`; `p<path>` to exec; optionally
+/// `e<n>` and `n` environment entries tagged `-`; `c<dir>` to enter; `s`
+/// for a new session; `d` to die with the parent; `S<program>` (binary,
+/// repeatable); `I<fd>` and `J<fd>` status descriptors; `W<text>` lines to
+/// print; or, instead of all of the above, `E<code>:<text>` or
+/// `O<code>:<text>` to print on stderr or stdout and exit.
 ///
 /// # Arguments
 /// * `tgid` - Process about to exec the trampoline.
@@ -120,16 +134,88 @@ pub fn write_record(tgid: i32, plan: &ExecPlan) -> Result<()> {
     let Some(dir) = INSTALLED.get() else {
         return Err(libc::ENOENT);
     };
-    let mut rec = Vec::with_capacity(256);
-    rec.extend_from_slice(plan.prefix.to_string().as_bytes());
-    rec.push(0);
-    rec.extend_from_slice(&plan.exec_path);
-    rec.push(0);
-    for a in &plan.argv[..plan.prefix] {
-        rec.extend_from_slice(a);
-        rec.push(0);
+    let mut rec = Record::default();
+    rec.text(b'v', b"2");
+    match &plan.trampoline {
+        Some(t) => {
+            for w in &t.warnings {
+                rec.text(b'W', w);
+            }
+            if let Some((code, text, to_stdout)) = &t.exit {
+                let mut v = format!("{code}:").into_bytes();
+                v.extend_from_slice(text);
+                rec.text(if *to_stdout { b'O' } else { b'E' }, &v);
+            } else {
+                rec.text(b'a', plan.argv.len().to_string().as_bytes());
+                for a in &plan.argv {
+                    rec.text(b'-', a);
+                }
+                rec.text(b'p', &plan.exec_path);
+                if let Some(env) = &t.env {
+                    rec.text(b'e', env.len().to_string().as_bytes());
+                    for e in env {
+                        rec.text(b'-', e);
+                    }
+                }
+                if let Some(dir) = &t.chdir {
+                    rec.text(b'c', dir);
+                }
+                if t.new_session {
+                    rec.text(b's', b"");
+                }
+                if t.die_with_parent {
+                    rec.text(b'd', b"");
+                }
+                for prog in &t.seccomp_programs {
+                    rec.binary(b'S', prog);
+                }
+                for fd in &t.info_fds {
+                    rec.text(b'I', fd.to_string().as_bytes());
+                }
+                for fd in &t.json_status_fds {
+                    rec.text(b'J', fd.to_string().as_bytes());
+                }
+            }
+        }
+        None => {
+            rec.text(b'A', plan.prefix.to_string().as_bytes());
+            for a in &plan.argv[..plan.prefix] {
+                rec.text(b'-', a);
+            }
+            rec.text(b'p', &plan.exec_path);
+        }
     }
-    std::fs::write(dir.join(format!("r{tgid}")), rec).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+    std::fs::write(dir.join(format!("r{tgid}")), rec.bytes).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+}
+
+/// A record under construction.
+#[derive(Default)]
+struct Record {
+    bytes: Vec<u8>,
+}
+
+impl Record {
+    /// Appends a text field: the tag, the text and a NUL.
+    fn text(&mut self, tag: u8, value: &[u8]) {
+        self.field(tag, value, true);
+    }
+
+    /// Appends a binary field: the tag and the bytes.
+    fn binary(&mut self, tag: u8, value: &[u8]) {
+        self.field(tag, value, false);
+    }
+
+    fn field(&mut self, tag: u8, value: &[u8], nul: bool) {
+        let len = 1 + value.len() + usize::from(nul);
+        self.bytes.extend_from_slice(len.to_string().as_bytes());
+        self.bytes.push(b':');
+        self.bytes.push(tag);
+        self.bytes.extend_from_slice(value);
+        if nul {
+            self.bytes.push(0);
+        }
+        self.bytes.push(b',');
+    }
 }
 
 /// Path of the record file of process `tgid`.

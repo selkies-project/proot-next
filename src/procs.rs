@@ -16,8 +16,10 @@
 //! re-read from `/proc` once a second, which keeps a reused id from naming
 //! the wrong process for longer than that.
 
+use crate::state::View;
 use crate::sys::{Result, errno};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -62,6 +64,12 @@ pub struct TraceeInfo {
     /// The process this one was `vfork`ed from and still shares memory with,
     /// until it execs; a rewritten exec path then has to be restored there.
     pub vfork_parent: Option<i32>,
+    /// The view this process lives in; `None` for the root view.
+    pub view: Option<Arc<View>>,
+    /// Set between a rewritten exec and the trampoline's exec of the real
+    /// target.  Inherited by a child the trampoline forks, which then carries
+    /// out the exec itself.
+    pub pending: Option<PendingExec>,
 }
 
 /// The program a process is about to run through the exec shim.
@@ -74,6 +82,9 @@ pub struct PendingExec {
     /// The path string rewritten in a `vfork` parent's memory: its address,
     /// the original bytes and the bytes written over them.
     pub restore: Option<(i32, u64, Vec<u8>, Vec<u8>)>,
+    /// The view the process enters at the real exec, with its working
+    /// directory there (a nested proot or bwrap launch).
+    pub enter: Option<(Arc<View>, Vec<u8>)>,
 }
 
 /// The reaper's epoll descriptor and the pidfd it watches for each process.
@@ -96,8 +107,9 @@ pub struct ProcTable {
     forks: Mutex<HashMap<i32, VecDeque<TraceeInfo>>>,
     /// Snapshots whose parent exited before the child was seen.
     orphans: Mutex<VecDeque<(Instant, TraceeInfo)>>,
-    /// Processes between the rewritten exec and the shim's own exec.
-    shim: Mutex<HashMap<i32, PendingExec>>,
+    /// At least the number of processes with a pending exec, so the check
+    /// on every notification costs nothing while there is none.
+    shim: AtomicUsize,
     reaper: Mutex<Option<Reaper>>,
 }
 
@@ -114,7 +126,7 @@ impl ProcTable {
             defaults: RwLock::new(TraceeInfo::default()),
             forks: Mutex::new(HashMap::new()),
             orphans: Mutex::new(VecDeque::new()),
-            shim: Mutex::new(HashMap::new()),
+            shim: AtomicUsize::new(0),
             reaper: Mutex::new(None),
         }
     }
@@ -185,7 +197,20 @@ impl ProcTable {
         let tgid = self.tgid(parent);
         let mut p = self.procs.write().unwrap();
         let info = p.get(&tgid).cloned().unwrap_or_default();
+        if info.pending.is_some() {
+            self.shim.fetch_add(1, Ordering::Relaxed);
+        }
         p.insert(child, info);
+    }
+
+    /// The view of the process of thread `tid`, if it has one of its own.
+    ///
+    /// # Arguments
+    /// * `tid` - Thread or process id.
+    pub fn view_of(&self, tid: i32) -> Option<Arc<View>> {
+        let tgid = self.tgid(tid);
+        self.ensure(tgid);
+        self.procs.read().unwrap().get(&tgid).and_then(|t| t.view.clone())
     }
 
     /// Takes a snapshot of the forking process for the child to inherit (no ptrace).
@@ -216,10 +241,12 @@ impl ProcTable {
             .write()
             .unwrap()
             .retain(|t, (g, _)| *t != pid && *g != pid);
-        if self.procs.write().unwrap().remove(&pid).is_none() {
+        let Some(gone) = self.procs.write().unwrap().remove(&pid) else {
             return;
+        };
+        if gone.pending.is_some() {
+            self.shim.fetch_sub(1, Ordering::Relaxed);
         }
-        self.shim.lock().unwrap().remove(&pid);
         if let Some(q) = self.forks.lock().unwrap().remove(&pid) {
             let now = Instant::now();
             let mut orphans = self.orphans.lock().unwrap();
@@ -278,21 +305,33 @@ impl ProcTable {
 
     /// Marks process `tgid` as about to run the exec shim for `pending`.
     pub fn shim_enter(&self, tgid: i32, pending: PendingExec) {
-        self.shim.lock().unwrap().insert(tgid, pending);
+        self.shim.fetch_add(1, Ordering::Relaxed);
+        self.update(tgid, |t| {
+            t.pending = Some(pending);
+        });
     }
 
     /// The pending exec of process `tgid`, if it is in the shim.
     pub fn shim_pending(&self, tgid: i32) -> Option<PendingExec> {
-        let m = self.shim.lock().unwrap();
-        if m.is_empty() {
+        if self.shim.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        m.get(&tgid).cloned()
+        self.ensure(tgid);
+        self.procs
+            .read()
+            .unwrap()
+            .get(&tgid)
+            .and_then(|t| t.pending.clone())
     }
 
     /// Clears the shim mark of process `tgid`.
     pub fn shim_leave(&self, tgid: i32) {
-        self.shim.lock().unwrap().remove(&tgid);
+        let mut p = self.procs.write().unwrap();
+        if let Some(t) = p.get_mut(&tgid)
+            && t.pending.take().is_some()
+        {
+            self.shim.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Makes sure process `tgid` has an entry, discovering its ancestry if needed.
@@ -342,8 +381,12 @@ impl ProcTable {
                 None => self.defaults.read().unwrap().clone(),
             }
         };
+        let pending = state.pending.is_some();
         let inserted = self.procs.write().unwrap().try_insert_entry(tgid, state);
         if inserted {
+            if pending {
+                self.shim.fetch_add(1, Ordering::Relaxed);
+            }
             self.watch(tgid);
         }
     }
@@ -376,7 +419,11 @@ impl ProcTable {
                 .get_mut(&tgid)
                 .and_then(|q| q.pop_front());
             let Some(state) = snapshot else { break };
+            let pending = state.pending.is_some();
             if self.procs.write().unwrap().try_insert_entry(pid, state) {
+                if pending {
+                    self.shim.fetch_add(1, Ordering::Relaxed);
+                }
                 self.watch(pid);
             }
         }
@@ -525,7 +572,7 @@ mod tests {
 
     #[test]
     fn shim_marks_are_per_process() {
-        let t = ProcTable::new(true);
+        let t = ProcTable::new(false);
         assert!(t.shim_pending(7).is_none());
         t.shim_enter(
             7,
@@ -533,10 +580,16 @@ mod tests {
                 guest: b"/bin/true".to_vec(),
                 host: b"/r/bin/true".to_vec(),
                 restore: None,
+                enter: None,
             },
         );
         assert_eq!(t.shim_pending(7).map(|p| p.guest), Some(b"/bin/true".to_vec()));
+        t.fork(7, 8);
+        assert_eq!(t.shim_pending(8).map(|p| p.host), Some(b"/r/bin/true".to_vec()));
         t.shim_leave(7);
         assert!(t.shim_pending(7).is_none());
+        assert!(t.shim_pending(8).is_some());
+        t.forget(8);
+        assert_eq!(t.shim.load(Ordering::Relaxed), 0);
     }
 }
