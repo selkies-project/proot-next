@@ -29,7 +29,9 @@ const ARGV_MAX: usize = 1 << 17;
 const PREFIX_MAX: usize = 64;
 
 static mut RECORD: [u8; RECORD_MAX] = [0; RECORD_MAX];
-static mut ARGV: [*const c_char; ARGV_MAX + PREFIX_MAX + 1] = [core::ptr::null(); ARGV_MAX + PREFIX_MAX + 1];
+/// Zeroed: the slot after the last argument written is the vector's terminating null.
+static mut ARGV: core::mem::MaybeUninit<[*const c_char; ARGV_MAX + PREFIX_MAX + 1]> =
+    core::mem::MaybeUninit::zeroed();
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -95,16 +97,16 @@ pub extern "C" fn main(argc: i32, argv: *const *const c_char, envp: *const *cons
             say(&[b"proot: exec shim: bad record\n"]);
             return 126;
         }
-        let mut fields: [*const c_char; PREFIX_MAX + 2] = [core::ptr::null(); PREFIX_MAX + 2];
+        let mut starts = [0usize; PREFIX_MAX + 2];
         let mut nfields = 0usize;
         let mut start = 0usize;
-        for i in 0..len {
-            if record[i] == 0 {
-                if nfields == fields.len() {
+        for (i, &b) in record[..len].iter().enumerate() {
+            if b == 0 {
+                if nfields == starts.len() {
                     say(&[b"proot: exec shim: record too long\n"]);
                     return 126;
                 }
-                fields[nfields] = record.as_ptr().add(start) as *const c_char;
+                starts[nfields] = start;
                 nfields += 1;
                 start = i + 1;
             }
@@ -114,30 +116,32 @@ pub extern "C" fn main(argc: i32, argv: *const *const c_char, envp: *const *cons
             return 126;
         }
         let mut count = 0usize;
-        let mut p = fields[0] as *const u8;
-        while *p != 0 {
-            count = count * 10 + (*p - b'0') as usize;
-            p = p.add(1);
+        for &b in record[starts[0]..].iter().take_while(|&&b| b != 0) {
+            if !b.is_ascii_digit() || count > PREFIX_MAX {
+                say(&[b"proot: exec shim: record count mismatch\n"]);
+                return 126;
+            }
+            count = count * 10 + (b - b'0') as usize;
         }
         if count + 2 != nfields {
             say(&[b"proot: exec shim: record count mismatch\n"]);
             return 126;
         }
-        let path = fields[1];
-        let out = &mut *core::ptr::addr_of_mut!(ARGV);
+        let field = |k: usize| record.as_ptr().add(starts[k]) as *const c_char;
+        let path = field(1);
+        let out = core::ptr::addr_of_mut!(ARGV).cast::<*const c_char>();
         let mut n = 0usize;
-        for f in &fields[2..2 + count] {
-            out[n] = *f;
+        for k in 2..2 + count {
+            out.add(n).write(field(k));
             n += 1;
         }
         let mut i = 1usize;
         while i < argc.max(0) as usize && n < ARGV_MAX + PREFIX_MAX {
-            out[n] = *argv.add(i);
+            out.add(n).write(*argv.add(i));
             n += 1;
             i += 1;
         }
-        out[n] = core::ptr::null();
-        libc::execve(path, out.as_ptr(), envp);
+        libc::execve(path, out.cast_const(), envp);
         let e = *libc::__errno_location();
         let mut ebuf = [0u8; 20];
         let edigits = itoa(e as u64, &mut ebuf);
