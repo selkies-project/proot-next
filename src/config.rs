@@ -22,6 +22,9 @@ pub struct Config {
     pub bindings: Vec<Binding>,
     /// Initial working directory, as a guest path.
     pub cwd: Vec<u8>,
+    /// `cwd` was not given on the command line: it is the caller's working
+    /// directory, to be kept only where the guest can see it.
+    pub cwd_default: bool,
     /// Kill every tracee when the supervisor exits.
     pub kill_on_exit: bool,
     /// Verbosity, 0 is quiet.
@@ -79,6 +82,7 @@ impl Default for Config {
             root: b"/".to_vec(),
             bindings: Vec::new(),
             cwd: b".".to_vec(),
+            cwd_default: false,
             kill_on_exit: false,
             verbose,
             command: Vec::new(),

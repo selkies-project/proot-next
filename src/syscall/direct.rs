@@ -26,10 +26,10 @@
 //! `clone` and its relatives are notified only to snapshot the parent's
 //! state for the child, see `procs`.
 
+use crate::exec::nested::EnvSource;
 use crate::exec::{self, shim};
 use crate::fs::translate::{detranslate_path, guest_fd_path, read_link};
 use crate::note;
-use crate::procs::PendingExec;
 use crate::seccomp::notify::{addfd_at, reply_continue};
 use crate::sys::{Result, errno};
 use crate::syscall::notify::{Outcome, Req};
@@ -69,9 +69,7 @@ pub fn dispatch(r: &Req, nr: i64) -> Option<Result<Outcome>> {
         EXECVE => do_execve(r, false),
         EXECVEAT => do_execve(r, true),
         CHDIR => r.path(0).and_then(|p| set_cwd(r, libc::AT_FDCWD, &p)),
-        FCHDIR => {
-            guest_fd_path(&r.ctx.fs, r.pid, r.arg(0) as i32).and_then(|p| set_cwd(r, libc::AT_FDCWD, &p))
-        }
+        FCHDIR => guest_fd_path(r.fs(), r.pid, r.arg(0) as i32).and_then(|p| set_cwd(r, libc::AT_FDCWD, &p)),
         CHROOT => do_chroot(r),
         CONNECT => do_sockaddr(r, r.arg(0) as i32, r.arg(1), r.arg(2) as usize, true),
         BIND => do_sockaddr(r, r.arg(0) as i32, r.arg(1), r.arg(2) as usize, false),
@@ -84,9 +82,11 @@ pub fn dispatch(r: &Req, nr: i64) -> Option<Result<Outcome>> {
 /// Lets the trampoline's own syscalls through untranslated.
 ///
 /// Between the rewritten exec and the trampoline's exec of the real target,
-/// the process opens and unlinks its record relative to the kernel cwd.  The
-/// mark is verified against `/proc/<pid>/exe` so a program whose rewritten
-/// exec failed is not left untranslated.
+/// the process opens and unlinks its record, and carries out the setup of a
+/// nested launch, with host paths.  The mark is verified against
+/// `/proc/<pid>/exe` so a program whose rewritten exec failed is not left
+/// untranslated.  Serves both modes: with ptrace the trampoline's notified
+/// syscalls come here and its traced ones to `syscall::traced`.
 ///
 /// # Arguments
 /// * `r` - The notification.
@@ -144,10 +144,10 @@ fn do_execve(r: &Req, is_at: bool) -> Result<Outcome> {
     if let Some(p) = r.ctx.procs.shim_pending(tgid) {
         r.ctx.procs.shim_leave(tgid);
         if shim::running(r.pid) {
-            r.ctx.set_exe(tgid, p.guest, p.host);
-            if let Some((parent, addr, orig, written)) = p.restore {
-                restore_if_intact(r, parent as u32, addr, &orig, &written);
+            if let Some((parent, addr, orig, written)) = &p.restore {
+                restore_if_intact(r, *parent as u32, *addr, orig, written);
             }
+            exec::finish_pending(r.ctx, tgid, p);
             return Ok(Outcome::Continue);
         }
     }
@@ -158,39 +158,39 @@ fn do_execve(r: &Req, is_at: bool) -> Result<Outcome> {
     };
     let user_path = r.path(path_idx)?;
     let argv = exec::read_argv(r.ctx, r.pid, r.arg(argv_idx), r.abi.ptr_size())?;
+    let env = EnvSource::Address {
+        envp: r.arg(argv_idx + 1),
+        ptr_size: r.abi.ptr_size(),
+    };
     let empty_path = is_at && user_path.is_empty();
     let plan = if empty_path {
         if at_flags & libc::AT_EMPTY_PATH == 0 {
             return Err(libc::ENOENT);
         }
-        let guest = guest_fd_path(&r.ctx.fs, r.pid, dirfd)?;
-        exec::plan(r.ctx, r.pid, libc::AT_FDCWD, &guest, argv, true)?
+        let guest = guest_fd_path(r.fs(), r.pid, dirfd)?;
+        exec::plan(r.ctx, r.pid, libc::AT_FDCWD, &guest, argv, true, env)?
     } else {
         let deref = at_flags & libc::AT_SYMLINK_NOFOLLOW == 0;
-        exec::plan(r.ctx, r.pid, dirfd, &user_path, argv, deref)?
+        exec::plan(r.ctx, r.pid, dirfd, &user_path, argv, deref, env)?
     };
     if !is_at && !plan.changed {
         r.ctx.set_exe(tgid, plan.guest_prog, plan.host_prog);
         return Ok(Outcome::Continue);
     }
-    check_executable(&plan)?;
+    if plan.trampoline.is_none() {
+        check_executable(&plan)?;
+    }
     r.valid()?;
     exec::debug_exec(r.pid, &plan);
     shim::write_record(tgid, &plan)?;
     let vfork_parent = r.ctx.tracee(tgid).vfork_parent;
     let mut orig = user_path.clone();
     orig.push(0);
-    let restore = vfork_parent
+    let mut pending = exec::pending_of(&plan);
+    pending.restore = vfork_parent
         .filter(|_| !empty_path)
         .map(|parent| (parent, r.arg(path_idx), orig, b"e\0".to_vec()));
-    r.ctx.procs.shim_enter(
-        tgid,
-        PendingExec {
-            guest: plan.guest_prog.clone(),
-            host: plan.host_prog.clone(),
-            restore,
-        },
-    );
+    r.ctx.procs.shim_enter(tgid, pending);
     let undo = |e: i32| {
         r.ctx.procs.shim_leave(tgid);
         if let Some(p) = shim::record_path(tgid) {
@@ -335,7 +335,7 @@ fn set_cwd(r: &Req, dirfd: i32, path: &[u8]) -> Result<Outcome> {
     if unsafe { libc::access(c.as_ptr(), libc::X_OK) } < 0 {
         return Err(errno());
     }
-    let guest = detranslate_path(&r.ctx.fs, &host);
+    let guest = detranslate_path(r.fs(), &host);
     r.valid()?;
     r.ctx.procs.set_cwd(r.pid as i32, guest);
     Ok(Outcome::Value(Ok(0)))
@@ -345,7 +345,7 @@ fn set_cwd(r: &Req, dirfd: i32, path: &[u8]) -> Result<Outcome> {
 /// be for an unprivileged process.
 fn do_chroot(r: &Req) -> Result<Outcome> {
     let host = r.translate(libc::AT_FDCWD, &r.path(0)?, true)?;
-    if detranslate_path(&r.ctx.fs, &host) == b"/" {
+    if detranslate_path(r.fs(), &host) == b"/" {
         return Ok(Outcome::Value(Ok(0)));
     }
     Err(libc::EPERM)

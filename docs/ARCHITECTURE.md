@@ -65,11 +65,48 @@ new namespace" and glycin falls back to running its loaders unsandboxed.
 keeps its flags in memory, so it is notified in both modes and checked by
 `syscall::direct::do_clone`; `setns` is refused outright.
 
-The images also put the `bwrap` symlink on the guest's `PATH`, so a program
-inside a guest may run proot-next itself as its bubblewrap.  Nesting is not
-supported (a second listener on the filter chain is `EBUSY`, and with ptrace
-the outer tracer already owns the child), so in bwrap mode that failure is
-worded as bubblewrap words a sandbox it cannot build, for the same callers.
+## Nested proot and bwrap
+
+The kernel allows one tracer per process and one listener per seccomp
+filter chain, so a proot started inside the guest can never be a second
+supervisor (PRoot gets around the first limit by emulating ptrace for its
+tracees, at about ten times the cost of a single PRoot, and would still hit
+the second).  It does not need to be one: the supervisor already serves
+every descendant, and a nested launch only needs a different translation
+table for one subtree.  So an `execve` of the supervisor's own binary
+(matched by inode), or of any ELF named `proot`, `proot-next` or `bwrap`
+(matched by name, unless `PROOT_NEST=0`), is not carried out.
+`exec/nested.rs` parses the command line with the same front ends as
+`main`, on the tracee's behalf: paths are looked up in the tracee's view,
+the working directory and environment are the tracee's (its `envp` is read
+from the exec), and `--args`, `--file` and `--seccomp` descriptors are read
+through `/proc/<pid>/fd`.  The root and the host side of every binding are
+translated through the requester's view, so the result is a flat table in
+host terms: a nested view can see no more than the view it was asked from,
+and a third level composes the same way.  The table, with the launch's
+`-k`/`-0`/`--hostname` values, is a `View` (`state.rs`); each process record
+holds an `Arc` to its view, inherited at fork, and the directory cache is
+shared across views and keyed by view.
+
+The process that called `proot` becomes the command, so the caller's child,
+its exit status and its signals are the kernel's own.  The exec is
+retargeted at the trampoline in both modes, exec'd by its full path with
+ptrace, and the record carries what only the process itself can do: the
+complete argument vector, a replaced environment, the `chdir` (with ptrace;
+without it the view's virtual cwd is set), `setsid`, the death signal, the
+caller's seccomp programs, the status descriptors, and for
+`--json-status-fd` a fork whose parent waits and reports the exit code,
+which is bubblewrap's own process shape in the one case a caller depends on
+it.  A usage error, `--help` or `--version` is also carried out by the
+trampoline, on the caller's own stderr or stdout.  The process enters its
+view at the trampoline's exec of the real target, where the pending record
+is completed (`exec::finish_pending`); until then its syscalls pass
+through untranslated, as they do for every trampoline.
+
+The filter is fixed at launch, so a nested `-0` or `-k` is refused with a
+message unless the outer launch already notifies those syscalls; a nested
+`--hostname` is dropped in that case.  bwrap's materialized root is removed
+when the last process of the view is gone.
 
 ## Without ptrace
 
@@ -261,7 +298,11 @@ lookups.
 * `execveat` of a memfd (`AT_EMPTY_PATH` on a descriptor without a path)
   fails; PRoot refuses it too.
 * bwrap: `--dev` binds the host `/dev`; `--uid/--gid`, `--unshare-*` and the
-  capability options are no-ops; `--hostname` only affects `uname`.
+  capability options are no-ops; `--hostname` only affects `uname`, and not
+  at all in a nested launch under an outer launch without `-k` or
+  `--hostname`.
+* Nested `-0` and `-k` need the outer launch to have them.  A debugger inside
+  a ptrace-mode guest still gets `EPERM`: ptrace is not emulated.
 * Opening a FIFO through a non-identity binding blocks a supervisor thread.
 * `name_to_handle_at` returns `EOPNOTSUPP`.
 * Without ptrace: a buffer refilled by the program between a rewrite and its

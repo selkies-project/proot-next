@@ -3,10 +3,56 @@
 use crate::config::{Binding, Config, trim_slashes};
 use crate::procs::ProcTable;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Entries kept in the directory cache before it is cleared wholesale.
 const DIR_CACHE_MAX: usize = 65_536;
+
+/// Canonical guest directories known to exist and not be symlinks, shared
+/// by every view of one supervisor.
+///
+/// Lets the walk skip one `lstat` per intermediate component.  Entries are
+/// keyed by the view they were resolved in, since the same guest path names
+/// different host directories in different views, and the whole cache is
+/// flushed by [`DirCache::flush`] after any syscall that may replace a
+/// directory, whichever view made it: the host directories are shared.
+#[derive(Debug)]
+pub struct DirCache {
+    entries: RwLock<HashSet<(u64, Vec<u8>)>>,
+    /// False when `PROOT_NO_PATH_CACHE` is set.
+    enabled: bool,
+}
+
+impl DirCache {
+    /// Creates an empty cache, disabled when `PROOT_NO_PATH_CACHE` is set.
+    pub fn new() -> DirCache {
+        DirCache {
+            entries: RwLock::new(HashSet::new()),
+            enabled: std::env::var_os("PROOT_NO_PATH_CACHE").is_none(),
+        }
+    }
+
+    /// Forgets every cached directory of every view.
+    ///
+    /// Call after `mkdir`, `rmdir`, `rename`, `unlink`, `symlink`, `link`,
+    /// `mknod` or any other syscall that can turn a directory into something
+    /// else (or the reverse); changes made from outside PRoot are not seen.
+    pub fn flush(&self) {
+        if let Ok(mut c) = self.entries.write() {
+            c.clear();
+        }
+    }
+}
+
+impl Default for DirCache {
+    fn default() -> Self {
+        DirCache::new()
+    }
+}
+
+/// Source of view identifiers, unique for the life of the supervisor.
+static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The guest filesystem view: a root directory plus bind mounts.
 #[derive(Debug)]
@@ -17,21 +63,19 @@ pub struct Fs {
     pub bindings: Vec<Binding>,
     /// True when root is `/` and there are no bindings: translation is a no-op.
     pub identity: bool,
-    /// Canonical guest directories known to exist and not be symlinks.
-    ///
-    /// Lets the walk skip one `lstat` per intermediate component.  Flushed by
-    /// [`Fs::flush_cache`] after any syscall that may replace a directory.
-    dir_cache: RwLock<HashSet<Vec<u8>>>,
+    /// Identifies this view's entries in the shared directory cache.
+    id: u64,
+    /// Directory cache shared with every other view of the supervisor.
+    cache: Arc<DirCache>,
     /// Per-process records: the program each process runs, since the kernel's
     /// own `/proc/<pid>/exe` names the dynamic loader after an exec rewrite,
     /// and without ptrace the working directory too.
     pub procs: Arc<ProcTable>,
-    /// False when `PROOT_NO_PATH_CACHE` is set.
-    cache_enabled: bool,
 }
 
 impl Fs {
-    /// Builds the view from the parsed configuration with its own process table.
+    /// Builds the view from the parsed configuration with its own process
+    /// table and directory cache.
     ///
     /// # Arguments
     /// * `config` - Parsed command line.  Bindings are normalized and sorted.
@@ -39,7 +83,18 @@ impl Fs {
         Fs::with_procs(config, Arc::new(ProcTable::new(false)))
     }
 
-    /// Builds the view from the parsed configuration over a shared process table.
+    /// Builds the view from the parsed configuration over a shared process
+    /// table, with a directory cache of its own.
+    ///
+    /// # Arguments
+    /// * `config` - Parsed command line.  Bindings are normalized and sorted.
+    /// * `procs` - Process table shared with the supervisor.
+    pub fn with_procs(config: &Config, procs: Arc<ProcTable>) -> Fs {
+        Fs::with_cache(config, procs, Arc::new(DirCache::new()))
+    }
+
+    /// Builds the view from the parsed configuration over a shared process
+    /// table and a shared directory cache.
     ///
     /// The root is made absolute, since it is used from the alias directory
     /// as well (loader aliases, the exec shim's records).
@@ -47,7 +102,8 @@ impl Fs {
     /// # Arguments
     /// * `config` - Parsed command line.  Bindings are normalized and sorted.
     /// * `procs` - Process table shared with the supervisor.
-    pub fn with_procs(config: &Config, procs: Arc<ProcTable>) -> Fs {
+    /// * `cache` - Directory cache shared with the supervisor's other views.
+    pub fn with_cache(config: &Config, procs: Arc<ProcTable>, cache: Arc<DirCache>) -> Fs {
         let root = resolve_host(&config.root);
         let mut bindings: Vec<Binding> = config
             .bindings
@@ -62,50 +118,49 @@ impl Fs {
         bindings.reverse();
         bindings.sort_by_key(|b| std::cmp::Reverse(b.guest.len()));
         let identity = root == b"/" && bindings.iter().all(|b| b.host == b.guest);
-        let cache_enabled = std::env::var_os("PROOT_NO_PATH_CACHE").is_none();
         Fs {
             root,
             bindings,
             identity,
-            dir_cache: RwLock::new(HashSet::new()),
+            id: NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed),
+            cache,
             procs,
-            cache_enabled,
         }
     }
 
-    /// Whether `guest` is a canonical directory the cache has seen.
+    /// Whether `guest` is a canonical directory the cache has seen in this view.
     ///
     /// # Arguments
     /// * `guest` - Canonical absolute guest path.
     pub fn cache_has_dir(&self, guest: &[u8]) -> bool {
-        self.cache_enabled && self.dir_cache.read().map(|c| c.contains(guest)).unwrap_or(false)
+        self.cache.enabled
+            && self
+                .cache
+                .entries
+                .read()
+                .map(|c| c.contains(&(self.id, guest.to_vec())))
+                .unwrap_or(false)
     }
 
-    /// Records that `guest` resolved to a real directory.
+    /// Records that `guest` resolved to a real directory in this view.
     ///
     /// # Arguments
     /// * `guest` - Canonical absolute guest path.
     pub fn cache_add_dir(&self, guest: &[u8]) {
-        if !self.cache_enabled {
+        if !self.cache.enabled {
             return;
         }
-        if let Ok(mut c) = self.dir_cache.write() {
+        if let Ok(mut c) = self.cache.entries.write() {
             if c.len() >= DIR_CACHE_MAX {
                 c.clear();
             }
-            c.insert(guest.to_vec());
+            c.insert((self.id, guest.to_vec()));
         }
     }
 
-    /// Forgets every cached directory.
-    ///
-    /// Call after `mkdir`, `rmdir`, `rename`, `unlink`, `symlink`, `link`,
-    /// `mknod` or any other syscall that can turn a directory into something
-    /// else (or the reverse); changes made from outside PRoot are not seen.
+    /// Forgets every cached directory of every view sharing the cache.
     pub fn flush_cache(&self) {
-        if let Ok(mut c) = self.dir_cache.write() {
-            c.clear();
-        }
+        self.cache.flush();
     }
 
     /// The recorded guest program of thread `tid`, if any.

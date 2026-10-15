@@ -5,16 +5,22 @@ description: "What the common failures mean."
 
 ### `ptrace(PTRACE_SEIZE) refused: this process is already traced`
 
-You are starting proot-next from inside a shell that already runs under
-proot-next, or under a debugger. Nested proot is not supported yet. Open a
-fresh terminal.
+You are starting proot-next under a debugger, or under a supervisor other
+than proot-next (the original PRoot, for instance). Inside proot-next itself
+this does not happen: an exec of proot or bwrap is served as a nested launch
+with a view of its own, see [how it works](/docs/how-it-works). Open a fresh
+terminal.
 
 In bwrap mode the same situation reads `bwrap: No permissions to create a
-new namespace: proot-next cannot nest` and exits 1: the images put the
-`bwrap` symlink on the guest's `PATH`, so a program inside a guest that
-looks for bubblewrap (GTK's glycin image loaders, WebKit) may find proot-next
-instead, and that wording is the one such programs take as "no sandbox
-here" before carrying on without one.
+new namespace: proot-next cannot run under another supervisor` and exits 1,
+the wording that programs looking for bubblewrap (GTK's glycin image
+loaders, WebKit) take as "no sandbox here" before carrying on without one.
+
+### `-0 inside proot-next needs the outer proot started with -0`
+
+A nested launch asked for fake root (or `-k`), which adds syscalls to the
+seccomp filter, and the filter is fixed when the outer proot starts. Start
+the outer one with the same option.
 
 A container whose seccomp profile filters the `ptrace` syscall does not reach
 this message: proot-next notices at start-up and runs without the ptrace

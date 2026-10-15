@@ -41,12 +41,24 @@ bindings:
 | `--info-fd`, `--json-status-fd` | `{"child-pid": N}` after the fork; the status fd also gets `{"exit-code": N}`. |
 | `--die-with-parent` | Already the behavior. |
 | `--new-session` | `setsid()` in the child. |
-| `--hostname` | Reported by `uname(2)`. |
+| `--hostname` | Reported by `uname(2)`. Dropped in a nested launch when the outer launch has no `-k` or `--hostname`. |
 | `--unshare-*`, `--share-net`, `--uid`, `--gid`, `--cap-*`, `--userns*`, `--pidns`, `--lock-file`, `--sync-fd`, `--block-fd`, `--as-pid-1` | Accepted and ignored. |
 | `--overlay-*` | Refused. |
 
 The private root is removed when the command exits. `PROOT_BWRAP_KEEP=1`
 keeps it for inspection.
+
+## Inside a guest
+
+A program running under proot-next that execs bwrap, whether the symlink
+above, a copy of proot-next, or the rootfs's own bubblewrap, gets the
+container it described as a nested view served by the supervisor already
+there: no second supervisor, no namespaces, the same materialized root and
+bindings composed through the caller's own view. GTK's glycin image loaders
+(every GTK 4 application, FileZilla's icons through its file chooser) run
+inside their sandbox root this way instead of falling back to running
+unsandboxed. The match on the name `bwrap` can be turned off with
+`PROOT_NEST=0`.
 
 ## Steam
 

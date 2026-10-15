@@ -46,6 +46,27 @@ refusal: bubblewrap, which GTK's glycin image loaders and WebKit use,
 reports that namespaces are unavailable and the application carries on
 without the sandbox; Firefox's content sandbox degrades the same way.
 
+## Nested proot and bwrap
+
+A proot started inside the guest cannot be a second supervisor: the kernel
+allows one tracer per process and one seccomp listener per filter chain.
+It does not need to be one. An `execve` of proot-next itself, or of any
+program named `proot` or `bwrap` (a distribution's bubblewrap included),
+is served by the supervisor already there: the command line is parsed on
+the caller's behalf, every path in it is composed through the caller's
+view, and the process that called `proot` becomes the command, in a view
+of its own that its children inherit. The caller's child, exit status and
+signals are the kernel's own, and `--info-fd`, `--json-status-fd`,
+`--seccomp`, `--die-with-parent` and `--new-session` behave as at top
+level. A nested view can see no more than the view it was asked from, and
+nesting composes to any depth. This is what lets proot-apps' graphical
+installer run `proot -R app /install` from inside its own guest, and GTK's
+glycin run its image loaders inside their sandbox root.
+
+Two options cannot be served nested unless the outer launch already has
+them, because the seccomp filter is fixed at launch: `-0` and `-k` are
+refused with a message. `PROOT_NEST=0` turns off the match by name.
+
 ## Why a small warm pool
 
 The kernel hands a notification to the longest-waiting receiver. On an idle

@@ -1,6 +1,8 @@
 //! Handlers for syscalls that take a ptrace stop: the path (or socket
 //! address) is rewritten in the tracee's memory and the syscall proceeds.
 
+use crate::exec::{self, shim};
+use crate::fs::Fs;
 use crate::fs::translate::translate_path;
 use crate::note;
 use crate::state::Ctx;
@@ -11,14 +13,34 @@ use crate::tracee::regs::Regs;
 /// Dispatches a seccomp-trace stop to the right handler.
 ///
 /// On error the syscall number is replaced so the kernel returns `ENOSYS`;
-/// precise errnos need an exit stop we do not take.
+/// precise errnos need an exit stop we do not take.  A process running the
+/// exec trampoline (a nested launch) has its syscalls passed through, and
+/// its exec of the real target completes the pending exec.
 ///
 /// # Arguments
 /// * `ctx` - Shared supervisor state.
 /// * `regs` - Registers at the stop; edits are committed by the caller.
 pub fn handle(ctx: &Ctx, regs: &mut Regs) {
+    let pid = regs.pid();
+    if let Some(pending) = ctx.procs.shim_pending(ctx.tgid(pid)) {
+        let tgid = ctx.tgid(pid);
+        if shim::running(pid as u32) {
+            let is_exec = matches!(
+                regs.abi().to_canonical(regs.sysnum()),
+                Some((EXECVE, _)) | Some((EXECVEAT, _))
+            );
+            if is_exec {
+                ctx.procs.shim_leave(tgid);
+                exec::finish_pending(ctx, tgid, pending);
+            }
+            return;
+        }
+        ctx.procs.shim_leave(tgid);
+    }
+    let view = ctx.view(pid);
+    let fs = &view.fs;
     if regs.abi().socketcall_nr() == Some(regs.sysnum()) {
-        if let Err(e) = rewrite_socketcall(ctx, regs) {
+        if let Err(e) = rewrite_socketcall(ctx, fs, regs) {
             note!(
                 ctx,
                 1,
@@ -36,19 +58,19 @@ pub fn handle(ctx: &Ctx, regs: &mut Regs) {
     };
     let r = match nr {
         EXECVE | EXECVEAT => crate::exec::handle_execve(ctx, regs),
-        CHDIR | CHROOT => rewrite_path_arg(ctx, regs, 0, true),
-        CONNECT | BIND => rewrite_sockaddr(ctx, regs, nr == CONNECT),
+        CHDIR | CHROOT => rewrite_path_arg(ctx, fs, regs, 0, true),
+        CONNECT | BIND => rewrite_sockaddr(ctx, fs, regs, nr == CONNECT),
         // Only O_PATH opens arrive here (the filter inspects the flags): their
         // descriptors cannot be injected, so the filename is rewritten in place.
         OPEN => {
             let deref = regs.abi().open_flags_to_host(regs.arg(1) as i64) & libc::O_NOFOLLOW as i64 == 0;
-            rewrite_path_arg_at(ctx, regs, None, 0, deref)
+            rewrite_path_arg_at(ctx, fs, regs, None, 0, deref)
         }
         OPENAT => {
             let deref = regs.abi().open_flags_to_host(regs.arg(2) as i64) & libc::O_NOFOLLOW as i64 == 0;
-            rewrite_path_arg_at(ctx, regs, Some(0), 1, deref)
+            rewrite_path_arg_at(ctx, fs, regs, Some(0), 1, deref)
         }
-        INOTIFY_ADD_WATCH => rewrite_path_arg(ctx, regs, 1, true),
+        INOTIFY_ADD_WATCH => rewrite_path_arg(ctx, fs, regs, 1, true),
         _ => Ok(()),
     };
     if let Err(e) = r {
@@ -85,12 +107,14 @@ pub fn push_cstr(ctx: &Ctx, regs: &mut Regs, bytes: &[u8]) -> Result<u64> {
 ///
 /// # Arguments
 /// * `ctx` - Shared supervisor state.
+/// * `fs` - The tracee's filesystem view.
 /// * `regs` - Registers at the stop.
 /// * `dirfd_index` - Argument index of the directory descriptor, if the syscall has one.
 /// * `path_index` - Argument index holding the path pointer.
 /// * `deref_final` - Follow a trailing symlink.
 pub fn rewrite_path_arg_at(
     ctx: &Ctx,
+    fs: &Fs,
     regs: &mut Regs,
     dirfd_index: Option<usize>,
     path_index: usize,
@@ -102,7 +126,7 @@ pub fn rewrite_path_arg_at(
     if path.is_empty() {
         return Ok(()); // AT_EMPTY_PATH: the descriptor itself, nothing to translate
     }
-    let host = translate_path(&ctx.fs, pid, dirfd, &path, deref_final)?;
+    let host = translate_path(fs, pid, dirfd, &path, deref_final)?;
     if host != path {
         let addr = push_cstr(ctx, regs, &host)?;
         regs.set_arg(path_index, addr);
@@ -117,13 +141,14 @@ pub fn rewrite_path_arg_at(
 ///
 /// # Arguments
 /// * `ctx` - Shared supervisor state.
+/// * `fs` - The tracee's filesystem view.
 /// * `regs` - Registers at the stop.
 /// * `index` - Argument index holding the path pointer.
 /// * `deref_final` - Follow a trailing symlink.
-pub fn rewrite_path_arg(ctx: &Ctx, regs: &mut Regs, index: usize, deref_final: bool) -> Result<()> {
+pub fn rewrite_path_arg(ctx: &Ctx, fs: &Fs, regs: &mut Regs, index: usize, deref_final: bool) -> Result<()> {
     let pid = regs.pid() as u32;
     let path = ctx.mem.read_cstr(pid, regs.arg(index))?;
-    let host = translate_path(&ctx.fs, pid, libc::AT_FDCWD, &path, deref_final)?;
+    let host = translate_path(fs, pid, libc::AT_FDCWD, &path, deref_final)?;
     if host != path {
         let addr = push_cstr(ctx, regs, &host)?;
         regs.set_arg(index, addr);
@@ -138,10 +163,12 @@ pub fn rewrite_path_arg(ctx: &Ctx, regs: &mut Regs, index: usize, deref_final: b
 ///
 /// # Arguments
 /// * `ctx` - Shared supervisor state.
+/// * `fs` - The tracee's filesystem view.
 /// * `regs` - Registers at the stop (fd, addr, len).
 /// * `deref_final` - Follow a trailing symlink (`connect`), or not (`bind`).
-fn rewrite_sockaddr(ctx: &Ctx, regs: &mut Regs, deref_final: bool) -> Result<()> {
-    if let Some((addr, len)) = translate_sockaddr(ctx, regs, regs.arg(1), regs.arg(2) as usize, deref_final)?
+fn rewrite_sockaddr(ctx: &Ctx, fs: &Fs, regs: &mut Regs, deref_final: bool) -> Result<()> {
+    if let Some((addr, len)) =
+        translate_sockaddr(ctx, fs, regs, regs.arg(1), regs.arg(2) as usize, deref_final)?
     {
         regs.set_arg(1, addr);
         regs.set_arg(2, len);
@@ -153,6 +180,7 @@ fn rewrite_sockaddr(ctx: &Ctx, regs: &mut Regs, deref_final: bool) -> Result<()>
 ///
 /// # Arguments
 /// * `ctx` - Shared supervisor state.
+/// * `fs` - The tracee's filesystem view.
 /// * `regs` - Registers at the stop, for scratch space.
 /// * `addr` - Address of the `sockaddr` in the tracee.
 /// * `len` - Its length.
@@ -162,6 +190,7 @@ fn rewrite_sockaddr(ctx: &Ctx, regs: &mut Regs, deref_final: bool) -> Result<()>
 /// `Some((new_addr, new_len))` when the path needed translating, else `None`.
 fn translate_sockaddr(
     ctx: &Ctx,
+    fs: &Fs,
     regs: &mut Regs,
     addr: u64,
     len: usize,
@@ -178,7 +207,7 @@ fn translate_sockaddr(
     }
     let end = sa[2..].iter().position(|&b| b == 0).map(|p| p + 2).unwrap_or(len);
     let path = &sa[2..end];
-    let host = translate_path(&ctx.fs, pid, libc::AT_FDCWD, path, deref_final)?;
+    let host = translate_path(fs, pid, libc::AT_FDCWD, path, deref_final)?;
     if host == path {
         return Ok(None);
     }
@@ -201,8 +230,9 @@ fn translate_sockaddr(
 ///
 /// # Arguments
 /// * `ctx` - Shared supervisor state.
+/// * `fs` - The tracee's filesystem view.
 /// * `regs` - Registers at the stop (call, args pointer).
-fn rewrite_socketcall(ctx: &Ctx, regs: &mut Regs) -> Result<()> {
+fn rewrite_socketcall(ctx: &Ctx, fs: &Fs, regs: &mut Regs) -> Result<()> {
     let pid = regs.pid() as u32;
     let call = regs.arg(0);
     let args_ptr = regs.arg(1);
@@ -211,7 +241,7 @@ fn rewrite_socketcall(ctx: &Ctx, regs: &mut Regs) -> Result<()> {
     let word = |i: usize| u32::from_ne_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap()) as u64;
     let (fd, addr, len) = (word(0), word(1), word(2) as usize);
     let deref_final = call == 3;
-    if let Some((new_addr, new_len)) = translate_sockaddr(ctx, regs, addr, len, deref_final)? {
+    if let Some((new_addr, new_len)) = translate_sockaddr(ctx, fs, regs, addr, len, deref_final)? {
         let mut new_args = [0u8; 12];
         new_args[0..4].copy_from_slice(&(fd as u32).to_ne_bytes());
         new_args[4..8].copy_from_slice(&(new_addr as u32).to_ne_bytes());

@@ -42,13 +42,16 @@ fn main() {
         .map(|f| f.as_bytes().to_vec())
         .unwrap_or_default();
     let parsed = if base.ends_with(b"bwrap") {
-        cli::bwrap::parse(args)
+        cli::bwrap::parse(args, &cli::host::Local)
     } else {
-        cli::parse(args)
+        cli::parse(args, &cli::host::Local)
     };
     let config = match parsed {
         Ok(c) => c,
-        Err(cli::CliError::Exit(code)) => std::process::exit(code),
+        Err(cli::CliError::Exit { code, text }) => {
+            print!("{text}");
+            std::process::exit(code)
+        }
         Err(cli::CliError::Usage(msg)) => {
             eprintln!("proot: {msg}");
             std::process::exit(125);
