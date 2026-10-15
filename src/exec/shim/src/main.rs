@@ -46,8 +46,10 @@ const FDS_MAX: usize = 32;
 const SECCOMP_SET_MODE_FILTER: libc::c_long = 1;
 
 static mut RECORD: [u8; RECORD_MAX] = [0; RECORD_MAX];
-static mut ARGV: [*const c_char; ARGV_MAX + 1] = [core::ptr::null(); ARGV_MAX + 1];
-static mut ENVP: [*const c_char; ENV_MAX + 1] = [core::ptr::null(); ENV_MAX + 1];
+/// Storage for the argument vector handed to `execve`, written through its own address.
+static mut ARGV: core::mem::MaybeUninit<[*const c_char; ARGV_MAX + 1]> = core::mem::MaybeUninit::zeroed();
+/// Storage for a replacement environment handed to `execve`, written through its own address.
+static mut ENVP: core::mem::MaybeUninit<[*const c_char; ENV_MAX + 1]> = core::mem::MaybeUninit::zeroed();
 
 /// `struct sock_fprog` as the kernel reads it.
 #[repr(C)]
@@ -203,8 +205,8 @@ pub extern "C" fn main(argc: i32, argv: *const *const c_char, envp: *const *cons
             say(&[b"proot: exec shim: bad record\n"]);
             return 126;
         }
-        let out = &mut *core::ptr::addr_of_mut!(ARGV);
-        let env_out = &mut *core::ptr::addr_of_mut!(ENVP);
+        let out = core::ptr::addr_of_mut!(ARGV).cast::<*const c_char>();
+        let env_out = core::ptr::addr_of_mut!(ENVP).cast::<*const c_char>();
         let mut plan = Plan {
             path: core::ptr::null(),
             argc: 0,
@@ -254,11 +256,11 @@ pub extern "C" fn main(argc: i32, argv: *const *const c_char, envp: *const *cons
             match tag {
                 b'-' => match list {
                     List::Argv if plan.argc < ARGV_MAX => {
-                        out[plan.argc] = text;
+                        out.add(plan.argc).write(text);
                         plan.argc += 1;
                     }
                     List::Env if plan.envc < ENV_MAX => {
-                        env_out[plan.envc] = text;
+                        env_out.add(plan.envc).write(text);
                         plan.envc += 1;
                     }
                     _ => {}
@@ -314,13 +316,13 @@ pub extern "C" fn main(argc: i32, argv: *const *const c_char, envp: *const *cons
         if !plan.complete {
             let mut i = 1usize;
             while i < argc.max(0) as usize && plan.argc < ARGV_MAX {
-                out[plan.argc] = *argv.add(i);
+                out.add(plan.argc).write(*argv.add(i));
                 plan.argc += 1;
                 i += 1;
             }
         }
-        out[plan.argc] = core::ptr::null();
-        env_out[plan.envc] = core::ptr::null();
+        out.add(plan.argc).write(core::ptr::null());
+        env_out.add(plan.envc).write(core::ptr::null());
         if plan.die_with_parent {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
         }
@@ -393,8 +395,12 @@ pub extern "C" fn main(argc: i32, argv: *const *const c_char, envp: *const *cons
                 return 124;
             }
         }
-        let env = if plan.env_given { env_out.as_ptr() } else { envp };
-        libc::execve(plan.path, out.as_ptr(), env);
+        let env = if plan.env_given {
+            env_out.cast_const()
+        } else {
+            envp
+        };
+        libc::execve(plan.path, out.cast_const(), env);
         let e = *libc::__errno_location();
         let mut ebuf = [0u8; 20];
         let edigits = itoa(e as u64, &mut ebuf);
