@@ -11,10 +11,20 @@
 //! is pinned to the alias directory holding the exec shim, and the handlers
 //! in `syscall::direct` do the rest.  The process table is then lazy and a
 //! reaper thread watches pidfds for exits.
+//!
+//! Where the kernel's ptrace access check refuses the supervisor even
+//! towards its own child (Yama's `ptrace_scope` of 2), the first tracee
+//! enters a user namespace of its own before installing the filter; see
+//! `access`.  Where that is refused too, the guest-stub restricted mode
+//! (see `guest_stub`) traps the served syscalls into a stub inside each
+//! guest, and the first tracee execs the trampoline that arms it, with a
+//! plan the supervisor wrote before letting it go.
 
+use crate::access;
 use crate::config::Config;
 use crate::exec::shim;
 use crate::fs::translate::{detranslate_path, translate_path};
+use crate::guest_stub::{self, layout};
 use crate::note;
 use crate::procs::{ProcTable, TraceeInfo};
 use crate::seccomp::{filter, notify};
@@ -51,13 +61,40 @@ pub fn run(config: Config) -> Result<i32, String> {
     }
     let mut config = config;
     resolve_command_in_path(&mut config);
-    let no_ptrace = no_ptrace_mode();
-    let ctx = Arc::new(Ctx::new(config, no_ptrace));
+    let access = match access::probe(
+        !no_ptrace_forced() && direct::ptrace_usable(),
+        guest_stub_choice(),
+    ) {
+        Ok(a) => a,
+        Err(e) if config.bwrap_mode => exit_like_bwrap_without_namespaces(&e),
+        Err(e) => return Err(e),
+    };
+    let no_ptrace = !access.ptrace;
+    let mut ctx = Ctx::new(config, no_ptrace);
+    if access.trap_mode {
+        ctx.mailbox = Some(guest_stub::Mailbox::create()?.fd);
+    }
+    let ctx = Arc::new(ctx);
+    let trap_mode = ctx.trap_mode();
     if no_ptrace {
         note!(
             ctx,
             1,
             "running without ptrace: the trace tier is served through notifications"
+        );
+    }
+    if trap_mode {
+        note!(
+            ctx,
+            1,
+            "running in the guest-stub mode: a stub in each guest stages syscall memory through a shared mailbox"
+        );
+    }
+    if access.userns.is_some() {
+        note!(
+            ctx,
+            1,
+            "the guest runs in a user namespace of its own: the ptrace access check refuses a plain child"
         );
     }
     let mut notify_list: Vec<i64> = NOTIFY_SYSCALLS.to_vec();
@@ -87,23 +124,48 @@ pub fn run(config: Config) -> Result<i32, String> {
         native.numbers_for(REFUSED_SYSCALLS),
         compat.numbers_for(REFUSED_SYSCALLS),
     );
-    let program = filter::build(
-        &filter::Table {
-            abi: native,
-            notify: &notify64,
-            trace: &trace64,
-            ns_flags: &ns64,
-            refused: &refused64,
-        },
-        &filter::Table {
-            abi: compat,
-            notify: &notify32,
-            trace: &trace32,
-            ns_flags: &ns32,
-            refused: &refused32,
-        },
-        no_ptrace,
-    );
+    let program = if trap_mode {
+        let (mut trapped64, direct64): (Vec<i64>, Vec<i64>) =
+            notify64.iter().partition(|nr| layout::trapped64(**nr));
+        let (mut trapped32, direct32): (Vec<i64>, Vec<i64>) =
+            notify32.iter().partition(|nr| layout::trapped32(**nr));
+        trapped64.extend(layout::SIGNAL_CALLS64);
+        trapped32.extend(layout::SIGNAL_CALLS32);
+        filter::build_trapped(
+            &filter::Table {
+                abi: native,
+                notify: &direct64,
+                trace: &trapped64,
+                ns_flags: &ns64,
+                refused: &refused64,
+            },
+            &filter::Table {
+                abi: compat,
+                notify: &direct32,
+                trace: &trapped32,
+                ns_flags: &ns32,
+                refused: &refused32,
+            },
+        )
+    } else {
+        filter::build(
+            &filter::Table {
+                abi: native,
+                notify: &notify64,
+                trace: &trace64,
+                ns_flags: &ns64,
+                refused: &refused64,
+            },
+            &filter::Table {
+                abi: compat,
+                notify: &notify32,
+                trace: &trace32,
+                ns_flags: &ns32,
+                refused: &refused32,
+            },
+            no_ptrace,
+        )
+    };
 
     // argv[0] may be overridden (bwrap --argv0); the program path is always command[0].
     let program_path = ctx.config.command[0].as_ptr();
@@ -150,6 +212,8 @@ pub fn run(config: Config) -> Result<i32, String> {
         );
     }
     let slash = CString::new("/").unwrap();
+    let shim_name = CString::new(shim::SHIM_NAME).unwrap();
+    let mailbox = ctx.mailbox;
     let pinned_cwd: Option<CString> = if no_ptrace {
         let dir = shim::install()?;
         become_subreaper();
@@ -205,6 +269,11 @@ pub fn run(config: Config) -> Result<i32, String> {
                 }
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
             }
+            if let Some(ns) = &access.userns
+                && ns.enter().is_err()
+            {
+                libc::_exit(118);
+            }
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
                 libc::_exit(120);
             }
@@ -231,9 +300,15 @@ pub fn run(config: Config) -> Result<i32, String> {
                 libc::_exit(125);
             }
             libc::close(sv[1]);
+            if go != 0 {
+                libc::_exit(go as i32);
+            }
             // From here on every traced syscall is served by the parent.
             if pinned_cwd.is_none() && (!host_cwd_exists || libc::chdir(cwd.as_ptr()) < 0) {
                 libc::chdir(slash.as_ptr());
+            }
+            if let Some(mail) = mailbox {
+                guest_stub::exec_trampoline(mail, shim_name.as_ptr(), argv.as_ptr(), envp);
             }
             libc::execve(program_path, argv.as_ptr(), envp);
             let e = *libc::__errno_location();
@@ -241,7 +316,27 @@ pub fn run(config: Config) -> Result<i32, String> {
         }
     }
     unsafe { libc::close(sv[1]) };
-    // Seize first: the child blocks on the handshake byte until we have.
+    let listener = match recv_fd(sv[0]) {
+        Some(fd) => fd,
+        None => {
+            unsafe { libc::close(sv[0]) };
+            let mut st = 0;
+            unsafe { libc::waitpid(pid, &mut st, libc::__WALL) };
+            return Err(match libc::WEXITSTATUS(st) {
+                119 if ctx.config.bwrap_mode => {
+                    exit_like_bwrap_without_namespaces("proot-next cannot run under another supervisor")
+                }
+                118 => "cannot enter the user namespace the probe entered".into(),
+                119 => "the seccomp filter chain already has a listener (a supervisor other than proot-next)"
+                    .into(),
+                120 => "PR_SET_NO_NEW_PRIVS refused".into(),
+                121 => "cannot enter the alias directory".into(),
+                124 => "the caller's --seccomp program was refused by the kernel".into(),
+                122 => "seccomp user notification is not available on this kernel or is filtered".into(),
+                _ => "child failed before handing over the seccomp listener".into(),
+            });
+        }
+    };
     if no_ptrace {
         ctx.procs.register_root(
             pid,
@@ -257,42 +352,33 @@ pub fn run(config: Config) -> Result<i32, String> {
         unsafe {
             libc::kill(pid, libc::SIGKILL);
             libc::close(sv[0]);
+            libc::close(listener);
             let mut st = 0;
             libc::waitpid(pid, &mut st, libc::__WALL);
         }
         if e == libc::EPERM && ctx.config.bwrap_mode {
-            exit_like_bwrap_without_namespaces();
+            exit_like_bwrap_without_namespaces("proot-next cannot run under another supervisor");
         }
         return Err(match e {
             libc::EPERM => "ptrace(PTRACE_SEIZE) refused: this process is already traced (a debugger, or a supervisor other than proot-next) or ptrace is disallowed here".into(),
             e => format!("ptrace(PTRACE_SEIZE): {}", strerror(e)),
         });
     }
-    let listener = match recv_fd(sv[0]) {
-        Some(fd) => fd,
-        None => {
-            unsafe { libc::close(sv[0]) };
-            let mut st = 0;
-            unsafe { libc::waitpid(pid, &mut st, libc::__WALL) };
-            return Err(match libc::WEXITSTATUS(st) {
-                119 if ctx.config.bwrap_mode => exit_like_bwrap_without_namespaces(),
-                119 => "the seccomp filter chain already has a listener (a supervisor other than proot-next)"
-                    .into(),
-                120 => "PR_SET_NO_NEW_PRIVS refused".into(),
-                121 => "cannot enter the alias directory".into(),
-                124 => "the caller's --seccomp program was refused by the kernel".into(),
-                122 => "seccomp user notification is not available on this kernel or is filtered".into(),
-                _ => "child failed before handing over the seccomp listener".into(),
-            });
-        }
-    };
     report_status(&ctx.config.info_fds, &format!("{{\"child-pid\": {pid}}}\n"));
     report_status(
         &ctx.config.json_status_fds,
         &format!("{{\"child-pid\": {pid}}}\n"),
     );
+    let go = if trap_mode {
+        match plan_first_trapped(&ctx, pid) {
+            Ok(()) => 0u8,
+            Err(libc::ENOENT) => 127,
+            Err(_) => 126,
+        }
+    } else {
+        0
+    };
     let pool = notify::start(listener, ctx.clone());
-    let go = 1u8;
     if unsafe { libc::write(sv[0], &go as *const u8 as *const _, 1) } != 1 {
         return Err("could not release the first tracee".into());
     }
@@ -321,28 +407,69 @@ pub fn run(config: Config) -> Result<i32, String> {
     Ok(code)
 }
 
-/// Whether to run without a ptrace tier.
+/// Plans the first tracee's exec in the guest-stub restricted mode: its
+/// command, argument vector and environment as the child will exec them.
 ///
-/// `PROOT_NO_PTRACE` forces it (any value but `0`); otherwise the probe in
-/// `syscall::direct` decides.
-fn no_ptrace_mode() -> bool {
-    match std::env::var_os("PROOT_NO_PTRACE") {
-        Some(v) => v != "0",
-        None => !direct::ptrace_usable(),
+/// # Arguments
+/// * `ctx` - Shared supervisor state, with the first tracee registered.
+/// * `pid` - The first tracee.
+///
+/// # Errors
+/// The errno the exec would have failed with.
+fn plan_first_trapped(ctx: &Ctx, pid: i32) -> crate::sys::Result<()> {
+    let argv: Vec<Vec<u8>> = std::iter::once(ctx.config.argv0.as_ref().unwrap_or(&ctx.config.command[0]))
+        .chain(ctx.config.command.iter().skip(1))
+        .map(|c| c.as_bytes().to_vec())
+        .collect();
+    let split = |e: &[u8]| match e.iter().position(|&b| b == b'=') {
+        Some(i) => (e[..i].to_vec(), e[i + 1..].to_vec()),
+        None => (e.to_vec(), Vec::new()),
+    };
+    let env: Vec<(Vec<u8>, Vec<u8>)> = match &ctx.config.env {
+        Some(e) => e.iter().map(|c| split(c.as_bytes())).collect(),
+        None => std::env::vars_os()
+            .map(|(k, v)| (k.into_vec(), v.into_vec()))
+            .collect(),
+    };
+    direct::plan_first_trapped(ctx, pid, ctx.config.command[0].as_bytes(), argv, env)
+}
+
+/// When the guest-stub restricted mode may be used, from `PROOT_GUEST_STUB`:
+/// as the fallback where nothing else reaches the guest's memory (unset, or
+/// any other value), anywhere (`force`), or never (`0`).
+///
+/// # Returns
+/// `Some(false)` for the fallback, `Some(true)` for `force`, `None` for `0`.
+fn guest_stub_choice() -> Option<bool> {
+    match std::env::var_os("PROOT_GUEST_STUB") {
+        Some(v) if v == "0" => None,
+        Some(v) => Some(v == "force"),
+        None => Some(false),
     }
+}
+
+/// Whether `PROOT_NO_PTRACE` forces the mode without a ptrace tier (any
+/// value but `0`).
+///
+/// # Returns
+/// `true` when the mode is forced.
+fn no_ptrace_forced() -> bool {
+    std::env::var_os("PROOT_NO_PTRACE").is_some_and(|v| v != "0")
 }
 
 /// Exits the way bubblewrap exits when it cannot create its namespaces.
 ///
-/// A supervisor cannot start under another tracer or another listener.
-/// Inside proot-next that never happens, since an exec of bwrap is served
-/// as a nested launch (see `exec::nested`); under anything else the caller
-/// is a program that started us as bubblewrap, and those programs know this
-/// message (GTK's glycin runs its image loaders unsandboxed on seeing it).
-fn exit_like_bwrap_without_namespaces() -> ! {
-    eprintln!(
-        "bwrap: No permissions to create a new namespace: proot-next cannot run under another supervisor"
-    );
+/// A supervisor cannot start under another tracer or another listener, nor
+/// on a host that refuses it access to its own child.  Inside proot-next
+/// the first never happens, since an exec of bwrap is served as a nested
+/// launch (see `exec::nested`); otherwise the caller is a program that
+/// started us as bubblewrap, and those programs know this message (GTK's
+/// glycin runs its image loaders unsandboxed on seeing it).
+///
+/// # Arguments
+/// * `reason` - Why proot-next cannot start, appended to the message.
+fn exit_like_bwrap_without_namespaces(reason: &str) -> ! {
+    eprintln!("bwrap: No permissions to create a new namespace: {reason}");
     std::process::exit(1);
 }
 

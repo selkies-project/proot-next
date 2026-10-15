@@ -172,6 +172,240 @@ lookups identical within noise, unix socket connect 3.2x against 2.3x,
 fork+wait 1.2x against 0.9x, fork+exec 1.4x against 1.9x (two execs per
 exec), `getcwd` 29x against 40x.
 
+## Yama scope 2
+
+Both modes rest on the kernel's ptrace access check towards every tracee.
+Yama's `ptrace_scope` of 2 refuses it to anyone without `CAP_SYS_PTRACE`,
+even towards a child, and checks that capability in the tracee's user
+namespace.  So `access.rs` forks a probe child before anything else and
+tries `PTRACE_SEIZE` (when the filter allows ptrace) and a read of a known
+static through `process_vm_readv` or `/proc/<pid>/mem`, first plainly and
+then with the child in a fresh user namespace.  The first plan that works
+wins: ptrace, ptrace in a namespace, no-ptrace, no-ptrace in a namespace.
+In a namespace the first tracee calls `unshare(CLONE_NEWUSER)` and writes
+an identity map of its own uid and gid before installing the filter; the
+supervisor stays in the initial namespace and owns the new one, which gives
+it every capability there.  The tracer seizes the child after receiving the
+listener, by which time the child is inside.  `PTRACE_SEIZE` on itself is
+no use as a probe: it answers `ESRCH` at scope 2 as everywhere else.  When
+no plan works the guest-stub mode below takes over; where it cannot (not
+x86_64 or aarch64, or `PROOT_GUEST_STUB=0`) the launch fails with exit 1 rather than
+serving a guest whose memory it cannot read (a no-ptrace guest hung at the
+first notification).
+
+The default Docker and Kubernetes `RuntimeDefault` profiles refuse
+`unshare` without `CAP_SYS_ADMIN`, and an added `CAP_SYS_PTRACE` is not
+effective for a non-root user, so a typical pod on a scope 2 node ends up
+in the guest-stub mode.
+
+## Guest stub restricted mode
+
+Where `unshare` is also refused (the common Kubernetes case, and Docker's
+default profile for a user without `CAP_SYS_ADMIN`), neither ptrace nor a
+user namespace is available, so the supervisor cannot read or write guest
+memory at all.  Nearly every syscall it serves has its important argument
+in guest memory (the path of `open`, the buffer of `stat`).  This mode puts
+a stub inside each guest process that moves that memory where the
+supervisor can see it.  `guest_stub.rs` is the supervisor's side, the
+trampoline's `stub.rs` and `loader.rs` the guest's, and `layout.rs` (in the
+trampoline's crate, compiled into both) the contract between them.
+
+### Gates and the filter
+
+One page at a fixed address holds two gates, the allow gate and the
+notify gate.  The filter reads the instruction pointer of every syscall
+before anything else: one made from the allow gate is allowed, one from
+the notify gate goes to the listener, whatever its number.  64-bit and
+32-bit processes have their gate page, and their mailbox, at addresses of
+their own: `0x7100_0000_0000` on x86_64, `0x40_0000_0000` on aarch64 (inside
+a 39-bit address space too, under where position-independent programs
+load), `0xe0000000` for both 32-bit ABIs.  A 64-bit gate is `syscall; jmp
+*%r12` or `svc #0; br x16`, the caller passing its return address in a
+register the kernel preserves and no syscall reads, so it needs no stack;
+i386 uses every free register for arguments, so a 32-bit gate is `int
+$0x80; ret`, called, and on 32-bit ARM `svc #0; bx lr`, called.  On ARM the
+gate code is written and then pushed through the caches (`dc cvau`/`ic
+ivau`, the `cacheflush` call) before it runs.  Everything else meets the
+usual tiers, except that the trace list
+is every served syscall with memory to stage, returned as
+`SECCOMP_RET_TRAP` with a tag, plus `rt_sigaction` and `rt_sigprocmask`.
+Served syscalls that need only registers (`clone`, `fork`, `vfork`,
+`fchdir`, the `-0` identity calls) are notified directly.  `clone3`, whose
+flags are in memory, gets `ENOSYS`, on which every C library falls back to
+`clone`.  The compat tiers are built the same way from the i386 or ARM
+numbers, i386 `bind` and `connect` of `socketcall` trapped by their call
+number.
+
+Telling the stub's syscalls apart by the address they are made from means
+no register value a program might happen to pass can make the filter take
+its call for the stub's, as a marker in an argument register could.
+
+The x86_64 address has to clear another program's filter too.  For games
+that make Windows syscalls directly, Proton's Wine installs a filter
+(`install_bpf` in `dlls/ntdll/unix/signal_x86_64.c`) that traps every
+syscall made from an address whose high word is `0x7000` or lower as the
+game's, native libraries being mapped above that.  Its trap outranks our
+filter's allow, the stub passes the `SIGSYS` on to Wine's handler as it
+should, and Wine crashed on the stub's own `gettid` (a Windows DOSBox
+build under Proton Experimental) while the gates were at `0x6e70_0000_0000`.
+
+### Mailbox
+
+A 16 MiB memfd, mapped `MAP_SHARED` at a fixed address in every guest and
+anywhere in the supervisor.  Its first page holds one owner per slot; then
+come 128 slots of 128 KiB.  A thread claims a slot by writing its thread id
+into the owner with a compare-and-swap and frees it by writing 0; a thread
+that finds every slot taken takes back those whose owner no longer exists
+(`kill(tid, 0)` answers `ESRCH`) and otherwise yields until one frees.
+Each invocation of the handler claims its own slot, so a signal handler
+that interrupts it can make trapped syscalls of its own.
+
+`tracee::mem` serves guest addresses inside the mailbox from the
+supervisor's mapping and answers `EFAULT` for every other address, so the
+handlers in `syscall::notify` and `syscall::direct` run unchanged on the
+staged copies, and a handler that reads memory the stub did not stage
+fails visibly instead of reading the guest by accident on a host where it
+could.
+
+### The handler
+
+On a tagged `SIGSYS` the handler reads the syscall's number and arguments
+from the signal frame, then, by the table in `layout.rs`:
+
+1. copies every path into a 4 KiB area of its slot (a NULL path stays
+   NULL, one without a NUL in 4096 bytes fails with `ENAMETOOLONG`), every
+   input buffer (`struct open_how`, a socket address, a `timespec` pair,
+   an extended attribute value) after them, and reserves room for every
+   output buffer, pointing those arguments at the copies;
+2. makes the syscall itself from the notify gate.  The supervisor answers
+   it from the copies, injects a descriptor, or lets it continue, in which
+   case the kernel runs it on the copies, which are valid memory in the
+   process; a path the kernel must open in the caller (`O_PATH`,
+   `inotify_add_watch`) is replaced in place by its host path, which the
+   4 KiB area always has room for;
+3. copies back what the call wrote (the whole `struct stat`, or as many
+   bytes as `readlink` returned), frees the slot and stores the result in
+   the saved result register (`rax`, `eax`, `x0`, `r0`).
+
+The other saved registers are never touched, so the program finds them as
+a syscall leaves them.  The handler runs with `SA_NODEFER` and makes its
+own syscalls through the allow gate with inline assembly: the thread
+pointer belongs to the program, so no libc.
+
+`SIGSYS` must never be blocked when a trap fires: the kernel then resets
+the handler and kills the process.  Programs block every signal routinely
+(`posix_spawn`'s child, a thread created with a full mask, a handler
+registered with `sigfillset`), so `rt_sigprocmask` is emulated on the mask
+saved in the signal frame, which `rt_sigreturn` installs, with `SIGSYS`
+left out, and `rt_sigaction` strips `SIGSYS` from every handler's mask.
+For `SIGSYS` itself `rt_sigaction` records the program's action without
+installing it, and a `SIGSYS` that is not one of the filter's traps (a
+filter of the program's own, `kill`) goes to that action.
+
+### Exec, and the first program
+
+Signal handlers are reset by `execve` and `ld.so` opens libraries before
+any preloaded code runs, so a stub loaded with `LD_PRELOAD` would arrive
+too late.  Every exec goes through the trampoline instead, which loads the
+program in place.
+
+On `execve` the handler stages the path, `argv` and `envp` (only `argv[0]`
+when they do not fit in a slot, which is enough for anything but a nested
+launch, then refused with `E2BIG`).  The supervisor plans the exec from the
+copy as in the no-ptrace mode, refuses what the trampolines cannot load
+(a format only `binfmt_misc` knows with `ENOEXEC`, a 32-bit program on a
+kernel without ia32 emulation with `EOPNOTSUPP`), installs a descriptor of
+the mailbox into the caller with `ADDFD`, writes the record and answers
+with that descriptor's number.  The handler frees its slot and execs `e`
+through the allow gate with the caller's own vectors.  For a 32-bit
+program the record says so, and `e` execs `e32`, the i386 or 32-bit ARM
+build of the same trampoline, with its own vectors, leaving the record for
+it; the other way round, a 32-bit process's stub execs `e` like any other.
+rustc links i686, armv7 and aarch64 musl statically but not
+position-independent, so those trampolines are linked at `0xd0000000`,
+above where fixed-address programs load and far below position-independent
+ones (the aarch64 startup code also needs to be within 4 GiB of address
+0); the x86_64 one is position-independent.
+
+The trampoline maps the gates first and makes its own syscalls through the
+allow gate until the stub is armed, maps the mailbox from the descriptor
+named in the record, arms the handler, and tells the supervisor with a
+`getpid` from the notify gate carrying a mark, at which the pending exec is
+completed (the program recorded for `/proc/self/exe`, a nested view
+entered).  That has to be a real syscall: container runtimes' profiles
+refuse unknown numbers, and their refusal outranks the notification.  Then
+it maps the program the way `binfmt_elf` would: a position-independent
+file wherever `mmap` finds room, aligned to its segments, a fixed-address
+one only where nothing is mapped, in pages of the size the kernel reports,
+the bss past the last file page anonymous.  The
+rest of the last file page of a segment with a bss is zeroed to the end of
+the page, not only of the segment, as the kernel does: glibc's `ld.so`
+allocates its first link map from that tail without clearing it, and
+Ubuntu's i386 `ld.so` crashed on the file data a shorter clearing left
+there.  The
+interpreter is opened through an ordinary, trapped `open`, so the
+supervisor translates it, and loaded the same way.  The new stack goes
+below the trampoline's frames, with the trampoline's own auxiliary vector
+(vDSO, `AT_RANDOM`, ids, hardware capabilities) and the entries that
+describe the program replaced; the argument and environment pointers point
+at the strings the kernel already holds, so `/proc/self/cmdline` and a
+program that rewrites its title see what they would.  `comm` is set from
+the record.  A 32-bit ARM entry point with the Thumb bit is entered in
+Thumb.
+
+The first program is planned by the supervisor before it lets the child
+go, and the child execs the trampoline through the allow gate with the
+mailbox descriptor it inherited.
+
+### Costs and limits
+
+- No dearer than the other modes: best of five on this host, `ls -lR /usr`
+  in the test rootfs took 50 ms against 57 ms without ptrace and 55 ms with
+  it, and 300 execs of `/bin/true` 130 ms against 168 ms and 119 ms.  The
+  trap and the copies cost about what `process_vm_readv` and
+  `/proc/<pid>/mem` do.
+- 32-bit programs run where the kernel has ia32 emulation, or on aarch64
+  where the CPU and kernel run AArch32.
+- A 32-bit process gives up 16 MiB of its address space at `0xe0100000`
+  to the mailbox, and `e32` sits at `0xd0000000`.
+- On aarch64 the loader maps programs without `PROT_BTI`, so a program
+  built for branch target identification runs without it on CPUs that
+  have it.
+- `/proc/<pid>/exe` and the first line of `/proc/<pid>/maps` name the
+  trampoline at the kernel level; the supervisor answers for `exe`.
+- An executable the guest may run but not read cannot be loaded.
+- A vfork child that changes the `SIGSYS` action changes it for its parent
+  too, since the recorded action lives in shared memory.
+- A program that passes an invalid non-NULL pointer to a trapped syscall
+  faults in the handler rather than getting `EFAULT`.
+- A program that longjmps out of a signal handler that interrupted the
+  stub leaves a slot claimed until the thread exits.
+
+### Status
+
+The fallback: `access::probe` selects the mode when neither ptrace nor a
+user namespace reaches the guest's memory, unless `PROOT_GUEST_STUB=0`
+rules it out; `PROOT_GUEST_STUB=force` selects it anywhere, which is how
+the e2e suite covers it on any host.  x86_64 and aarch64 hosts, for their
+64-bit and 32-bit programs.
+Checked with Firefox and a Chromium build rendering pages headless and the
+GTK4 proot-apps installer (glycin's nested bwrap loaders included) on a
+desktop host, with Firefox through proot-apps inside a selkies container
+under Docker's default profile at Yama scope 2, and on i386 with a Debian
+trixie rootfs (shell, apt under `-0`, gcc) and the stub probe built for
+i386, run under proot and under its `bwrap` front end in a locked-down
+selkies container with Ubuntu 26.04's i386 libraries.  Steam in a selkies
+container under Docker's default profile with every capability but the six
+its init needs dropped and `no-new-privileges`, at Yama scope 2, took the
+mode as the fallback for pressure-vessel's `bwrap` and ran games through
+every runtime path Steam uses: native 64-bit and native 32-bit programs in
+the Steam Linux Runtime, and Windows programs, 32-bit ones included, under
+Proton 11 and Proton Experimental.  On aarch64
+(Neoverse-N1, 4K pages, 48-bit addresses), in a locked-down selkies
+container with the mode forced: the e2e suite in all three modes, the stub
+probe for aarch64 and for 32-bit ARM, and an armhf Debian rootfs running
+apt and gcc under `-0`.
+
 ## Why a small warm pool
 
 The kernel hands a notification to the longest-waiting receiver.  On an idle
@@ -305,6 +539,10 @@ lookups.
   a ptrace-mode guest still gets `EPERM`: ptrace is not emulated.
 * Opening a FIFO through a non-identity binding blocks a supervisor thread.
 * `name_to_handle_at` returns `EOPNOTSUPP`.
+* In the user namespace used at Yama scope 2, only the caller's uid and gid
+  are mapped: other owners read as `nobody` through calls the kernel answers
+  (`fstat`), supplementary groups as `nogroup`, and
+  `setgroups` is refused without `-0`.
 * Without ptrace: a buffer refilled by the program between a rewrite and its
   restore is not restored, and one read back in the microseconds before the
   restore shows the alias; `connect` after a `bind` on the same socket loses

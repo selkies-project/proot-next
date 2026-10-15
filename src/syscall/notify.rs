@@ -169,6 +169,15 @@ pub fn handle(ctx: &Ctx, listener: i32, req: &SeccompNotif) {
         return;
     };
     let raw_nr = req.data.nr as i64;
+    let hello = match abi {
+        Abi::X86_64 | Abi::Aarch64 => crate::guest_stub::layout::HELLO64,
+        Abi::I386 | Abi::Arm => crate::guest_stub::layout::HELLO32,
+    };
+    if ctx.trap_mode() && raw_nr == hello && req.data.args[0] == crate::guest_stub::layout::HELLO_MARK {
+        direct::hello(ctx, req.pid);
+        reply(listener, req.id, Ok(0));
+        return;
+    }
     let (nr, variant) = if ctx.no_ptrace && abi.socketcall_nr() == Some(raw_nr) {
         (SOCKETCALL, Variant::Same)
     } else {
@@ -475,7 +484,7 @@ fn do_open(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64, mode: i
     }
     if flags & WRITE_INTENT == 0
         && let Some(fd) =
-            fake_proc_status(&host, fake_ids_for_status(r, &host))?.or(fake_proc_cmdline(&host)?)
+            fake_proc_status(&host, fake_ids_for_status(r, &host))?.or(fake_proc_cmdline(r.ctx, &host)?)
     {
         return Ok(Outcome::Fd {
             fd,
@@ -557,13 +566,22 @@ fn fake_proc_status(host: &[u8], fake_root: Option<crate::procs::Ids>) -> Result
 /// their own command line expect the argv the tracee passed.  A process in
 /// the no-ptrace trampoline, or one that rewrote its own argv, is left as is.
 ///
+/// In the guest-stub restricted mode no loader is exec'd, so the kernel's
+/// file is the vector the program was exec'd with, which is right but for a
+/// `#!` script: there the interpreter, its argument and the script recorded
+/// at the exec take the place of `argv[0]`, as the kernel would show them.
+///
 /// # Arguments
+/// * `ctx` - Shared supervisor state.
 /// * `host` - Translated host path about to be opened.
 ///
 /// # Returns
 /// A descriptor on the rewritten copy, or `None` when the path is not a
 /// cmdline file or the file carries no loader prefix.
-fn fake_proc_cmdline(host: &[u8]) -> Result<Option<i32>> {
+///
+/// # Errors
+/// An errno when the file cannot be read or the copy made.
+fn fake_proc_cmdline(ctx: &Ctx, host: &[u8]) -> Result<Option<i32>> {
     let Some(rest) = host.strip_prefix(b"/proc/") else {
         return Ok(None);
     };
@@ -582,6 +600,22 @@ fn fake_proc_cmdline(host: &[u8]) -> Result<Option<i32>> {
     let text = std::fs::read(std::ffi::OsStr::from_bytes(host))
         .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
     let args: Vec<&[u8]> = text.split(|&c| c == 0).collect();
+    if ctx.trap_mode() {
+        let pid: i32 = std::str::from_utf8(rest.split(|&c| c == b'/').next().unwrap_or_default())
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        let Some(prefix) = ctx.procs.info(pid).cmdline_prefix.filter(|_| !text.is_empty()) else {
+            return Ok(None);
+        };
+        let out: Vec<u8> = prefix
+            .iter()
+            .map(|a| a.as_slice())
+            .chain(args.iter().skip(1).copied())
+            .collect::<Vec<_>>()
+            .join(&0u8);
+        return Ok(Some(readonly_memfd("proc-cmdline", &out)?));
+    }
     let alias_dir = crate::exec::alias_dir();
     let in_alias = args
         .first()

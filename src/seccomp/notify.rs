@@ -282,6 +282,34 @@ pub fn addfd_at(listener: i32, id: u64, fd: i32, newfd: i32, cloexec: bool) -> R
     if rc < 0 { Err(e) } else { Ok(()) }
 }
 
+/// Installs `fd` into the tracee at the lowest free descriptor number,
+/// without answering the notification.  Closes the supervisor's copy.
+///
+/// # Arguments
+/// * `listener` - Listener descriptor.
+/// * `id` - Notification id.
+/// * `fd` - Supervisor-side descriptor to hand over.
+/// * `cloexec` - Set `O_CLOEXEC` on the tracee's copy.
+///
+/// # Returns
+/// The descriptor number in the tracee.
+///
+/// # Errors
+/// Errno from the ioctl.
+pub fn addfd(listener: i32, id: u64, fd: i32, cloexec: bool) -> Result<i32> {
+    let add = SeccompNotifAddfd {
+        id,
+        flags: 0,
+        srcfd: fd as u32,
+        newfd: 0,
+        newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+    };
+    let rc = unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_ADDFD as _, &add as *const _) };
+    let e = errno();
+    unsafe { libc::close(fd) };
+    if rc < 0 { Err(e) } else { Ok(rc) }
+}
+
 /// Checks that the tracee is still blocked in this notification.
 ///
 /// Call after reading tracee memory and before acting on it.

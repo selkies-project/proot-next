@@ -8,8 +8,13 @@
 //! and its 32-bit compat ABI each get a number table; any other audit arch
 //! (x32) is refused with `ENOSYS`.  A compat table may be empty, which
 //! refuses that ABI too.
+//!
+//! The guest-stub restricted mode (see `guest_stub`) traps its trace list
+//! into the guest's `SIGSYS` handler instead, behind a prologue that lets
+//! the stub's own syscalls through by the gate they are made from.
 
 use crate::abi::Abi;
+use crate::guest_stub::layout;
 use crate::sys::*;
 
 /// Mirror of `struct sock_filter`.
@@ -34,6 +39,9 @@ const BPF_JEQ_K: u16 = 0x15;
 const BPF_JSET_K: u16 = 0x45;
 const BPF_JA: u16 = 0x05;
 const BPF_RET_K: u16 = 0x06;
+
+/// `SECCOMP_RET_TRAP`: raise `SIGSYS` in the calling thread instead.
+const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
 
 /// Offset of the low 32 bits of `seccomp_data.args[i]`.
 fn arg_offset(i: usize) -> u32 {
@@ -106,6 +114,88 @@ impl Sub {
 /// # Returns
 /// The instruction list, ready for `seccomp(2)`.
 pub fn build(t64: &Table, t32: &Table, no_trace: bool) -> Vec<SockFilter> {
+    build_tiers(t64, t32, if no_trace { None } else { Some(SECCOMP_RET_TRACE) })
+}
+
+/// Builds the filter of the guest-stub restricted mode.
+///
+/// A syscall made from one of the stub's gates is decided by the gate: the
+/// allow gate's are allowed, the notify gate's go to the listener.  Each ABI
+/// has its gate page at its own address.  Every other `clone3` (435 on both
+/// ABIs) is refused with `ENOSYS`, which makes a C library fall back to
+/// `clone`, whose flags are in a register.  The rest follows [`build`], with
+/// the trace lists trapped into the stub (`SECCOMP_RET_TRAP` with
+/// [`layout::TAG`]) instead of stopping for a tracer.
+///
+/// ```text
+/// 0   ld arch
+/// 1   jeq arch64 -> 3
+/// 2   jeq arch32 -> 8, else -> 15
+/// 3   ld instruction_pointer (high word)
+/// 4   jeq 64-bit gate page -> 5, else -> 15
+/// 5   ld instruction_pointer (low word)
+/// 6   jeq 64-bit allow gate -> 13
+/// 7   jeq 64-bit notify gate -> 14, else -> 15
+/// 8   ld instruction_pointer (high word)
+/// 9   jeq 0 -> 10, else -> 15
+/// 10  ld instruction_pointer (low word)
+/// 11  jeq 32-bit allow gate -> 13
+/// 12  jeq 32-bit notify gate -> 14, else -> 15
+/// 13  ret ALLOW
+/// 14  ret USER_NOTIF
+/// 15  ld nr
+/// 16  jeq clone3 -> 17, else -> T
+/// 17  ret ERRNO(ENOSYS)
+/// T   the tiers of [`build`]
+/// ```
+///
+/// # Arguments
+/// * `t64` - The 64-bit ABI: `notify` answered directly, `trace` trapped.
+/// * `t32` - The compat ABI, likewise.
+///
+/// # Returns
+/// The instruction list, ready for `seccomp(2)`.
+pub fn build_trapped(t64: &Table, t32: &Table) -> Vec<SockFilter> {
+    let ip = |gate: u64| gate + layout::SYSCALL_LEN as u64;
+    let notify = layout::GATE_NOTIFY_OFFSET as u64;
+    let hi64 = (ip(layout::GATE64) >> 32) as u32;
+    debug_assert_eq!(hi64, (ip(layout::GATE64 + notify) >> 32) as u32);
+    let mut f = vec![
+        stmt(BPF_LD_W_ABS, 4),
+        jump(t64.abi.audit(), 1, 0),
+        jump(t32.abi.audit(), 5, 12),
+        stmt(BPF_LD_W_ABS, 12),
+        jump(hi64, 0, 10),
+        stmt(BPF_LD_W_ABS, 8),
+        jump(ip(layout::GATE64) as u32, 6, 0),
+        jump(ip(layout::GATE64 + notify) as u32, 6, 7),
+        stmt(BPF_LD_W_ABS, 12),
+        jump(0, 0, 5),
+        stmt(BPF_LD_W_ABS, 8),
+        jump(ip(layout::GATE32) as u32, 1, 0),
+        jump(ip(layout::GATE32 + notify) as u32, 1, 2),
+        stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+        stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
+        stmt(BPF_LD_W_ABS, 0),
+        jump(crate::syscall::nr::CLONE3 as u32, 0, 1),
+        stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
+    ];
+    f.extend(build_tiers(t64, t32, Some(SECCOMP_RET_TRAP | layout::TAG)));
+    f
+}
+
+/// Builds the tiers shared by every mode.
+///
+/// # Arguments
+/// * `t64` - The host's 64-bit ABI and its syscall lists.
+/// * `t32` - The host's 32-bit compat ABI and its lists (may be empty).
+/// * `trace_ret` - What the trace lists return; `None` sends them to the
+///   listener like the notify lists.
+///
+/// # Returns
+/// The instruction list.
+fn build_tiers(t64: &Table, t32: &Table, trace_ret: Option<u32>) -> Vec<SockFilter> {
+    let no_trace = trace_ret.is_none();
     // Per table: the (nr, sub) entries placed after the plain notify/trace lists.
     let subs_for = |t: &Table| -> Vec<(i64, Sub)> {
         let mut v: Vec<(i64, Sub)> = t
@@ -270,7 +360,7 @@ pub fn build(t64: &Table, t32: &Table, no_trace: bool) -> Vec<SockFilter> {
         }
     }
     f.push(stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF));
-    f.push(stmt(BPF_RET_K, SECCOMP_RET_TRACE));
+    f.push(stmt(BPF_RET_K, trace_ret.unwrap_or(SECCOMP_RET_TRACE)));
     f.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
     f.push(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
     // Trailing ALLOW for sub-blocks that fall through.
@@ -363,6 +453,21 @@ mod tests {
 
     /// Interprets the subset of BPF we emit, returning the action for (arch, nr, args).
     fn run_args(prog: &[SockFilter], arch: u32, nr: u32, args: [u64; 6]) -> u32 {
+        run_from(prog, arch, nr, args, 0x0040_1000)
+    }
+
+    /// [`run_args`] for a syscall made at a given instruction pointer.
+    ///
+    /// # Arguments
+    /// * `prog` - The filter.
+    /// * `arch` - `AUDIT_ARCH_*` of the call.
+    /// * `nr` - Syscall number.
+    /// * `args` - Its arguments.
+    /// * `ip` - Instruction pointer of the call.
+    ///
+    /// # Returns
+    /// The filter's action.
+    fn run_from(prog: &[SockFilter], arch: u32, nr: u32, args: [u64; 6], ip: u64) -> u32 {
         let mut pc = 0usize;
         let mut acc = 0u32;
         loop {
@@ -372,6 +477,8 @@ mod tests {
                     acc = match i.k {
                         0 => nr,
                         4 => arch,
+                        8 => ip as u32,
+                        12 => (ip >> 32) as u32,
                         k => args[((k - 16) / 8) as usize] as u32,
                     }
                 }
@@ -393,6 +500,109 @@ mod tests {
 
     fn run(prog: &[SockFilter], arch: u32, nr: u32) -> u32 {
         run_args(prog, arch, nr, [0; 6])
+    }
+
+    /// In the guest-stub mode the trace lists are trapped into the stub, the
+    /// notify lists still reach the listener, each ABI's gates are decided
+    /// by the gate whatever the syscall and only from that ABI's page,
+    /// `clone3` gets `ENOSYS`, namespace flags and the refused lists keep
+    /// their `EPERM`, and i386 `socketcall` traps `bind` and `connect` only.
+    #[test]
+    fn trap_mode_routes_by_gate_and_traps_the_staged_calls() {
+        let p = build_trapped(
+            &Table {
+                abi: Abi::X86_64,
+                notify: &[56, 81],
+                trace: &[2, 59, 257],
+                ns_flags: &[272],
+                refused: &[308],
+            },
+            &Table {
+                abi: Abi::I386,
+                notify: &[120, 133],
+                trace: &[5, 11, 174],
+                ns_flags: &[310],
+                refused: &[346],
+            },
+        );
+        let trap = SECCOMP_RET_TRAP | layout::TAG;
+        let eperm = SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let enosys = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+        let notify = layout::GATE_NOTIFY_OFFSET as u64;
+        let len = layout::SYSCALL_LEN as u64;
+        let (allow64, notify64) = (layout::GATE64 + len, layout::GATE64 + notify + len);
+        let (allow32, notify32) = (layout::GATE32 + len, layout::GATE32 + notify + len);
+        let mark = [layout::HELLO_MARK, 0, 0, 0, 0, 0];
+        assert_eq!(run(&p, AUDIT_ARCH_X86_64, 257), trap);
+        assert_eq!(run(&p, AUDIT_ARCH_X86_64, 59), trap);
+        assert_eq!(run(&p, AUDIT_ARCH_X86_64, 81), SECCOMP_RET_USER_NOTIF);
+        assert_eq!(run(&p, AUDIT_ARCH_X86_64, 56), SECCOMP_RET_USER_NOTIF);
+        assert_eq!(run(&p, AUDIT_ARCH_X86_64, 0), SECCOMP_RET_ALLOW);
+        assert_eq!(
+            run_from(&p, AUDIT_ARCH_X86_64, 257, [0; 6], allow64),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            run_from(&p, AUDIT_ARCH_X86_64, 59, [0; 6], allow64),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            run_from(&p, AUDIT_ARCH_X86_64, 257, [0; 6], notify64),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(
+            run_from(&p, AUDIT_ARCH_X86_64, layout::HELLO64 as u32, mark, notify64),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(run_from(&p, AUDIT_ARCH_X86_64, 257, [0; 6], allow64 + 1), trap);
+        assert_eq!(
+            run_from(&p, AUDIT_ARCH_X86_64, 257, [0; 6], notify64 + (1 << 32)),
+            trap
+        );
+        assert_eq!(run_from(&p, AUDIT_ARCH_X86_64, 257, [0; 6], allow32), trap);
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_X86_64, 257, [0, 0, 0, 0, 0, 0x4321]),
+            trap
+        );
+        assert_eq!(run(&p, AUDIT_ARCH_X86_64, 435), enosys);
+        let newuser = libc::CLONE_NEWUSER as u64;
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_X86_64, 272, [newuser, 0, 0, 0, 0, 0]),
+            eperm
+        );
+        assert_eq!(run(&p, AUDIT_ARCH_X86_64, 272), SECCOMP_RET_ALLOW);
+        assert_eq!(run(&p, AUDIT_ARCH_X86_64, 308), eperm);
+        assert_eq!(run(&p, AUDIT_ARCH_I386, 5), trap);
+        assert_eq!(run(&p, AUDIT_ARCH_I386, 11), trap);
+        assert_eq!(run(&p, AUDIT_ARCH_I386, 174), trap);
+        assert_eq!(run(&p, AUDIT_ARCH_I386, 120), SECCOMP_RET_USER_NOTIF);
+        assert_eq!(run(&p, AUDIT_ARCH_I386, 3), SECCOMP_RET_ALLOW);
+        assert_eq!(
+            run_from(&p, AUDIT_ARCH_I386, 5, [0; 6], allow32),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            run_from(&p, AUDIT_ARCH_I386, 5, [0; 6], notify32),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(
+            run_from(&p, AUDIT_ARCH_I386, layout::HELLO32 as u32, mark, notify32),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(run_from(&p, AUDIT_ARCH_I386, 5, [0; 6], allow64), trap);
+        assert_eq!(run_from(&p, AUDIT_ARCH_I386, 5, [0; 6], allow32 + 2), trap);
+        assert_eq!(run_args(&p, AUDIT_ARCH_I386, 102, [3, 0, 0, 0, 0, 0]), trap);
+        assert_eq!(run_args(&p, AUDIT_ARCH_I386, 102, [2, 0, 0, 0, 0, 0]), trap);
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_I386, 102, [1, 0, 0, 0, 0, 0]),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(run(&p, AUDIT_ARCH_I386, 435), enosys);
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_I386, 310, [newuser, 0, 0, 0, 0, 0]),
+            eperm
+        );
+        assert_eq!(run(&p, AUDIT_ARCH_I386, 346), eperm);
     }
 
     #[test]

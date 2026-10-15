@@ -73,6 +73,9 @@ pub struct Ctx {
     /// True when running without ptrace: the former ptrace tier is served
     /// through notifications with in-place rewrites (see `syscall::direct`).
     pub no_ptrace: bool,
+    /// The mailbox descriptor of the guest-stub restricted mode, installed
+    /// into every process that execs (see `guest_stub`); `None` elsewhere.
+    pub mailbox: Option<i32>,
     /// Set once any process has a view of its own; until then every lookup
     /// answers the root view without touching the process table.
     nested: AtomicBool,
@@ -95,8 +98,17 @@ impl Ctx {
             mem: Mem,
             procs,
             no_ptrace,
+            mailbox: None,
             nested: AtomicBool::new(false),
         }
+    }
+
+    /// Whether guests run the stub of the guest-stub restricted mode.
+    ///
+    /// # Returns
+    /// `true` when a mailbox was set up.
+    pub fn trap_mode(&self) -> bool {
+        self.mailbox.is_some()
     }
 
     /// The view the process of thread `tid` lives in.

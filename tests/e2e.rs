@@ -10,7 +10,9 @@
 //! The whole suite also runs with `PROOT_NO_PTRACE=1` in the environment,
 //! which the binary inherits: everything then goes through the no-ptrace
 //! mode, except the cases that are about the tracer itself, which skip.
-//! The `no_ptrace_*` cases force that mode themselves.
+//! The `no_ptrace_*` cases force that mode themselves.  Likewise with
+//! `PROOT_GUEST_STUB=force`, the guest-stub restricted mode; the
+//! `guest_stub_*` cases force it.
 
 use std::io::Write;
 use std::os::unix::net::UnixListener;
@@ -47,11 +49,19 @@ fn run_no_ptrace(args: &[&str]) -> Output {
 
 /// Whether the suite runs in the no-ptrace mode, where tracer-only cases skip.
 fn no_ptrace_suite() -> bool {
-    if std::env::var_os("PROOT_NO_PTRACE").is_some_and(|v| v != "0") {
+    if std::env::var_os("PROOT_NO_PTRACE").is_some_and(|v| v != "0") || guest_stub_forced() {
         eprintln!("skipping: needs the ptrace tier");
         return true;
     }
     false
+}
+
+/// Whether the suite runs with the guest stub forced.
+///
+/// # Returns
+/// `true` when `PROOT_GUEST_STUB` is `force`.
+fn guest_stub_forced() -> bool {
+    std::env::var_os("PROOT_GUEST_STUB").is_some_and(|v| v == "force")
 }
 
 /// Makes a file executable.
@@ -970,6 +980,432 @@ fn no_ptrace_spawn_and_fexecve() {
     assert_eq!(
         stdout(&o),
         "hello 0\nhello 1\n/pn-p/h.sh\nhello fd",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// Yama's `ptrace_scope`.
+///
+/// # Returns
+/// The setting, or 0 without Yama.
+fn ptrace_scope() -> u32 {
+    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The guest moved into a user namespace of its own, as on a host with
+/// `ptrace_scope` 2, keeps the caller's ids and a working tracer or
+/// no-ptrace tier.
+#[test]
+fn user_namespace_keeps_ids_and_serves_the_guest() {
+    let host_ns = std::fs::read_link("/proc/self/ns/user").unwrap();
+    let uid = unsafe { libc::getuid() };
+    let o = Command::new(proot())
+        .env("PROOT_USERNS", "1")
+        .env("PROOT_GUEST_STUB", "0")
+        .args([
+            "-r",
+            "/",
+            "/bin/sh",
+            "-c",
+            "id -u; cd /tmp && pwd; readlink /proc/self/ns/user",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn proot");
+    let err = String::from_utf8_lossy(&o.stderr);
+    if err.contains("a user namespace did not help") {
+        eprintln!("skipping: no unprivileged user namespaces here");
+        return;
+    }
+    let out = stdout(&o);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}\n{err}");
+    assert_eq!(lines[0], uid.to_string(), "{err}");
+    assert_eq!(lines[1], "/tmp", "{err}");
+    assert_ne!(Path::new(lines[2]), host_ns, "{err}");
+}
+
+/// A host that refuses the supervisor access to its own child, with no user
+/// namespace and no guest stub to fall back on, gets an error and a failing
+/// status at once instead of a guest that hangs, in both front ends.
+#[test]
+fn refused_memory_access_fails_fast() {
+    if ptrace_scope() < 2 {
+        eprintln!("skipping: kernel.yama.ptrace_scope below 2 grants access to a child");
+        return;
+    }
+    let d = tmpdir("refused");
+    let bwrap = d.join("bwrap");
+    std::os::unix::fs::symlink(proot(), &bwrap).unwrap();
+    for (program, args, expected) in [
+        (
+            proot(),
+            vec!["-r", "/", "/bin/true"],
+            "proot: cannot reach the guest's memory",
+        ),
+        (
+            bwrap.clone(),
+            vec!["--bind", "/", "/", "/bin/true"],
+            "bwrap: No permissions to create a new namespace: cannot reach the guest's memory",
+        ),
+    ] {
+        for no_ptrace in ["0", "1"] {
+            let start = Instant::now();
+            let o = Command::new(&program)
+                .env("PROOT_USERNS", "0")
+                .env("PROOT_GUEST_STUB", "0")
+                .env("PROOT_NO_PTRACE", no_ptrace)
+                .args(&args)
+                .stdin(Stdio::null())
+                .output()
+                .expect("spawn proot");
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert_eq!(o.status.code(), Some(1), "{err}");
+            assert!(err.starts_with(expected), "{err}");
+            assert!(err.contains("ptrace_scope is"), "{err}");
+            assert!(start.elapsed() < Duration::from_secs(5));
+        }
+    }
+}
+
+/// A host that refuses the supervisor access to its own child and has no
+/// user namespace to offer runs the guest in the guest-stub mode, in both
+/// front ends, without being asked to.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn refused_memory_access_falls_back_to_the_guest_stub() {
+    if ptrace_scope() < 2 {
+        eprintln!("skipping: kernel.yama.ptrace_scope below 2 grants access to a child");
+        return;
+    }
+    let d = tmpdir("fallback");
+    let bwrap = d.join("bwrap");
+    std::os::unix::fs::symlink(proot(), &bwrap).unwrap();
+    for (program, args) in [
+        (proot(), vec!["-r", "/", "/bin/sh", "-c", "cd /tmp && pwd"]),
+        (
+            bwrap.clone(),
+            vec!["--bind", "/", "/", "/bin/sh", "-c", "cd /tmp && pwd"],
+        ),
+    ] {
+        let o = Command::new(&program)
+            .env("PROOT_USERNS", "0")
+            .env("PROOT_VERBOSE", "1")
+            .env_remove("PROOT_GUEST_STUB")
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn proot");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(stdout(&o), "/tmp", "{err}");
+        assert!(err.contains("running in the guest-stub mode"), "{err}");
+    }
+}
+
+/// Runs `proot` in the guest-stub restricted mode.
+///
+/// # Arguments
+/// * `args` - Its arguments.
+///
+/// # Returns
+/// The finished process.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn run_guest_stub(args: &[&str]) -> Output {
+    Command::new(proot())
+        .env("PROOT_GUEST_STUB", "force")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn proot")
+}
+
+/// What a program takes for granted about its syscalls holds under the
+/// guest stub (`tests/probes/stubprobe.c`): the registers a syscall
+/// preserves, NULL and over-long paths, output buffers, 48 threads at once,
+/// every signal blocked, a handler with a full mask, a `SIGSYS` handler of
+/// the program's own, spawn and vfork, and an exec whose environment does
+/// not fit in a mailbox slot.  The probe is built for the host and, where
+/// the compiler has `-m32` (gcc-multilib on x86_64), for i386, whose
+/// children are 64-bit programs; each is checked without proot first, then in the suite's mode,
+/// then in the guest-stub mode.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn guest_stub_keeps_what_programs_take_for_granted() {
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: no C compiler for the stub probe");
+        return;
+    }
+    let d = tmpdir("stubprobe");
+    let build = |name: &str, flags: &[&str]| {
+        let out = d.join(name);
+        let o = Command::new("cc")
+            .args(["-O1", "-pthread"])
+            .args(flags)
+            .arg("-o")
+            .arg(&out)
+            .arg(repo().join("tests/probes/stubprobe.c"))
+            .output()
+            .unwrap();
+        o.status.success().then_some(out).ok_or(o)
+    };
+    let mut probes = vec![build("stubprobe", &[]).expect("build the x86_64 probe")];
+    match build("stubprobe32", &["-m32", "-no-pie", "-fno-pie"]) {
+        Ok(p) => probes.push(p),
+        Err(_) => eprintln!("skipping the i386 probe: cc -m32 does not link here"),
+    }
+    let fresh = |name: String| {
+        let w = d.join(name);
+        std::fs::create_dir_all(&w).unwrap();
+        w
+    };
+    for probe in &probes {
+        let name = probe.file_name().unwrap().to_str().unwrap();
+        let native = Command::new(probe)
+            .arg(fresh(format!("{name}-native")))
+            .output()
+            .unwrap();
+        assert!(native.status.success(), "{name}:\n{}", stdout(&native));
+        for (mode, o) in [
+            (
+                "suite",
+                run(&[
+                    "-r",
+                    "/",
+                    "-b",
+                    &format!("{}:/pn-s", fresh(format!("{name}-suite")).display()),
+                    probe.to_str().unwrap(),
+                    "/pn-s",
+                ]),
+            ),
+            (
+                "guest stub",
+                run_guest_stub(&[
+                    "-r",
+                    "/",
+                    "-b",
+                    &format!("{}:/pn-s", fresh(format!("{name}-stub")).display()),
+                    probe.to_str().unwrap(),
+                    "/pn-s",
+                ]),
+            ),
+        ] {
+            let out = stdout(&o);
+            assert!(
+                o.status.success() && out.ends_with("done") && !out.contains("FAIL"),
+                "{name} in {mode}:\n{out}\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        }
+    }
+}
+
+/// A rootfs runs under the guest stub: dynamic programs and their libraries
+/// load from the rootfs, the working directory is virtual, `/proc/self`
+/// names the program, a `#!` script's comm and cmdline read as the kernel
+/// would give them, pipes, background jobs and exit codes behave.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn guest_stub_runs_a_rootfs() {
+    let Some(rootfs) = rootfs() else { return };
+    let d = tmpdir("stub-rootfs");
+    std::fs::write(
+        d.join("tool"),
+        "#!/bin/sh\necho \"$(cat /proc/$$/comm) $(tr '\\0' ' ' < /proc/$$/cmdline)\"\n",
+    )
+    .unwrap();
+    chmod_x(&d.join("tool"));
+    let o = run_guest_stub(&[
+        "-R",
+        rootfs.to_str().unwrap(),
+        "-b",
+        &format!("{}:/pn-t", d.display()),
+        "/bin/sh",
+        "-c",
+        "grep ^ID= /etc/os-release; cd /usr/lib && pwd; readlink /proc/self/exe; cat /proc/self/comm; \
+         /pn-t/tool one; echo a | tr a b; for i in 1 2 3; do /bin/true & done; wait; \
+         sh -c 'exit 7'; echo $?",
+    ]);
+    assert_eq!(
+        stdout(&o),
+        "ID=debian\n/usr/lib\n/usr/bin/readlink\ncat\ntool /bin/sh /pn-t/tool one \nb\n7",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// A command the guest stub cannot start fails as in the other modes: 127
+/// for a missing program, 126 for one that is not executable.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn guest_stub_refuses_what_it_cannot_run() {
+    let d = tmpdir("stub-refuse");
+    std::fs::write(d.join("plain"), "not a program\n").unwrap();
+    let bind = format!("{}:/pn-r", d.display());
+    let o = run_guest_stub(&["-r", "/", "/pn-missing"]);
+    assert_eq!(o.status.code(), Some(127));
+    let o = run_guest_stub(&["-r", "/", "-b", &bind, "/pn-r/plain"]);
+    assert_eq!(o.status.code(), Some(126));
+}
+
+/// Under a seccomp profile that refuses syscall numbers the kernel does not
+/// know, as container runtimes' default profiles do, the guest stub still
+/// tells the supervisor which program each process runs: `/proc/self/exe`
+/// and `comm` name the program, not the trampoline (Ubuntu's Rust coreutils
+/// refuse to run otherwise).
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn guest_stub_starts_under_a_container_profile() {
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: no C compiler for the profile wrapper");
+        return;
+    }
+    let d = tmpdir("deny-unknown");
+    let wrapper = d.join("denyunknown");
+    let o = Command::new("cc")
+        .arg("-o")
+        .arg(&wrapper)
+        .arg(repo().join("tests/probes/denyunknown.c"))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = Command::new(&wrapper)
+        .env("PROOT_GUEST_STUB", "force")
+        .arg(proot())
+        .args([
+            "-r",
+            "/",
+            "/bin/sh",
+            "-c",
+            "readlink /proc/self/exe; cat /proc/self/comm",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let readlink = std::fs::canonicalize("/usr/bin/readlink").unwrap();
+    assert_eq!(
+        stdout(&o),
+        format!("{}\ncat", readlink.display()),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// The guest stub's loader leaves the rest of the page a program's bss
+/// ends in zero, as the kernel does (`tests/probes/bsstail.c`): Ubuntu's
+/// i386 `ld.so` allocates its first link map there and crashed on what the
+/// file held past the data.  Built for the host and, where `cc -m32` links,
+/// for i386.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn guest_stub_zeroes_the_page_after_the_bss() {
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: no C compiler for the bss probe");
+        return;
+    }
+    let d = tmpdir("bsstail");
+    for (name, flags) in [("bsstail", &[][..]), ("bsstail32", &["-m32"][..])] {
+        let out = d.join(name);
+        let o = Command::new("cc")
+            .args(["-O1"])
+            .args(flags)
+            .arg("-o")
+            .arg(&out)
+            .arg(repo().join("tests/probes/bsstail.c"))
+            .output()
+            .unwrap();
+        if !o.status.success() {
+            assert!(!flags.is_empty(), "{}", String::from_utf8_lossy(&o.stderr));
+            eprintln!("skipping {name}: cc -m32 does not link here");
+            continue;
+        }
+        let native = Command::new(&out).output().unwrap();
+        assert_eq!(stdout(&native), "bss tail zero", "{name} natively");
+        let o = run_guest_stub(&["-r", "/", out.to_str().unwrap()]);
+        assert_eq!(
+            stdout(&o),
+            "bss tail zero",
+            "{name}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+}
+
+/// Under the guest stub, `AT_EXECFN` names the program as its exec named
+/// it, for an ordinary exec and for the command of a nested bwrap launch
+/// alike.  Ubuntu's Rust coreutils dispatch on it and refused to run as
+/// the outer `bwrap`.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn guest_stub_reports_the_path_each_exec_named() {
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: no C compiler for the AT_EXECFN probe");
+        return;
+    }
+    let d = tmpdir("execfn");
+    std::fs::write(
+        d.join("execfn.c"),
+        "#include <stdio.h>\n#include <sys/auxv.h>\nint main(void) { puts((const char *)getauxval(AT_EXECFN)); return 0; }\n",
+    )
+    .unwrap();
+    let o = Command::new("cc")
+        .current_dir(&d)
+        .args(["-o", "execfn", "execfn.c"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let bwrap = d.join("bwrap");
+    std::os::unix::fs::symlink(proot(), &bwrap).unwrap();
+    let o = run_guest_stub(&[
+        "-r",
+        "/",
+        "/bin/sh",
+        "-c",
+        &format!(
+            "cd {d} && ./execfn && {d}/bwrap --bind / / {d}/execfn",
+            d = d.display()
+        ),
+    ]);
+    assert_eq!(
+        stdout(&o),
+        format!("./execfn\n{}/execfn", d.display()),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// The seccomp filter Proton's Wine installs for some games traps every
+/// syscall made from an address whose high word is `0x7000` or lower as a
+/// Windows program's (`tests/probes/winefilter.c`); the guest stub's gates
+/// lie above that, or Wine takes the stub's own syscalls for the game's
+/// and crashes (a Windows DOSBox build under Proton Experimental).
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn guest_stub_gates_pass_wines_filter() {
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: no C compiler for the Wine filter probe");
+        return;
+    }
+    let d = tmpdir("winefilter");
+    let probe = d.join("winefilter");
+    let o = Command::new("cc")
+        .arg("-o")
+        .arg(&probe)
+        .arg(repo().join("tests/probes/winefilter.c"))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::write(d.join("file"), "wine\n").unwrap();
+    let file = d.join("file");
+    let native = Command::new(&probe).arg(&file).output().unwrap();
+    assert_eq!(stdout(&native), "wine filter ok");
+    let o = run_guest_stub(&["-r", "/", probe.to_str().unwrap(), file.to_str().unwrap()]);
+    assert_eq!(
+        stdout(&o),
+        "wine filter ok",
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );

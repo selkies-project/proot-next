@@ -13,6 +13,11 @@
 //! an environment, a directory to enter, session and death-signal flags,
 //! seccomp programs, status descriptors, or a message to print and exit with.
 //!
+//! In the guest-stub restricted mode every exec takes the trampoline, which
+//! arms the guest stub and loads the program in place rather than exec'ing
+//! it (see `guest_stub`); its record then also names the mailbox descriptor,
+//! the `AT_EXECFN` path and the process name, see [`Trapped`].
+//!
 //! The binaries under `shim/bin/` are built by `shim/build.sh` from the
 //! `no_std` crate in `shim/` and embedded here; one per host architecture.
 
@@ -26,11 +31,22 @@ use std::sync::OnceLock;
 const SHIM: &[u8] = include_bytes!("shim/bin/shim-x86_64");
 #[cfg(target_arch = "aarch64")]
 const SHIM: &[u8] = include_bytes!("shim/bin/shim-aarch64");
+/// The 32-bit trampoline, which loads the compat ABI's programs in the
+/// guest-stub mode: i386 on x86_64, 32-bit ARM on aarch64.
+#[cfg(target_arch = "x86_64")]
+const SHIM32: Option<&[u8]> = Some(include_bytes!("shim/bin/shim-i686"));
+/// The 32-bit trampoline, which loads the compat ABI's programs in the
+/// guest-stub mode: i386 on x86_64, 32-bit ARM on aarch64.
+#[cfg(target_arch = "aarch64")]
+const SHIM32: Option<&[u8]> = Some(include_bytes!("shim/bin/shim-armv7"));
 
 /// Name of the trampoline inside the alias directory.
 pub const SHIM_NAME: &str = "e";
 
 static INSTALLED: OnceLock<PathBuf> = OnceLock::new();
+
+/// Whether the i386 trampoline was installed and runs here.
+static HAS_32BIT: OnceLock<bool> = OnceLock::new();
 
 /// Installs the trampoline and returns the directory holding it.
 ///
@@ -81,17 +97,34 @@ pub fn install() -> std::result::Result<PathBuf, String> {
 fn install_in(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(SHIM_NAME);
-    std::fs::write(&path, SHIM)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-    let out = std::process::Command::new(&path)
-        .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .output()?;
+    let runs = |name: &str, bytes: &[u8]| -> std::io::Result<std::process::Output> {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        std::process::Command::new(&path)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+    };
+    let out = runs(SHIM_NAME, SHIM)?;
     if out.status.code() != Some(126) {
         return Err(std::io::Error::other(format!("trampoline did not run: {out:?}")));
     }
+    if let Some(bytes) = SHIM32 {
+        let ok =
+            runs(crate::guest_stub::layout::SHIM32_NAME, bytes).is_ok_and(|o| o.status.code() == Some(126));
+        let _ = HAS_32BIT.set(ok);
+    }
     Ok(())
+}
+
+/// Whether the 32-bit trampoline is installed and runs here, which takes a
+/// kernel with ia32 emulation, or a CPU and kernel with AArch32.
+///
+/// # Returns
+/// `true` when 32-bit programs can run in the guest-stub mode.
+pub fn has_32bit() -> bool {
+    HAS_32BIT.get().copied().unwrap_or(false)
 }
 
 /// Path of the installed trampoline.
@@ -122,20 +155,33 @@ pub fn running(tid: u32) -> bool {
 /// for a new session; `d` to die with the parent; `S<program>` (binary,
 /// repeatable); `I<fd>` and `J<fd>` status descriptors; `W<text>` lines to
 /// print; or, instead of all of the above, `E<code>:<text>` or
-/// `O<code>:<text>` to print on stderr or stdout and exit.
+/// `O<code>:<text>` to print on stderr or stdout and exit.  In the
+/// guest-stub mode `m<fd>`, `x<path>`, `n<name>` and, for a 32-bit program,
+/// `w` follow `v2`, and an
+/// ordinary exec that keeps the caller's `argv[0]` is `A0` with `k`, so the
+/// trampoline passes on its own argument vector whole.
 ///
 /// # Arguments
 /// * `tgid` - Process about to exec the trampoline.
 /// * `plan` - What it should exec.
+/// * `trapped` - The guest-stub mode's additions, if in that mode.
 ///
 /// # Errors
 /// Errno from writing the file.
-pub fn write_record(tgid: i32, plan: &ExecPlan) -> Result<()> {
+pub fn write_record(tgid: i32, plan: &ExecPlan, trapped: Option<&Trapped>) -> Result<()> {
     let Some(dir) = INSTALLED.get() else {
         return Err(libc::ENOENT);
     };
     let mut rec = Record::default();
     rec.text(b'v', b"2");
+    if let Some(t) = trapped {
+        rec.text(b'm', t.mailbox.to_string().as_bytes());
+        rec.text(b'x', &t.execfn);
+        rec.text(b'n', &t.name);
+        if t.narrow {
+            rec.text(b'w', b"");
+        }
+    }
     match &plan.trampoline {
         Some(t) => {
             for w in &t.warnings {
@@ -177,6 +223,11 @@ pub fn write_record(tgid: i32, plan: &ExecPlan) -> Result<()> {
                 }
             }
         }
+        None if trapped.is_some() && plan.prefix == 1 => {
+            rec.text(b'A', b"0");
+            rec.text(b'k', b"");
+            rec.text(b'p', &plan.exec_path);
+        }
         None => {
             rec.text(b'A', plan.prefix.to_string().as_bytes());
             for a in &plan.argv[..plan.prefix] {
@@ -186,6 +237,19 @@ pub fn write_record(tgid: i32, plan: &ExecPlan) -> Result<()> {
         }
     }
     std::fs::write(dir.join(format!("r{tgid}")), rec.bytes).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+}
+
+/// What a record carries in the guest-stub restricted mode.
+#[derive(Clone, Debug)]
+pub struct Trapped {
+    /// The mailbox descriptor installed in the process.
+    pub mailbox: i32,
+    /// The path to report as `AT_EXECFN`: the one the caller named.
+    pub execfn: Vec<u8>,
+    /// The process name the kernel would give, at most 15 bytes.
+    pub name: Vec<u8>,
+    /// The program is 32-bit: `e` hands the record to `e32`.
+    pub narrow: bool,
 }
 
 /// A record under construction.

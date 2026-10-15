@@ -4,9 +4,15 @@
 //! them; otherwise `/proc/<pid>/mem` is opened per access (the descriptor is
 //! not cached because it would silently read the old address space after an
 //! `execve`).
+//!
+//! In the guest-stub restricted mode the supervisor cannot reach a guest's
+//! memory at all; the stub copies what a syscall uses into the mailbox (see
+//! `guest_stub`), whose guest addresses are then served from the
+//! supervisor's own mapping of it, and every other address is `EFAULT`.
 
 use crate::sys::{PATH_MAX, Result, errno};
 use std::ffi::CString;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 const MODE_UNPROBED: u8 = 0;
@@ -19,6 +25,46 @@ const MODE_PROC_MEM: u8 = 2;
 pub struct Mem;
 
 static MODE: AtomicU8 = AtomicU8::new(MODE_UNPROBED);
+
+/// The mailbox of the guest-stub restricted mode as each ABI's guests map
+/// it: its guest address, its length, and the address of the supervisor's
+/// mapping of it.
+static WINDOWS: OnceLock<Vec<(u64, usize, usize)>> = OnceLock::new();
+
+/// Serves every later access from the mailbox mapped at `local`.
+///
+/// # Arguments
+/// * `guests` - Addresses of the mailbox in the guests, one per ABI.
+/// * `len` - Its length.
+/// * `local` - The supervisor's mapping of it.
+pub fn set_window(guests: &[u64], len: usize, local: *mut u8) {
+    let _ = WINDOWS.set(guests.iter().map(|&g| (g, len, local as usize)).collect());
+}
+
+/// Where `len` bytes at guest address `addr` lie in the supervisor's mapping
+/// of the mailbox, when it is in use.
+///
+/// # Arguments
+/// * `addr` - Guest address.
+/// * `len` - Bytes from there.
+///
+/// # Returns
+/// `None` outside the guest-stub mode; otherwise the local address and how
+/// many of the bytes lie inside the mailbox.
+///
+/// # Errors
+/// `EFAULT` when `addr` is not in the mailbox.
+fn in_window(addr: u64, len: usize) -> Option<Result<(*mut u8, usize)>> {
+    let windows = WINDOWS.get()?;
+    let Some(&(guest, size, local)) = windows
+        .iter()
+        .find(|&&(g, size, _)| addr >= g && addr < g + size as u64)
+    else {
+        return Some(Err(libc::EFAULT));
+    };
+    let off = (addr - guest) as usize;
+    Some(Ok(((local + off) as *mut u8, len.min(size - off))))
+}
 
 impl Mem {
     /// Reads `buf.len()` bytes at `addr` in `pid`'s address space.
@@ -34,6 +80,11 @@ impl Mem {
     /// # Errors
     /// `EFAULT` for unmapped memory, `ESRCH` when the tracee is gone.
     pub fn read(&self, pid: u32, addr: u64, buf: &mut [u8]) -> Result<usize> {
+        if let Some(w) = in_window(addr, buf.len()) {
+            let (at, n) = w?;
+            unsafe { std::ptr::copy_nonoverlapping(at, buf.as_mut_ptr(), n) };
+            return Ok(n);
+        }
         match self.mode() {
             MODE_PROC_MEM => {
                 let fd = open_mem(pid)?;
@@ -71,6 +122,9 @@ impl Mem {
     /// * `addr` - Virtual address in the tracee.
     /// * `buf` - Bytes to write; a short write is an error.
     pub fn write(&self, pid: u32, addr: u64, buf: &[u8]) -> Result<()> {
+        if let Some(w) = in_window(addr, buf.len()) {
+            return write_window(w, buf);
+        }
         let n = match self.mode() {
             MODE_PROC_MEM => {
                 let fd = open_mem(pid)?;
@@ -118,6 +172,9 @@ impl Mem {
     /// * `addr` - Virtual address in the tracee.
     /// * `buf` - Bytes to write; a short write is an error.
     pub fn write_force(&self, pid: u32, addr: u64, buf: &[u8]) -> Result<()> {
+        if let Some(w) = in_window(addr, buf.len()) {
+            return write_window(w, buf);
+        }
         let fd = open_mem(pid)?;
         let n = unsafe { libc::pwrite64(fd, buf.as_ptr() as *const _, buf.len(), addr as i64) };
         unsafe { libc::close(fd) };
@@ -218,6 +275,24 @@ impl Mem {
     fn demote(&self) -> bool {
         MODE.swap(MODE_PROC_MEM, Ordering::Relaxed) != MODE_PROC_MEM
     }
+}
+
+/// Copies `buf` into the mailbox at a place [`in_window`] found.
+///
+/// # Arguments
+/// * `w` - The lookup's result.
+/// * `buf` - The bytes to write.
+///
+/// # Errors
+/// `EFAULT` when `buf` runs past the end of the mailbox, or the error of
+/// the lookup.
+fn write_window(w: Result<(*mut u8, usize)>, buf: &[u8]) -> Result<()> {
+    let (at, n) = w?;
+    if n != buf.len() {
+        return Err(libc::EFAULT);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), at, n) };
+    Ok(())
 }
 
 fn open_mem(pid: u32) -> Result<i32> {

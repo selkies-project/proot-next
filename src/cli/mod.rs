@@ -42,7 +42,10 @@ Alias options:
   -S *path*                     Alias: -0 -r *path* + a couple of recommended -b.
 
 Environment: PROOT_THREADS (default 4) and PROOT_SPIN_US (default 200) tune the supervisor pool;
-PROOT_NO_PTRACE=1 forces the mode used where ptrace is filtered out.
+PROOT_NO_PTRACE=1 forces the mode used where ptrace is filtered out; PROOT_USERNS=1 forces, and
+PROOT_USERNS=0 rules out, the user namespace used where Yama's ptrace_scope is 2; where neither
+works the guest-stub mode is the fallback (x86_64 and aarch64 hosts), which PROOT_GUEST_STUB=0
+rules out and PROOT_GUEST_STUB=force takes anywhere.
 ";
 
 /// Host paths bound into the guest by `-R` and `-S`, when they exist.

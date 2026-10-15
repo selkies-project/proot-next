@@ -38,7 +38,11 @@ jobs:
           components: clippy
 
       - name: Native libraries for the probes
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libudev-dev
+        # gcc-multilib on x86_64 builds the i386 stub probe
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libudev-dev
+          if [ "${{ matrix.target.arch }}" = x86_64 ]; then sudo apt-get install -y -qq gcc-multilib; fi
 
       - name: Build the 32-bit probes
         # i686 on x86_64, armv7 on aarch64: static musl through rust-lld, no cross toolchain

@@ -72,6 +72,10 @@ pub struct ExecPlan {
     /// launch); `None` for an ordinary exec, which only takes the trampoline
     /// without ptrace.
     pub trampoline: Option<Trampoline>,
+    /// The program path as its exec named it: the caller's for an ordinary
+    /// exec, the inner command's for a nested launch, empty for a plan that
+    /// only prints a message.  What the kernel reports as `AT_EXECFN`.
+    pub user_path: Vec<u8>,
 }
 
 /// What the trampoline does inside the tracee before exec'ing the plan.
@@ -118,6 +122,7 @@ impl ExecPlan {
             host_prog: Vec::new(),
             understood: true,
             trampoline: Some(trampoline),
+            user_path: Vec::new(),
         }
     }
 }
@@ -135,7 +140,9 @@ impl ExecPlan {
 /// typed unless that name is dirfd-relative and meaningless after the
 /// rewrite.  The loader is reached through an alias named as the tracee
 /// named the program, which is where the kernel takes `comm` from, so a
-/// script keeps its own name rather than its interpreter's.
+/// script keeps its own name rather than its interpreter's.  In the
+/// guest-stub restricted mode the program itself is the plan: the
+/// trampoline loads it and its interpreter the way the kernel would.
 ///
 /// An exec of proot or bwrap is a nested launch and is planned by
 /// [`nested::plan`] in the view it describes.
@@ -238,7 +245,7 @@ pub fn plan_in(
     let mut changed = depth > 0 || argv_was_null;
     let (exec_path, new_argv): (Vec<u8>, Vec<Vec<u8>>) = match kind {
         Ok(FileKind::Elf64(info)) | Ok(FileKind::Elf32(info)) => match info.interp {
-            Some(interp) if !fs.identity => {
+            Some(interp) if !fs.identity && !ctx.trap_mode() => {
                 let host_interp = translate_path(fs, pid, libc::AT_FDCWD, &interp, true)?;
                 let mut v = vec![host_interp.clone()];
                 let argv0_supported = loader_supports_argv0(&host_interp);
@@ -278,6 +285,7 @@ pub fn plan_in(
         host_prog,
         understood,
         trampoline: None,
+        user_path: user_path.to_vec(),
     })
 }
 
@@ -321,7 +329,7 @@ pub fn handle_execve(ctx: &Ctx, regs: &mut Regs) -> Result<()> {
     let (exec_path, argv): (Vec<u8>, Vec<Vec<u8>>) = if plan.trampoline.is_some() {
         let shim_path = shim::install().map_err(|_| libc::ENOENT)?.join(shim::SHIM_NAME);
         let shim_path = shim_path.as_os_str().as_bytes().to_vec();
-        shim::write_record(ctx.tgid(pid as i32), &plan)?;
+        shim::write_record(ctx.tgid(pid as i32), &plan, None)?;
         ctx.procs.shim_enter(pid as i32, pending_of(&plan));
         (shim_path.clone(), vec![shim_path])
     } else {
@@ -358,6 +366,7 @@ pub fn pending_of(plan: &ExecPlan) -> PendingExec {
             .as_ref()
             .filter(|t| t.exit.is_none())
             .and_then(|t| t.enter.clone()),
+        cmdline_prefix: None,
     }
 }
 
@@ -370,6 +379,8 @@ pub fn pending_of(plan: &ExecPlan) -> PendingExec {
 /// * `pending` - What was recorded at the rewritten exec.
 pub fn finish_pending(ctx: &Ctx, tgid: i32, pending: PendingExec) {
     ctx.set_exe(tgid, pending.guest, pending.host);
+    ctx.procs
+        .update(tgid, |t| t.cmdline_prefix = pending.cmdline_prefix);
     if let Some((view, cwd)) = pending.enter {
         ctx.enter_view(tgid, view, cwd);
     }

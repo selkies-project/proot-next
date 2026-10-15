@@ -66,6 +66,11 @@ pub struct TraceeInfo {
     pub vfork_parent: Option<i32>,
     /// The view this process lives in; `None` for the root view.
     pub view: Option<Arc<View>>,
+    /// Arguments that stand in `/proc/<pid>/cmdline` before the kernel's
+    /// `argv[1..]`: the interpreter, its argument and the script of a `#!`
+    /// program the guest-stub trampoline loaded, where the kernel's file
+    /// keeps the vector the script was exec'd with.
+    pub cmdline_prefix: Option<Vec<Vec<u8>>>,
     /// Set between a rewritten exec and the trampoline's exec of the real
     /// target.  Inherited by a child the trampoline forks, which then carries
     /// out the exec itself.
@@ -85,6 +90,8 @@ pub struct PendingExec {
     /// The view the process enters at the real exec, with its working
     /// directory there (a nested proot or bwrap launch).
     pub enter: Option<(Arc<View>, Vec<u8>)>,
+    /// What becomes [`TraceeInfo::cmdline_prefix`].
+    pub cmdline_prefix: Option<Vec<Vec<u8>>>,
 }
 
 /// The reaper's epoll descriptor and the pidfd it watches for each process.
@@ -581,6 +588,7 @@ mod tests {
                 host: b"/r/bin/true".to_vec(),
                 restore: None,
                 enter: None,
+                cmdline_prefix: None,
             },
         );
         assert_eq!(t.shim_pending(7).map(|p| p.guest), Some(b"/bin/true".to_vec()));

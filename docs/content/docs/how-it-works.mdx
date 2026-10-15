@@ -36,6 +36,37 @@ in the tracee's path string in place, with the real target in a record file
 beside it. ptrace stays the first choice where it works: it costs nothing it
 does not have to, and it is what Steam is tested against.
 
+## Hosts that refuse access to a child
+
+Both modes need the kernel's ptrace access check to pass towards every
+tracee. Yama's `kernel.yama.ptrace_scope` of 2 grants that only to a holder
+of `CAP_SYS_PTRACE` in the tracee's user namespace, so on such a host the
+first tracee enters a user namespace of its own before installing the
+filter. The supervisor stays outside and owns it, which is enough. The
+namespace maps your uid and gid onto themselves and nothing else, so other
+users' files read as `nobody` through calls the kernel answers directly
+(`fstat`), supplementary groups read as `nogroup`, and `setgroups` is
+refused. Path lookups served by the supervisor keep the real owners.
+
+The choice is made at start-up by trying the accesses on a throwaway child.
+Where neither works (Yama 3, or a seccomp profile that also refuses
+`unshare`, as the default Docker and Kubernetes `RuntimeDefault` profiles do
+for a user without `CAP_SYS_ADMIN`), proot-next falls back to the guest-stub
+mode on x86_64 and aarch64. Elsewhere, or with `PROOT_GUEST_STUB=0`, it
+stops with a message instead of starting a guest it cannot serve.
+
+## The guest-stub mode
+
+The fallback where nothing else reaches the guest's memory, on x86_64 and
+aarch64 hosts. The filter sends the syscalls proot-next serves to a small
+handler inside each guest process, which copies the paths and buffers they use into memory shared
+with the supervisor, has the supervisor answer from that copy, and copies
+the results back, so the supervisor never needs to reach the guest's own
+memory. The handler lives in the exec trampoline, which loads every
+program in place instead of exec'ing it so the handler survives, the way
+the kernel would load it. 32-bit programs get a 32-bit build of the
+handler and trampoline, where the kernel runs 32-bit programs at all.
+
 ## No namespaces inside the guest
 
 Creating a user, mount or other namespace inside the guest is refused with

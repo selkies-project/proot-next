@@ -13,10 +13,12 @@
 //! `bwrap`, busybox style, so a symlink is enough to make it a drop-in.
 
 mod abi;
+mod access;
 mod cli;
 mod config;
 mod exec;
 mod fs;
+mod guest_stub;
 mod launch;
 mod procs;
 mod seccomp;

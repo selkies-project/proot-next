@@ -1,6 +1,18 @@
 # Copied to .cargo/config.toml by build.sh: self-contained static linking, no system cross toolchain.
 [target.x86_64-unknown-linux-musl]
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "linker=rust-lld", "-C", "relocation-model=static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "linker=rust-lld", "-C", "relocation-model=pie"]
 
+# rustc links aarch64 musl statically but not position independent either,
+# so the aarch64 shim sits within 4 GiB of address 0, which its startup code
+# needs, at the 32-bit shims' address: above non-PIE programs, far below PIE ones.
 [target.aarch64-unknown-linux-musl]
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "linker=rust-lld", "-C", "relocation-model=static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "linker=rust-lld", "-C", "relocation-model=static", "-C", "link-arg=--image-base=0xd0000000"]
+
+# Like i686: static, at an address 32-bit ARM programs leave alone.
+[target.armv7-unknown-linux-musleabihf]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "linker=rust-lld", "-C", "relocation-model=static", "-C", "link-arg=--image-base=0xd0000000"]
+
+# rustc links i686 musl statically but not position independent, so the
+# i386 shim sits at an address 32-bit programs leave alone, below its gates.
+[target.i686-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "linker=rust-lld", "-C", "relocation-model=static", "-C", "link-arg=--image-base=0xd0000000"]

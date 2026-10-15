@@ -16,6 +16,28 @@ new namespace: proot-next cannot run under another supervisor` and exits 1,
 the wording that programs looking for bubblewrap (GTK's glycin image
 loaders, WebKit) take as "no sandbox here" before carrying on without one.
 
+### `cannot reach the guest's memory`
+
+The kernel refused proot-next access to its own child, both as it is and
+inside a user namespace, and both modes need that access. The message names
+the `kernel.yama.ptrace_scope` setting. Any one of these fixes it:
+
+- `kernel.yama.ptrace_scope` of 0 or 1 on the host (2 alone is handled by
+  a user namespace, 3 cannot be lowered until reboot).
+- Unprivileged user namespaces: in a container, a seccomp profile that
+  allows `unshare` (Kubernetes `seccompProfile: Unconfined` or a
+  `Localhost` profile; Docker `--security-opt seccomp=unconfined`).
+- `CAP_SYS_PTRACE` that is effective, which in a container means running as
+  root with the capability added; adding it to a non-root user's container
+  only raises the bounding set.
+- On x86_64 and aarch64, the guest-stub mode, which needs none of the
+  above and is the fallback unless `PROOT_GUEST_STUB=0` rules it out, so
+  this message only appears with that setting or on other architectures.
+
+In bwrap mode the message starts with `bwrap: No permissions to create a
+new namespace:`, so callers looking for bubblewrap carry on without a
+sandbox. The exit status is 1 either way.
+
 ### `-0 inside proot-next needs the outer proot started with -0`
 
 A nested launch asked for fake root (or `-k`), which adds syscalls to the

@@ -25,12 +25,21 @@
 //!
 //! `clone` and its relatives are notified only to snapshot the parent's
 //! state for the child, see `procs`.
+//!
+//! In the guest-stub restricted mode (see `guest_stub`) the strings these
+//! handlers rewrite are the stub's copies in the mailbox, with room for any
+//! host path, so the full host path is written and nothing is put back.  An
+//! exec is planned from the staged copy and answered with the mailbox
+//! descriptor installed for the trampoline, which the stub then execs itself.
 
 use crate::exec::nested::EnvSource;
-use crate::exec::{self, shim};
+use crate::exec::shim::Trapped;
+use crate::exec::{self, ExecPlan, shim};
 use crate::fs::translate::{detranslate_path, guest_fd_path, read_link};
+use crate::guest_stub::layout;
 use crate::note;
-use crate::seccomp::notify::{addfd_at, reply_continue};
+use crate::seccomp::notify::{addfd, addfd_at, reply_continue};
+use crate::state::Ctx;
 use crate::sys::{Result, errno};
 use crate::syscall::notify::{Outcome, Req};
 use crate::syscall::nr::*;
@@ -66,6 +75,7 @@ static ALIASES: Mutex<([bool; ALIAS_CHARS.len()], usize)> = Mutex::new(([false; 
 /// * `nr` - Canonical syscall number.
 pub fn dispatch(r: &Req, nr: i64) -> Option<Result<Outcome>> {
     Some(match nr {
+        EXECVE | EXECVEAT if r.ctx.trap_mode() => do_execve_trapped(r, nr == EXECVEAT),
         EXECVE => do_execve(r, false),
         EXECVEAT => do_execve(r, true),
         CHDIR => r.path(0).and_then(|p| set_cwd(r, libc::AT_FDCWD, &p)),
@@ -95,7 +105,7 @@ pub fn dispatch(r: &Req, nr: i64) -> Option<Result<Outcome>> {
 /// # Returns
 /// `Some(Continue)` for the trampoline, `None` otherwise.
 pub fn shim_passthrough(r: &Req, nr: i64) -> Option<Outcome> {
-    if matches!(nr, EXECVE | EXECVEAT) {
+    if matches!(nr, EXECVE | EXECVEAT) || r.ctx.trap_mode() {
         return None;
     }
     let tgid = r.tgid();
@@ -182,7 +192,7 @@ fn do_execve(r: &Req, is_at: bool) -> Result<Outcome> {
     }
     r.valid()?;
     exec::debug_exec(r.pid, &plan);
-    shim::write_record(tgid, &plan)?;
+    shim::write_record(tgid, &plan, None)?;
     let vfork_parent = r.ctx.tracee(tgid).vfork_parent;
     let mut orig = user_path.clone();
     orig.push(0);
@@ -220,6 +230,191 @@ fn do_execve(r: &Req, is_at: bool) -> Result<Outcome> {
         addfd_at(r.listener, r.id, fd, dirfd, true).map_err(undo)?;
     }
     Ok(Outcome::Continue)
+}
+
+/// `execve`/`execveat` in the guest-stub restricted mode.
+///
+/// The stub staged the path and the vectors, or only `argv[0]` when they
+/// did not fit, which is enough for anything but a nested launch.  The plan
+/// is checked as [`do_execve`] checks it, plus what the trampoline's loader
+/// cannot run; the mailbox is installed into the caller, the record
+/// written, and the answer is the mailbox's descriptor number, on which
+/// the stub execs the trampoline.
+///
+/// # Arguments
+/// * `r` - The notification.
+/// * `is_at` - `execveat` rather than `execve`.
+///
+/// # Returns
+/// The mailbox's descriptor number in the caller, as the call's result.
+///
+/// # Errors
+/// The errno the kernel would refuse the exec with, `E2BIG` for vectors too
+/// large to stage when the plan needs them, or the error of reading the
+/// arguments or installing the mailbox.
+fn do_execve_trapped(r: &Req, is_at: bool) -> Result<Outcome> {
+    let (dirfd, path_idx, argv_idx, at_flags) = if is_at {
+        (r.arg(0) as i32, 1, 2, r.arg(4) as i32)
+    } else {
+        (libc::AT_FDCWD, 0, 1, 0)
+    };
+    let truncated = r.arg(layout::EXEC_TRUNCATED_ARG) != 0;
+    let user_path = r.path(path_idx)?;
+    let argv = exec::read_argv(r.ctx, r.pid, r.arg(argv_idx), r.abi.ptr_size())?;
+    let env = EnvSource::Address {
+        envp: r.arg(argv_idx + 1),
+        ptr_size: r.abi.ptr_size(),
+    };
+    let plan = if is_at && user_path.is_empty() {
+        if at_flags & libc::AT_EMPTY_PATH == 0 {
+            return Err(libc::ENOENT);
+        }
+        let guest = guest_fd_path(r.fs(), r.pid, dirfd)?;
+        exec::plan(r.ctx, r.pid, libc::AT_FDCWD, &guest, argv, true, env)?
+    } else {
+        let deref = at_flags & libc::AT_SYMLINK_NOFOLLOW == 0;
+        exec::plan(r.ctx, r.pid, dirfd, &user_path, argv, deref, env)?
+    };
+    if truncated && plan.trampoline.is_some() {
+        return Err(libc::E2BIG);
+    }
+    let narrow = check_loadable(r.ctx, &plan)?;
+    r.valid()?;
+    exec::debug_exec(r.pid, &plan);
+    let mailbox = r.ctx.mailbox.ok_or(libc::ENOSYS)?;
+    let copy = unsafe { libc::fcntl(mailbox, libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        return Err(errno());
+    }
+    let fd = addfd(r.listener, r.id, copy, false)?;
+    commit_trapped(r.ctx, r.tgid(), &plan, fd, narrow)?;
+    Ok(Outcome::Value(Ok(fd as i64)))
+}
+
+/// Plans the first tracee's exec in the guest-stub restricted mode, which
+/// the supervisor itself sets up rather than a stub: the tracee execs the
+/// trampoline through the allow gate with the mailbox it inherited.
+///
+/// # Arguments
+/// * `ctx` - Shared supervisor state.
+/// * `pid` - The first tracee, registered in the process table.
+/// * `path` - The command as given.
+/// * `argv` - Its argument vector.
+/// * `env` - Its environment, as names and values.
+///
+/// # Errors
+/// The errno the exec would have failed with.
+pub fn plan_first_trapped(
+    ctx: &Ctx,
+    pid: i32,
+    path: &[u8],
+    argv: Vec<Vec<u8>>,
+    env: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<()> {
+    let plan = exec::plan(
+        ctx,
+        pid as u32,
+        libc::AT_FDCWD,
+        path,
+        argv,
+        true,
+        EnvSource::Given(env),
+    )?;
+    let narrow = check_loadable(ctx, &plan)?;
+    exec::debug_exec(pid as u32, &plan);
+    commit_trapped(ctx, pid, &plan, ctx.mailbox.ok_or(libc::ENOSYS)?, narrow)
+}
+
+/// Writes the trampoline's record for a planned exec in the guest-stub mode
+/// and marks the process as about to run it.
+///
+/// # Arguments
+/// * `ctx` - Shared supervisor state.
+/// * `tgid` - The process.
+/// * `plan` - Its exec; its `user_path` becomes `AT_EXECFN` and the name.
+/// * `mailbox` - The mailbox's descriptor number in the process.
+/// * `narrow` - The program is 32-bit, for the 32-bit trampoline.
+///
+/// # Errors
+/// Errno from writing the record.
+fn commit_trapped(ctx: &Ctx, tgid: i32, plan: &ExecPlan, mailbox: i32, narrow: bool) -> Result<()> {
+    let execfn = if plan.user_path.is_empty() {
+        plan.guest_prog.clone()
+    } else {
+        plan.user_path.clone()
+    };
+    let mut name = exec::exec_name(&plan.user_path, &plan.guest_prog).to_vec();
+    name.truncate(15);
+    let trapped = Trapped {
+        mailbox,
+        execfn,
+        name,
+        narrow,
+    };
+    shim::write_record(tgid, plan, Some(&trapped))?;
+    let mut pending = exec::pending_of(plan);
+    if plan.trampoline.is_none() && plan.prefix > 1 {
+        pending.cmdline_prefix = Some(plan.argv[..plan.prefix].to_vec());
+    }
+    ctx.procs.shim_enter(tgid, pending);
+    Ok(())
+}
+
+/// Refuses, in the guest-stub mode, a plan the trampolines' loaders cannot
+/// carry out, and tells which trampoline loads the rest.  Besides what the
+/// kernel refuses (see [`check_executable`]) that is a format only
+/// `binfmt_misc` would run, and a 32-bit program where the i386 trampoline
+/// cannot run (a kernel without ia32 emulation).  A nested launch, which
+/// the trampoline sets up first, is only classified.
+///
+/// # Arguments
+/// * `ctx` - Shared supervisor state, for the diagnostic.
+/// * `plan` - The exec.
+///
+/// # Returns
+/// Whether the program is 32-bit, to be loaded by the i386 trampoline.
+///
+/// # Errors
+/// The kernel's errno, `ENOEXEC` for an unknown format, `EOPNOTSUPP` for a
+/// 32-bit program without the i386 trampoline.
+fn check_loadable(ctx: &Ctx, plan: &ExecPlan) -> Result<bool> {
+    if plan.trampoline.is_some() {
+        return Ok(!plan.exec_path.is_empty()
+            && matches!(
+                exec::elf::classify_file(&plan.exec_path),
+                Ok(exec::elf::FileKind::Elf32(_))
+            ));
+    }
+    check_executable(plan)?;
+    match exec::elf::classify_file(&plan.exec_path) {
+        Ok(exec::elf::FileKind::Elf64(_)) => Ok(false),
+        Ok(exec::elf::FileKind::Elf32(_)) if shim::has_32bit() => Ok(true),
+        Ok(exec::elf::FileKind::Elf32(_)) => {
+            note!(
+                ctx,
+                1,
+                "{}: 32-bit programs cannot run here (no i386 trampoline)",
+                String::from_utf8_lossy(&plan.guest_prog)
+            );
+            Err(libc::EOPNOTSUPP)
+        }
+        _ => Err(libc::ENOEXEC),
+    }
+}
+
+/// Answers the trampoline's [`layout::HELLO`]: the exec planned for the
+/// process has happened, so it now runs the program, in the view the plan
+/// named.
+///
+/// # Arguments
+/// * `ctx` - Shared supervisor state.
+/// * `tid` - The calling thread.
+pub fn hello(ctx: &Ctx, tid: u32) {
+    let tgid = ctx.tgid(tid as i32);
+    if let Some(p) = ctx.procs.shim_pending(tgid) {
+        ctx.procs.shim_leave(tgid);
+        exec::finish_pending(ctx, tgid, p);
+    }
 }
 
 /// Refuses a plan the kernel would refuse, with the kernel's errno.
@@ -506,6 +701,9 @@ fn do_inotify_add_watch(r: &Req) -> Result<Outcome> {
 pub fn do_open_path(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64) -> Result<Outcome> {
     let nofollow = flags & libc::O_NOFOLLOW as i64 != 0;
     let host = r.translate(dirfd, path, !nofollow)?;
+    if r.ctx.trap_mode() {
+        return rewrite_staged(r, path_addr, &host);
+    }
     let cloexec = flags & libc::O_CLOEXEC as i64 != 0;
     let c = CString::new(host.clone()).map_err(|_| libc::ENOENT)?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -595,6 +793,9 @@ enum Form {
 /// # Errors
 /// `ENAMETOOLONG` when even the alias does not fit, or the errno of creating it.
 fn transient_rewrite(r: &Req, addr: u64, orig: &[u8], host: &[u8], form: Form) -> Result<Outcome> {
+    if r.ctx.trap_mode() {
+        return rewrite_staged(r, addr, host);
+    }
     let dir = shim::dir_bytes().ok_or(libc::ENOENT)?;
     let name = acquire_alias().ok_or(libc::EAGAIN)?;
     let release = |e: i32| {
@@ -648,6 +849,35 @@ fn transient_rewrite(r: &Req, addr: u64, orig: &[u8], host: &[u8], form: Form) -
     restore_if_intact(r, r.pid, addr, orig, &written);
     release_alias(name);
     Ok(Outcome::Replied)
+}
+
+/// Replaces a path the guest stub staged with its host path and lets the
+/// syscall continue on it.
+///
+/// # Arguments
+/// * `r` - The notification.
+/// * `addr` - Address of the staged path, a [`layout::PATH_AREA`] of the mailbox.
+/// * `host` - The host path.
+///
+/// # Errors
+/// `ENAMETOOLONG` for a host path that does not fit, `EFAULT` for an
+/// address outside the mailbox.
+fn rewrite_staged(r: &Req, addr: u64, host: &[u8]) -> Result<Outcome> {
+    if host.len() >= layout::PATH_AREA {
+        return Err(libc::ENAMETOOLONG);
+    }
+    let mut bytes = host.to_vec();
+    bytes.push(0);
+    r.valid()?;
+    r.ctx.mem.write(r.pid, addr, &bytes)?;
+    note!(
+        r.ctx,
+        2,
+        "pid {} rewrote the staged path to {}",
+        r.pid,
+        String::from_utf8_lossy(host)
+    );
+    Ok(Outcome::Continue)
 }
 
 /// Puts `orig` back at `addr` in process `pid` if the memory still holds
