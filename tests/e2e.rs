@@ -1153,7 +1153,10 @@ fn guest_stub_keeps_what_programs_take_for_granted() {
         o.status.success().then_some(out).ok_or(o)
     };
     let mut probes = vec![build("stubprobe", &[]).expect("build the x86_64 probe")];
-    match build("stubprobe32", &["-m32", "-no-pie", "-fno-pie"]) {
+    match build(
+        "stubprobe32",
+        &["-m32", "-no-pie", "-fno-pie", "-D_FILE_OFFSET_BITS=64"],
+    ) {
         Ok(p) => probes.push(p),
         Err(_) => eprintln!("skipping the i386 probe: cc -m32 does not link here"),
     }
