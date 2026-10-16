@@ -11,7 +11,7 @@ most users rely on.
 | `-r path`, `--rootfs=path` | Use `path` as the guest root. Default `/`. |
 | `-R path` | `-r path` plus the recommended bindings: `/dev`, `/proc`, `/sys`, `/tmp`, `/run`, `/etc/{hosts,host.conf,hosts.equiv,mtab,netgroup,networks,passwd,group,nsswitch.conf,resolv.conf,localtime}`, the system D-Bus socket, and `$HOME`. Each only if it exists on the host. |
 | `-S path` | `-R` with the shorter PRoot list, plus `-0`. |
-| `-b host[:guest]`, `--bind`, `-m`, `--mount` | Make a host path visible at a guest path. Files work as well as directories. Later bindings win over earlier ones on equal prefixes; longer prefixes win over shorter. |
+| `-b host[:guest]`, `--bind`, `-m`, `--mount` | Make a host path visible at a guest path. Files work as well as directories. Later bindings win over earlier ones on equal prefixes; longer prefixes win over shorter. A guest path that does not exist gets an empty mount point for the run, as in PRoot, so its directory lists it (see `PROOT_DONT_POLLUTE_ROOTFS`). |
 | `-w path`, `--cwd`, `--pwd` | Initial working directory, as a guest path. Defaults to the host's current directory when that is visible in the guest, else `/`. |
 | `-k release`, `--kernel-release` | Report `release` from `uname(2)`. |
 | `--kill-on-exit` | Accepted for compatibility. Tracees always die with the supervisor: once it is gone their translated syscalls would fail, so an orphan is never useful. |

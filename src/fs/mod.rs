@@ -3,11 +3,13 @@
 //! * [`binding`] holds the prefix tables for both directions.
 //! * [`canon`] walks a guest path component by component, resolving symlinks
 //!   inside the guest namespace (the port of PRoot's `canon.c`).
+//! * [`glue`] creates the mount points of bindings so listings show them.
 //! * [`translate`] turns a tracee's `(dirfd, path)` pair into a host path and
 //!   back.
 
 pub mod binding;
 pub mod canon;
+pub mod glue;
 pub mod translate;
 
 pub use binding::Fs;

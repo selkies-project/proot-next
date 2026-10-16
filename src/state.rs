@@ -3,10 +3,11 @@
 use crate::config::Config;
 use crate::fs::Fs;
 use crate::fs::binding::DirCache;
+use crate::fs::glue::{self, Placeholder};
 use crate::procs::{Ids, ProcTable, TraceeInfo};
 use crate::tracee::mem::Mem;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// One guest: a filesystem view and the launch options that go with it.
 ///
@@ -26,10 +27,13 @@ pub struct View {
     /// Directories removed once the last process of the view is gone (a
     /// nested bwrap's materialized root).
     cleanup_dirs: Vec<Vec<u8>>,
+    /// Mount points created for the bindings, removed with the view.
+    placeholders: Mutex<Vec<Placeholder>>,
 }
 
 impl View {
-    /// Builds a view from a configuration whose paths are host paths.
+    /// Builds a view from a configuration whose paths are host paths, and
+    /// creates the mount points its bindings are missing (see [`glue`]).
     ///
     /// # Arguments
     /// * `config` - Root, bindings and flags.
@@ -37,8 +41,10 @@ impl View {
     /// * `cache` - Directory cache shared with the supervisor's other views.
     /// * `cleanup` - Remove `config.cleanup_dirs` when the view is dropped.
     pub fn new(config: &Config, procs: Arc<ProcTable>, cache: Arc<DirCache>, cleanup: bool) -> View {
+        let fs = Fs::with_cache(config, procs, cache);
+        let placeholders = Mutex::new(glue::create(&fs));
         View {
-            fs: Fs::with_cache(config, procs, cache),
+            fs,
             kernel_release: config.kernel_release.clone(),
             hostname: config.hostname.clone(),
             fake_root: config.fake_root,
@@ -47,6 +53,18 @@ impl View {
             } else {
                 Vec::new()
             },
+            placeholders,
+        }
+    }
+
+    /// Removes the mount points created for this view's bindings.
+    ///
+    /// Called when the guest is done; later calls do nothing.
+    pub fn remove_placeholders(&self) {
+        let placeholders = std::mem::take(&mut *self.placeholders.lock().unwrap_or_else(|e| e.into_inner()));
+        if !placeholders.is_empty() {
+            glue::remove(&placeholders);
+            self.fs.flush_cache();
         }
     }
 }
@@ -54,6 +72,7 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         use std::os::unix::ffi::OsStrExt;
+        self.remove_placeholders();
         for dir in &self.cleanup_dirs {
             let _ = std::fs::remove_dir_all(std::ffi::OsStr::from_bytes(dir));
         }

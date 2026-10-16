@@ -394,6 +394,77 @@ fn bwrap_mode_builds_a_container() {
     );
 }
 
+/// NVIDIA under proot-apps: driver files bound one by one into the rootfs's
+/// vendor directories were found by name but missing from the listings
+/// libglvnd and the Vulkan loader take drivers from, so Chrome ran on Mesa.
+#[test]
+fn bound_files_show_in_directory_listings() {
+    let d = tmpdir("glue");
+    std::fs::create_dir_all(d.join("vk")).unwrap();
+    std::fs::write(d.join("vk/real.json"), "{}").unwrap();
+    std::fs::write(d.join("icd.json"), "{\"nvidia\":1}").unwrap();
+    std::fs::create_dir_all(d.join("srcdir")).unwrap();
+    let file_bind = format!("{0}/icd.json:{0}/vk/nvidia_icd.json", d.display());
+    let dir_bind = format!("{0}/srcdir:{0}/glue/a/b", d.display());
+    let script = format!(
+        "ls {0}/vk; ls {0}/glue/a; cat {0}/vk/nvidia_icd.json",
+        d.display()
+    );
+    let o = run(&[
+        "-r", "/", "-b", &file_bind, "-b", &dir_bind, "/bin/sh", "-c", &script,
+    ]);
+    assert_eq!(
+        stdout(&o),
+        "nvidia_icd.json\nreal.json\nb\n{\"nvidia\":1}",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(!d.join("vk/nvidia_icd.json").exists());
+    assert!(!d.join("glue").exists());
+    assert_eq!(std::fs::read(d.join("icd.json")).unwrap(), b"{\"nvidia\":1}");
+}
+
+/// A bwrap file bind inside a directory bind lists in that directory, as
+/// the mount point bubblewrap creates would make it.
+#[test]
+fn bwrap_bind_inside_a_bind_shows_in_its_listing() {
+    let d = tmpdir("glue-bwrap");
+    let bwrap = d.join("bwrap");
+    std::os::unix::fs::symlink(proot(), &bwrap).unwrap();
+    std::fs::create_dir_all(d.join("hostdir")).unwrap();
+    std::fs::write(d.join("hostdir/real"), "").unwrap();
+    std::fs::write(d.join("zz.json"), "{}").unwrap();
+    let o = Command::new(&bwrap)
+        .args([
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--symlink",
+            "usr/lib",
+            "/lib",
+            "--symlink",
+            "usr/lib64",
+            "/lib64",
+        ])
+        .args(["--bind", d.join("hostdir").to_str().unwrap(), "/opt"])
+        .args(["--ro-bind", d.join("zz.json").to_str().unwrap(), "/opt/zz.json"])
+        .args(["--", "/usr/bin/ls", "/opt"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(
+        stdout(&o),
+        "real\nzz.json",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let left: Vec<_> = std::fs::read_dir(d.join("hostdir"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, vec![std::ffi::OsString::from("real")]);
+}
+
 #[test]
 fn rootfs_runs_shell_scripts_and_reports_guest_paths() {
     let Some(r) = rootfs() else { return };

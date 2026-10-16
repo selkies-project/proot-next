@@ -430,6 +430,25 @@ never escape it.  `fs/translate.rs` resolves `dirfd`-relative paths by reading
 the descriptor's path from `/proc/<pid>/fd` and detranslating it, then
 canonicalizes the joined guest path.
 
+## Mount points
+
+A directory listing is the kernel's: `getdents` runs untranslated on a
+descriptor of the host directory, so a binding whose guest path has nothing
+behind it on disk is found by name and missing from its parent's listing.
+Loaders that discover drivers by listing a directory (libglvnd's
+`egl_vendor.d`, the Vulkan loader's `icd.d`, the OpenCL ICD loader) then
+never see a vendor file bound in one by one, which is how proot-apps hands
+the NVIDIA driver to its guests.  `fs/glue.rs` does what PRoot does: when a
+view is built, every missing component of a binding's guest path is
+created in the directory under it, an empty file or a directory after the
+binding's host side, and removed when the view ends.  The walk never
+follows a symlink and never creates under a read-only binding.  Each
+placeholder carries the `user.proot-next.placeholder` attribute, so one
+left by a supervisor that was killed is adopted and removed by the next
+launch.  `PROOT_DONT_POLLUTE_ROOTFS` turns this off.  Emulating `getdents`
+instead would need the tracee's directory position, which only
+`pidfd_getfd` reaches and a default container profile refuses.
+
 ## execve
 
 The kernel resolves `PT_INTERP` itself, which would escape the guest.  The
@@ -529,8 +548,8 @@ lookups.
   missing files are passed through so the kernel reports `ENOENT` itself.
 * `AT_EMPTY_PATH` operations pass through to the kernel on the host fd (correct
   by construction, but untranslated).
-* Mount points for bindings are not "glued" into the rootfs listing: `ls /`
-  only shows entries that physically exist in the rootfs.
+* A mount point left by a supervisor that was killed stays on a filesystem
+  without user extended attributes; elsewhere the next launch removes it.
 * Kernel-level `/proc/<pid>/exe` names the loader alias; `readlink` is
   answered from our own record and `cmdline` is served, but a tool outside
   the guest sees the alias.  A glibc older than 2.33 in a rootfs loses
