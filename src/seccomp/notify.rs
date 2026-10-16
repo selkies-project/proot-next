@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 /// The listener pool; see [`start`].
 pub struct Pool {
+    listener: i32,
     token: Mutex<()>,
     park: Mutex<()>,
     cv: Condvar,
@@ -138,10 +139,23 @@ fn thread_main(listener: i32, pool: Arc<Pool>, ctx: Arc<Ctx>, spin_us: u64) {
 
 impl Pool {
     /// Blocks until the pool has shut down, i.e. no process uses the filter any more.
+    ///
+    /// The wait is on the listener's `POLLHUP`, which closes the pool too: a thread already
+    /// blocked in `RECV` when the last process left the filter is not woken by the hangup on
+    /// every kernel (6.8 wakes a receiver only for `EPOLLIN` or `EPOLLERR`), and would hold
+    /// the supervisor up for good.  A `poll` for no events wakes for the hangup alone.
     pub fn wait_closed(&self) {
-        let mut g = self.park.lock().unwrap();
         while !self.closed.load(Ordering::Acquire) {
-            g = self.cv.wait_timeout(g, Duration::from_millis(200)).unwrap().0;
+            let mut pfd = libc::pollfd {
+                fd: self.listener,
+                events: 0,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut pfd, 1, 200) } > 0 && pfd.revents & libc::POLLHUP != 0 {
+                self.closed.store(true, Ordering::Release);
+                self.cv.notify_all();
+                break;
+            }
         }
     }
 }
@@ -156,6 +170,7 @@ impl Pool {
 /// The pool, to wait for its shutdown.
 pub fn start(listener: i32, ctx: Arc<Ctx>) -> Arc<Pool> {
     let pool = Arc::new(Pool {
+        listener,
         token: Mutex::new(()),
         park: Mutex::new(()),
         cv: Condvar::new(),
