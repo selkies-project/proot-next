@@ -594,6 +594,7 @@ pub fn run(
     };
     let mut aux = [(0usize, 0usize); AUXV_MAX];
     let mut naux = 0;
+    let mut kernel_execfn = 0;
     unsafe {
         let mut p = kernel_envp;
         while !(*p).is_null() {
@@ -602,6 +603,9 @@ pub fn run(
         let mut a = p.add(1) as *const usize;
         while *a != AT_NULL && naux < AUXV_MAX - 6 {
             let (k, v) = (*a, *a.add(1));
+            if k == AT_EXECFN {
+                kernel_execfn = v;
+            }
             let replaced = matches!(k, AT_PHDR | AT_PHENT | AT_PHNUM | AT_BASE | AT_ENTRY)
                 || (k == AT_EXECFN && !execfn.is_null());
             if !replaced {
@@ -622,10 +626,31 @@ pub fn run(
         naux += 1;
     }
     if !execfn.is_null() {
-        aux[naux] = (AT_EXECFN, execfn as usize);
+        aux[naux] = (AT_EXECFN, unsafe { execfn_in_place(kernel_execfn, execfn) });
         naux += 1;
     }
     unsafe { enter(start, argc, argv, envp, &aux[..naux]) }
+}
+
+/// Writes the path to report as `AT_EXECFN` over the kernel's string, the shim's padded path
+/// (`layout::padded_path`), so the auxiliary vector the kernel keeps names the program too.
+///
+/// # Arguments
+/// * `kernel` - Address of the kernel's `AT_EXECFN` string, or 0.
+/// * `execfn` - The path to report.
+///
+/// # Returns
+/// The address of the path: the kernel's string, or `execfn` where that is shorter.
+///
+/// # Safety
+/// `execfn` must be a NUL-terminated string, and `kernel`, unless 0, one in writable memory.
+unsafe fn execfn_in_place(kernel: usize, execfn: *const c_char) -> usize {
+    let n = unsafe { libc::strlen(execfn) } + 1;
+    if kernel == 0 || unsafe { libc::strlen(kernel as *const c_char) } + 1 < n {
+        return execfn as usize;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(execfn.cast::<u8>(), kernel as *mut u8, n) };
+    kernel
 }
 
 /// Builds the initial stack and jumps to `entry`.

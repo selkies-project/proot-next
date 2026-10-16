@@ -153,6 +153,36 @@ pub const EXEC_TRUNCATED_ARG: usize = 5;
 /// Name of the 32-bit trampoline in the alias directory, next to `e`.
 pub const SHIM32_NAME: &str = "e32";
 
+/// A trampoline's path relative to the alias directory, `.` and slashes before its name filling
+/// a [`PATH_AREA`], for `execve`.
+///
+/// The kernel copies the path an exec names onto the new stack as the string of `AT_EXECFN`,
+/// which the auxiliary vector it keeps (`PR_GET_AUXV`, `/proc/self/auxv`) points to; the
+/// trampoline writes the program's path over it, which no staged path outgrows.
+///
+/// # Arguments
+/// * `name` - The trampoline's name in the alias directory.
+///
+/// # Returns
+/// The path, NUL-terminated.
+pub const fn padded_path(name: &[u8]) -> [u8; PATH_AREA] {
+    let mut p = [b'/'; PATH_AREA];
+    p[0] = b'.';
+    let mut i = 0;
+    while i < name.len() {
+        p[PATH_AREA - 1 - name.len() + i] = name[i];
+        i += 1;
+    }
+    p[PATH_AREA - 1] = 0;
+    p
+}
+
+/// The path every exec in the guest-stub mode takes to `e`, see [`padded_path`].
+pub static SHIM_PATH: [u8; PATH_AREA] = padded_path(b"e");
+
+/// The path `e` takes to [`SHIM32_NAME`], see [`padded_path`].
+pub static SHIM32_PATH: [u8; PATH_AREA] = padded_path(SHIM32_NAME.as_bytes());
+
 const _: () = {
     assert!(GATE64.is_multiple_of(PAGE as u64) && MAIL64.is_multiple_of(PAGE as u64));
     assert!(GATE32.is_multiple_of(PAGE as u64) && MAIL32.is_multiple_of(PAGE as u64));

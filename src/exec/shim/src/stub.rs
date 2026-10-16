@@ -14,10 +14,10 @@
 //! * `execve` and `execveat` are planned by the supervisor from a staged
 //!   copy of the path and vectors, which answers with a mailbox descriptor
 //!   it installed; the stub then execs the shim (`e` in the alias directory,
-//!   the kernel working directory of every guest) through the allow gate
-//!   with the caller's own vectors.  The new shim maps the mailbox again and
-//!   loads the program itself, so the stub is in place from its first
-//!   instruction.
+//!   the kernel working directory of every guest, by [`layout::SHIM_PATH`])
+//!   through the allow gate with the caller's own vectors.  The new shim maps
+//!   the mailbox again and loads the program itself, so the stub is in place
+//!   from its first instruction.
 //! * `rt_sigprocmask` is emulated on the mask saved in the signal frame,
 //!   which `rt_sigreturn` restores, with `SIGSYS` kept unblocked: the kernel
 //!   kills a process whose trap finds `SIGSYS` blocked.
@@ -52,8 +52,6 @@ const SIGSYS_BIT: u64 = 1 << (SIGSYS - 1);
 const UNBLOCKABLE: u64 = (1 << (libc::SIGKILL - 1)) | (1 << (libc::SIGSTOP - 1));
 /// Size of the alternate signal stack given to the main thread.
 const ALT_STACK_SIZE: usize = 64 * 1024;
-/// Path of the shim relative to the kernel working directory.
-const SHIM: &[u8] = b"e\0";
 /// Size of the kernel's signal set.
 const SIGSET_SIZE: usize = 8;
 
@@ -1038,7 +1036,7 @@ unsafe fn exec(nr: isize, a: [usize; 6]) -> isize {
     }
     let rc = sys(
         libc::SYS_execve as isize,
-        [SHIM.as_ptr() as usize, a[argv], a[envp], 0, 0, 0],
+        [layout::SHIM_PATH.as_ptr() as usize, a[argv], a[envp], 0, 0, 0],
     );
     sys(libc::SYS_close as isize, [mail as usize, 0, 0, 0, 0, 0]);
     rc

@@ -517,14 +517,19 @@ extern "C" fn main(argc: i32, argv: *const *const c_char, envp: *const *const c_
         }
         #[cfg(target_pointer_width = "64")]
         if plan.narrow {
-            let mut e32 = [0u8; 8];
-            e32[..layout::SHIM32_NAME.len()].copy_from_slice(layout::SHIM32_NAME.as_bytes());
             let e = sc(
                 libc::SYS_execve,
-                [e32.as_ptr() as usize, argv as usize, envp as usize, 0, 0, 0],
+                [
+                    layout::SHIM32_PATH.as_ptr() as usize,
+                    argv as usize,
+                    envp as usize,
+                    0,
+                    0,
+                    0,
+                ],
             );
             unlink(name.as_ptr() as *const c_char);
-            return cannot(&e32[..layout::SHIM32_NAME.len()], b"execute", -e as i32);
+            return cannot(layout::SHIM32_NAME.as_bytes(), b"execute", -e as i32);
         }
         #[cfg(any(
             target_arch = "x86_64",

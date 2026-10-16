@@ -212,7 +212,6 @@ pub fn run(config: Config) -> Result<i32, String> {
         );
     }
     let slash = CString::new("/").unwrap();
-    let shim_name = CString::new(shim::SHIM_NAME).unwrap();
     let mailbox = ctx.mailbox;
     let pinned_cwd: Option<CString> = if no_ptrace {
         let dir = shim::install()?;
@@ -308,7 +307,12 @@ pub fn run(config: Config) -> Result<i32, String> {
                 libc::chdir(slash.as_ptr());
             }
             if let Some(mail) = mailbox {
-                guest_stub::exec_trampoline(mail, shim_name.as_ptr(), argv.as_ptr(), envp);
+                guest_stub::exec_trampoline(
+                    mail,
+                    guest_stub::layout::SHIM_PATH.as_ptr().cast(),
+                    argv.as_ptr(),
+                    envp,
+                );
             }
             libc::execve(program_path, argv.as_ptr(), envp);
             let e = *libc::__errno_location();

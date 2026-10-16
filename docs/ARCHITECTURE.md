@@ -349,9 +349,13 @@ below the trampoline's frames, with the trampoline's own auxiliary vector
 (vDSO, `AT_RANDOM`, ids, hardware capabilities) and the entries that
 describe the program replaced; the argument and environment pointers point
 at the strings the kernel already holds, so `/proc/self/cmdline` and a
-program that rewrites its title see what they would.  `comm` is set from
-the record.  A 32-bit ARM entry point with the Thumb bit is entered in
-Thumb.
+program that rewrites its title see what they would.  The vector the
+kernel keeps, which `PR_GET_AUXV` and `/proc/self/auxv` return (rustix
+reads it, and uutils' multi-call binary picks its applet by the name in
+its `AT_EXECFN`), points at the path `e` was exec'd by, which is padded
+with slashes to the longest a staged path can be (`./…/e`) so the
+trampoline can write the program's path over it.  `comm` is set from the
+record.  A 32-bit ARM entry point with the Thumb bit is entered in Thumb.
 
 The first program is planned by the supervisor before it lets the child
 go, and the child execs the trampoline through the allow gate with the
@@ -372,7 +376,9 @@ mailbox descriptor it inherited.
   built for branch target identification runs without it on CPUs that
   have it.
 - `/proc/<pid>/exe` and the first line of `/proc/<pid>/maps` name the
-  trampoline at the kernel level; the supervisor answers for `exe`.
+  trampoline at the kernel level; the supervisor answers for `exe`.  The
+  auxiliary vector the kernel keeps describes the trampoline but for
+  `AT_EXECFN`.
 - An executable the guest may run but not read cannot be loaded.
 - A vfork child that changes the `SIGSYS` action changes it for its parent
   too, since the recorded action lives in shared memory.

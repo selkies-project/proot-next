@@ -1336,8 +1336,10 @@ fn guest_stub_zeroes_the_page_after_the_bss() {
 
 /// Under the guest stub, `AT_EXECFN` names the program as its exec named
 /// it, for an ordinary exec and for the command of a nested bwrap launch
-/// alike.  Ubuntu's Rust coreutils dispatch on it and refused to run as
-/// the outer `bwrap`.
+/// alike, in the auxiliary vector the program starts with and in the one
+/// the kernel keeps (`PR_GET_AUXV`, `/proc/self/auxv`).  Ubuntu's Rust
+/// coreutils dispatch on it and refused to run as the outer `bwrap`, and
+/// uutils 0.8, which reads the kernel's through rustix, as `e`.
 #[test]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn guest_stub_reports_the_path_each_exec_named() {
@@ -1348,7 +1350,22 @@ fn guest_stub_reports_the_path_each_exec_named() {
     let d = tmpdir("execfn");
     std::fs::write(
         d.join("execfn.c"),
-        "#include <stdio.h>\n#include <sys/auxv.h>\nint main(void) { puts((const char *)getauxval(AT_EXECFN)); return 0; }\n",
+        concat!(
+            "#include <fcntl.h>\n#include <stdio.h>\n#include <sys/auxv.h>\n#include <sys/prctl.h>\n#include <unistd.h>\n",
+            "#ifndef PR_GET_AUXV\n#define PR_GET_AUXV 0x41555856\n#endif\n",
+            "static unsigned long v[512];\n",
+            "static const char *execfn(long n) {\n",
+            "  for (long i = 0; i + 1 < n / (long)sizeof *v && v[i]; i += 2)\n",
+            "    if (v[i] == AT_EXECFN) return (const char *)v[i + 1];\n",
+            "  return \"-\";\n}\n",
+            "int main(void) {\n",
+            "  const char *own = (const char *)getauxval(AT_EXECFN);\n",
+            "  long n = prctl(PR_GET_AUXV, v, sizeof v, 0, 0);\n",
+            "  printf(\"%s %s\", own, n > 0 ? execfn(n) : own);\n",
+            "  int fd = open(\"/proc/self/auxv\", O_RDONLY);\n",
+            "  printf(\" %s\\n\", execfn(read(fd, v, sizeof v)));\n",
+            "  return 0;\n}\n",
+        ),
     )
     .unwrap();
     let o = Command::new("cc")
@@ -1371,7 +1388,32 @@ fn guest_stub_reports_the_path_each_exec_named() {
     ]);
     assert_eq!(
         stdout(&o),
-        format!("./execfn\n{}/execfn", d.display()),
+        format!(
+            "./execfn ./execfn ./execfn\n{d}/execfn {d}/execfn {d}/execfn",
+            d = d.display()
+        ),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let o = Command::new("cc")
+        .current_dir(&d)
+        .args(["-m32", "-o", "execfn32", "execfn.c"])
+        .output()
+        .unwrap();
+    if !o.status.success() {
+        eprintln!("skipping the 32-bit case: no 32-bit C toolchain");
+        return;
+    }
+    let o = run_guest_stub(&[
+        "-r",
+        "/",
+        "/bin/sh",
+        "-c",
+        &format!("cd {} && ./execfn32", d.display()),
+    ]);
+    assert_eq!(
+        stdout(&o),
+        "./execfn32 ./execfn32 ./execfn32",
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );
