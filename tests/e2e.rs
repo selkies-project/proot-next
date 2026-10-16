@@ -687,7 +687,11 @@ fn nested_proot_runs_in_a_view_of_its_own() {
     let o = run(&["-r", "/", "/bin/sh", "-c", &messages]);
     let out = stdout(&o);
     let err = String::from_utf8_lossy(&o.stderr);
-    assert_eq!(out, "rc=127\nproot-next 0.3.0\nrc=1", "{out}\n{err}");
+    assert_eq!(
+        out,
+        format!("rc=127\nproot-next {}\nrc=1", env!("CARGO_PKG_VERSION")),
+        "{out}\n{err}"
+    );
     assert!(
         err.contains("proot: cannot execute /nonexistent-cmd: No such file or directory"),
         "{err}"
