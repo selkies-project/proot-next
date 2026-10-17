@@ -58,6 +58,9 @@ pub struct Table<'a> {
     pub ns_flags: &'a [i64],
     /// Syscalls refused with `EPERM` outright (`setns`).
     pub refused: &'a [i64],
+    /// `prctl` numbers whose `PR_SET_DUMPABLE` and `PR_GET_DUMPABLE` go to
+    /// the listener; every other option is allowed.
+    pub dumpable: &'a [i64],
 }
 
 fn stmt(code: u16, k: u32) -> SockFilter {
@@ -86,6 +89,8 @@ enum Sub {
     Socketcall,
     /// `clone`/`unshare`: a `CLONE_NEW*` bit in the first argument is refused.
     NsFlags,
+    /// `prctl`: `PR_SET_DUMPABLE` and `PR_GET_DUMPABLE` go to the listener, the rest are allowed.
+    Dumpable,
 }
 
 impl Sub {
@@ -94,6 +99,7 @@ impl Sub {
             Sub::OPath { .. } => 3,
             Sub::Socketcall => 4,
             Sub::NsFlags => 3,
+            Sub::Dumpable => 4,
         }
     }
 }
@@ -207,6 +213,7 @@ fn build_tiers(t64: &Table, t32: &Table, trace_ret: Option<u32>) -> Vec<SockFilt
             v.push((nr, Sub::Socketcall));
         }
         v.extend(t.ns_flags.iter().map(|nr| (*nr, Sub::NsFlags)));
+        v.extend(t.dumpable.iter().map(|nr| (*nr, Sub::Dumpable)));
         v
     };
     let (subs64, subs32) = (subs_for(t64), subs_for(t32));
@@ -355,6 +362,17 @@ fn build_tiers(t64: &Table, t32: &Table, trace_ret: Option<u32>) -> Vec<SockFilt
                     jt: 0,
                     jf: 0,
                     k: off(here + 2, a3_idx) as u32,
+                });
+            }
+            Sub::Dumpable => {
+                f.push(stmt(BPF_LD_W_ABS, arg_offset(0)));
+                f.push(jump(libc::PR_SET_DUMPABLE as u32, off(here + 1, n_idx), 0));
+                f.push(jump(libc::PR_GET_DUMPABLE as u32, off(here + 2, n_idx), 0));
+                f.push(SockFilter {
+                    code: BPF_JA,
+                    jt: 0,
+                    jf: 0,
+                    k: off(here + 3, a3_idx) as u32,
                 });
             }
         }
@@ -516,6 +534,7 @@ mod tests {
                 trace: &[2, 59, 257],
                 ns_flags: &[272],
                 refused: &[308],
+                dumpable: &[],
             },
             &Table {
                 abi: Abi::I386,
@@ -523,6 +542,7 @@ mod tests {
                 trace: &[5, 11, 174],
                 ns_flags: &[310],
                 refused: &[346],
+                dumpable: &[],
             },
         );
         let trap = SECCOMP_RET_TRAP | layout::TAG;
@@ -614,6 +634,7 @@ mod tests {
                 trace: &[59, 80],
                 ns_flags: &[56, 272],
                 refused: &[308],
+                dumpable: &[157],
             },
             &Table {
                 abi: Abi::I386,
@@ -621,6 +642,7 @@ mod tests {
                 trace: &[11, 12],
                 ns_flags: &[120, 310],
                 refused: &[346],
+                dumpable: &[172],
             },
             false,
         );
@@ -648,6 +670,26 @@ mod tests {
         );
         assert_eq!(
             run_args(&p, AUDIT_ARCH_I386, 102, [1, 0, 0, 0, 0, 0]),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_X86_64, 157, [4, 0, 0, 0, 0, 0]),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_X86_64, 157, [3, 0, 0, 0, 0, 0]),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_X86_64, 157, [15, 0, 0, 0, 0, 0]),
+            SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_I386, 172, [4, 0, 0, 0, 0, 0]),
+            SECCOMP_RET_USER_NOTIF
+        );
+        assert_eq!(
+            run_args(&p, AUDIT_ARCH_I386, 172, [15, 0, 0, 0, 0, 0]),
             SECCOMP_RET_ALLOW
         );
         assert_eq!(run(&p, AUDIT_ARCH_X86_64, 2), SECCOMP_RET_USER_NOTIF);
@@ -691,6 +733,7 @@ mod tests {
                 trace: &[221],
                 ns_flags: &[],
                 refused: &[],
+                dumpable: &[],
             },
             &Table {
                 abi: Abi::Arm,
@@ -698,6 +741,7 @@ mod tests {
                 trace: &[],
                 ns_flags: &[],
                 refused: &[],
+                dumpable: &[],
             },
             false,
         );
@@ -726,6 +770,7 @@ mod tests {
                 trace: &[],
                 ns_flags: &[272],
                 refused: &[],
+                dumpable: &[],
             },
             &Table {
                 abi: Abi::I386,
@@ -733,6 +778,7 @@ mod tests {
                 trace: &[],
                 ns_flags: &[],
                 refused: &[],
+                dumpable: &[],
             },
             true,
         );

@@ -606,6 +606,31 @@ fn gamepad_discovery_through_libudev() {
     );
 }
 
+/// A process that clears its dumpable flag is still served: the kernel would
+/// refuse the supervisor its memory and `/proc/<pid>/fd` from then on, so
+/// the `prctl` is answered without being done, and the flag reads back as
+/// the process set it.  Bitwarden's process isolation does this at start-up.
+#[test]
+fn undumpable_process_is_still_served() {
+    let d = tmpdir("dumpable");
+    std::fs::write(d.join("f"), "x").unwrap();
+    let bin = d.join("dumpable");
+    let cc = Command::new("cc")
+        .args(["-O1", "-o"])
+        .arg(&bin)
+        .arg(repo().join("tests/probes/dumpable.c"))
+        .arg("-lpthread")
+        .status()
+        .unwrap();
+    assert!(cc.success(), "compiling dumpable.c");
+    let args = ["-r", "/", bin.to_str().unwrap(), d.to_str().unwrap()];
+    for o in [run(&args), run_no_ptrace(&args)] {
+        let out = stdout(&o);
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(out, "dumpable=0\ndumpable=1\nok");
+    }
+}
+
 #[test]
 fn fatal_signal_report_names_the_module() {
     if no_ptrace_suite() {

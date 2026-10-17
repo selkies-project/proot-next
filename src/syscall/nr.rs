@@ -106,6 +106,7 @@ pub fn name(nr: i64) -> &'static str {
         BIND => "bind",
         EXECVE => "execve",
         UNAME => "uname",
+        PRCTL => "prctl",
         TRUNCATE => "truncate",
         GETCWD => "getcwd",
         CHDIR => "chdir",

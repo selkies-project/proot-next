@@ -323,6 +323,7 @@ fn dispatch(r: &Req, nr: i64) -> Result<Outcome> {
         REMOVEXATTR | LREMOVEXATTR => do_removexattr(r, nr == LREMOVEXATTR),
         INOTIFY_ADD_WATCH => do_inotify_add_watch(r),
         CLONE3 => direct::do_clone(r, CLONE3),
+        PRCTL => do_prctl(r),
         NAME_TO_HANDLE_AT => Ok(Outcome::Value(Err(libc::EOPNOTSUPP))),
         _ => Ok(Outcome::Continue),
     }
@@ -864,6 +865,35 @@ fn do_uname(r: &Req) -> Result<Outcome> {
     r.valid()?;
     r.write(r.arg(0), &bytes)?;
     Ok(Outcome::Value(Ok(0)))
+}
+
+/// `prctl(PR_SET_DUMPABLE)` and `PR_GET_DUMPABLE`.
+///
+/// The flag is remembered for the process and never cleared in the kernel:
+/// a non-dumpable tracee is unreachable through `process_vm_readv`,
+/// `/proc/<pid>/mem` and `/proc/<pid>/fd` for a supervisor without
+/// `CAP_SYS_PTRACE`, and every path syscall it made would fail with `EACCES`.
+/// Other options reach the handler only through a filter without the
+/// argument check and run natively.
+///
+/// # Returns
+/// `0` for a set of `0` or `1`, the remembered flag for a get.
+///
+/// # Errors
+/// `EINVAL` for a value the kernel refuses.
+fn do_prctl(r: &Req) -> Result<Outcome> {
+    let tgid = r.tgid();
+    match r.arg(0) as i32 {
+        libc::PR_SET_DUMPABLE => match r.arg(1) {
+            v @ (0 | 1) => {
+                r.ctx.set_dumpable(tgid, v == 1);
+                Ok(Outcome::Value(Ok(0)))
+            }
+            _ => Ok(Outcome::Value(Err(libc::EINVAL))),
+        },
+        libc::PR_GET_DUMPABLE => Ok(Outcome::Value(Ok(r.ctx.dumpable(tgid) as i64))),
+        _ => Ok(Outcome::Continue),
+    }
 }
 
 /// The identity syscalls under `-0`, over the process's virtual [`crate::procs::Ids`].

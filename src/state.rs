@@ -178,6 +178,16 @@ impl Ctx {
         self.procs.set_ids(tid, ids);
     }
 
+    /// Whether the process of thread `tid` still reads as dumpable.
+    pub fn dumpable(&self, tid: i32) -> bool {
+        self.procs.dumpable(tid)
+    }
+
+    /// Records the dumpable flag the process of thread `tid` set.
+    pub fn set_dumpable(&self, tid: i32, dumpable: bool) {
+        self.procs.set_dumpable(tid, dumpable);
+    }
+
     /// Supplementary groups of the process of thread `tid`, if `setgroups` was called.
     pub fn groups(&self, tid: i32) -> Option<Vec<u32>> {
         self.procs.groups(tid)

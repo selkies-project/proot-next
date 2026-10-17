@@ -95,6 +95,16 @@ pub const NO_PTRACE_SYSCALLS: &[i64] = &[
 /// inspected by a handler instead; `setns` is refused outright.
 pub const NAMESPACE_FLAG_SYSCALLS: &[i64] = &[CLONE, UNSHARE];
 
+/// Syscalls whose dumpable-flag operations go to the listener.
+///
+/// A process that clears its dumpable flag closes `process_vm_readv`,
+/// `/proc/<pid>/mem` and `/proc/<pid>/fd` to everyone without
+/// `CAP_SYS_PTRACE`, the supervisor included, and every later path syscall
+/// would fail with `EACCES`.  The filter routes `prctl(PR_SET_DUMPABLE)` and
+/// `PR_GET_DUMPABLE` here, where the flag is remembered instead of changed;
+/// every other `prctl` runs natively.
+pub const DUMPABLE_SYSCALLS: &[i64] = &[PRCTL];
+
 /// Syscalls refused with `EPERM` unconditionally.
 pub const REFUSED_SYSCALLS: &[i64] = &[SETNS];
 

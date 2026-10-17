@@ -31,8 +31,8 @@ use crate::seccomp::{filter, notify};
 use crate::state::Ctx;
 use crate::sys::{errno, strerror};
 use crate::syscall::{
-    NAMESPACE_FLAG_SYSCALLS, NO_PTRACE_SYSCALLS, NOTIFY_SYSCALLS, REFUSED_SYSCALLS, TRACE_SYSCALLS, direct,
-    nr,
+    DUMPABLE_SYSCALLS, NAMESPACE_FLAG_SYSCALLS, NO_PTRACE_SYSCALLS, NOTIFY_SYSCALLS, REFUSED_SYSCALLS,
+    TRACE_SYSCALLS, direct, nr,
 };
 use crate::tracee::ptrace;
 use crate::tracer;
@@ -120,6 +120,10 @@ pub fn run(config: Config) -> Result<i32, String> {
         .filter(|nr| !notify_list.contains(nr))
         .collect();
     let (ns64, ns32) = (native.numbers_for(&ns_list), compat.numbers_for(&ns_list));
+    let (dumpable64, dumpable32) = (
+        native.numbers_for(DUMPABLE_SYSCALLS),
+        compat.numbers_for(DUMPABLE_SYSCALLS),
+    );
     let (refused64, refused32) = (
         native.numbers_for(REFUSED_SYSCALLS),
         compat.numbers_for(REFUSED_SYSCALLS),
@@ -138,6 +142,7 @@ pub fn run(config: Config) -> Result<i32, String> {
                 trace: &trapped64,
                 ns_flags: &ns64,
                 refused: &refused64,
+                dumpable: &dumpable64,
             },
             &filter::Table {
                 abi: compat,
@@ -145,6 +150,7 @@ pub fn run(config: Config) -> Result<i32, String> {
                 trace: &trapped32,
                 ns_flags: &ns32,
                 refused: &refused32,
+                dumpable: &dumpable32,
             },
         )
     } else {
@@ -155,6 +161,7 @@ pub fn run(config: Config) -> Result<i32, String> {
                 trace: &trace64,
                 ns_flags: &ns64,
                 refused: &refused64,
+                dumpable: &dumpable64,
             },
             &filter::Table {
                 abi: compat,
@@ -162,6 +169,7 @@ pub fn run(config: Config) -> Result<i32, String> {
                 trace: &trace32,
                 ns_flags: &ns32,
                 refused: &refused32,
+                dumpable: &dumpable32,
             },
             no_ptrace,
         )

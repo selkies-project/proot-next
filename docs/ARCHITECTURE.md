@@ -509,6 +509,16 @@ the virtual ids.
 them), `/proc/<pid>/mem` otherwise, opened per access so a stale descriptor
 never reads a pre-exec address space.
 
+Both, and the `/proc/<pid>/fd` links the handlers resolve descriptors
+through, pass the kernel's ptrace access check, which a tracee closes to
+everyone without `CAP_SYS_PTRACE` by clearing its dumpable flag
+(`prctl(PR_SET_DUMPABLE, 0)`, what Bitwarden's process isolation and
+Chromium's sandbox do): every path syscall after it got `EACCES`, Bitwarden
+could not open its log or create a thread.  The filter sends that `prctl`
+and `PR_GET_DUMPABLE` to the listener, which records the value per process
+and answers without clearing anything; an exec resets the record as the
+kernel resets the flag.  Every other `prctl` option runs natively.
+
 ## Measurements
 
 `bench/run.sh` builds `bench/sysbench.c`, runs it natively and under one or

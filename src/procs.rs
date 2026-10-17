@@ -66,6 +66,10 @@ pub struct TraceeInfo {
     pub vfork_parent: Option<i32>,
     /// The view this process lives in; `None` for the root view.
     pub view: Option<Arc<View>>,
+    /// Set when the process cleared its dumpable flag with `prctl`, which the
+    /// supervisor answers without doing; an exec resets it as the kernel
+    /// resets the flag.
+    pub undumpable: bool,
     /// Arguments that stand in `/proc/<pid>/cmdline` before the kernel's
     /// `argv[1..]`: the interpreter, its argument and the script of a `#!`
     /// program the guest-stub trampoline loaded, where the kernel's file
@@ -272,7 +276,18 @@ impl ProcTable {
         self.update(tid, |t| {
             t.exe_guest = Some(guest);
             t.exe_host = Some(host);
+            t.undumpable = false;
         });
+    }
+
+    /// Whether the process of thread `tid` still reads as dumpable.
+    pub fn dumpable(&self, tid: i32) -> bool {
+        !self.info(tid).undumpable
+    }
+
+    /// Records the dumpable flag the process of thread `tid` set.
+    pub fn set_dumpable(&self, tid: i32, dumpable: bool) {
+        self.update(tid, |t| t.undumpable = !dumpable);
     }
 
     /// The recorded guest program of thread `tid`, if any.
