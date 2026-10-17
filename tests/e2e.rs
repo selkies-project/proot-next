@@ -331,6 +331,16 @@ fn programs_keep_their_name() {
 }
 
 #[test]
+fn execs_carry_arguments_and_environment_entries_longer_than_a_path() {
+    let p = proot();
+    let p = p.to_str().unwrap();
+    let big = "x".repeat(8192);
+    let script = format!("BIG={big} {p} -r / /bin/sh -c 'echo ${{#BIG}}'; /bin/echo {big} | wc -c");
+    let o = run(&["-r", "/", "/bin/sh", "-c", &script]);
+    assert_eq!(stdout(&o), "8192\n8193", "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
 fn bwrap_mode_builds_a_container() {
     let d = tmpdir("bwrap");
     let bwrap = d.join("bwrap");

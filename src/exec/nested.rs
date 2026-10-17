@@ -34,6 +34,7 @@ use crate::fs::translate::{detranslate_path, guest_cwd, read_link, translate_pat
 use crate::note;
 use crate::state::{Ctx, View};
 use crate::sys::Result;
+use crate::tracee::mem::MAX_ARG_STRLEN;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::{Arc, OnceLock};
@@ -526,7 +527,7 @@ fn read_env(ctx: &Ctx, pid: u32, envp: u64, ptr_size: usize) -> Result<Vec<(Vec<
     let ptrs = ctx.mem.read_ptr_array_sized(pid, envp, MAX_ENV, ptr_size)?;
     let mut out = Vec::with_capacity(ptrs.len());
     for p in ptrs {
-        let entry = ctx.mem.read_cstr(pid, p)?;
+        let entry = ctx.mem.read_string(pid, p, MAX_ARG_STRLEN)?;
         match entry.iter().position(|&b| b == b'=') {
             Some(i) => out.push((entry[..i].to_vec(), entry[i + 1..].to_vec())),
             None => out.push((entry, Vec::new())),

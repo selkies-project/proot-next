@@ -38,6 +38,7 @@ use crate::procs::PendingExec;
 use crate::state::{Ctx, View};
 use crate::sys::Result;
 use crate::syscall::nr::EXECVEAT;
+use crate::tracee::mem::MAX_ARG_STRLEN;
 use crate::tracee::regs::Regs;
 use elf::FileKind;
 use nested::EnvSource;
@@ -401,7 +402,9 @@ pub fn read_argv(ctx: &Ctx, pid: u32, argv_ptr: u64, ptr_size: usize) -> Result<
         return Ok(Vec::new());
     }
     let ptrs = ctx.mem.read_ptr_array_sized(pid, argv_ptr, MAX_ARGV, ptr_size)?;
-    ptrs.iter().map(|&p| ctx.mem.read_cstr(pid, p)).collect()
+    ptrs.iter()
+        .map(|&p| ctx.mem.read_string(pid, p, MAX_ARG_STRLEN))
+        .collect()
 }
 
 /// Prints the rewritten exec when `PROOT_EXEC_DEBUG` is set.

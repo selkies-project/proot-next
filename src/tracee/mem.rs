@@ -11,6 +11,11 @@
 //! supervisor's own mapping of it, and every other address is `EFAULT`.
 
 use crate::sys::{PATH_MAX, Result, errno};
+
+/// The kernel's limit on one argument or environment string of an exec
+/// (`MAX_ARG_STRLEN`, 32 pages): a longer one fails the exec with `E2BIG`
+/// before any supervisor sees it.
+pub const MAX_ARG_STRLEN: usize = 32 * 4096;
 use std::ffi::CString;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -187,10 +192,7 @@ impl Mem {
         }
     }
 
-    /// Reads a NUL-terminated string of at most `PATH_MAX - 1` bytes.
-    ///
-    /// Reads stop at page boundaries so a short string next to an unmapped
-    /// page does not fault.
+    /// Reads a NUL-terminated path of at most `PATH_MAX - 1` bytes.
     ///
     /// # Arguments
     /// * `pid` - Tracee thread id.
@@ -202,11 +204,32 @@ impl Mem {
     /// # Errors
     /// `ENAMETOOLONG` when no NUL is found within `PATH_MAX`, `EFAULT` otherwise.
     pub fn read_cstr(&self, pid: u32, addr: u64) -> Result<Vec<u8>> {
+        self.read_string(pid, addr, PATH_MAX)
+    }
+
+    /// Reads a NUL-terminated string of fewer than `max` bytes.
+    ///
+    /// Reads stop at page boundaries so a short string next to an unmapped
+    /// page does not fault.  An argument or environment entry of an exec is
+    /// read with [`MAX_ARG_STRLEN`], the kernel's own limit for one such
+    /// string; a path with `PATH_MAX`.
+    ///
+    /// # Arguments
+    /// * `pid` - Tracee thread id.
+    /// * `addr` - Address of the first byte.
+    /// * `max` - Length at which the read gives up.
+    ///
+    /// # Returns
+    /// The bytes before the NUL.
+    ///
+    /// # Errors
+    /// `ENAMETOOLONG` when no NUL is found within `max` bytes, `EFAULT` otherwise.
+    pub fn read_string(&self, pid: u32, addr: u64, max: usize) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(256);
         let mut cur = addr;
         let mut chunk = [0u8; 4096];
-        while out.len() < PATH_MAX {
-            let to_page = (4096 - (cur & 4095) as usize).min(PATH_MAX - out.len());
+        while out.len() < max {
+            let to_page = (4096 - (cur & 4095) as usize).min(max - out.len());
             let n = self.read(pid, cur, &mut chunk[..to_page])?;
             if n == 0 {
                 return Err(libc::EFAULT);
