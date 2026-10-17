@@ -424,6 +424,28 @@ fn bound_files_show_in_directory_listings() {
     assert_eq!(std::fs::read(d.join("icd.json")).unwrap(), b"{\"nvidia\":1}");
 }
 
+/// A binding whose guest path runs through a symlink of the rootfs is found
+/// under the canonical path lookups resolve to.  Steam's 32-bit reaper asks
+/// for `/lib/ld-linux.so.2` on a merged-usr host where `/lib` points to
+/// `usr/lib`, and the loader bound there was never matched.
+#[test]
+fn binding_given_through_a_symlink_matches_canonical_lookups() {
+    let d = tmpdir("symlink-bind");
+    std::fs::create_dir_all(d.join("real")).unwrap();
+    std::os::unix::fs::symlink("real", d.join("link")).unwrap();
+    std::fs::write(d.join("src.txt"), "hello\n").unwrap();
+    let file_bind = format!("{0}/src.txt:{0}/link/x.txt", d.display());
+    let script = format!("cat {0}/link/x.txt {0}/real/x.txt; ls {0}/real", d.display());
+    let o = run(&["-r", "/", "-b", &file_bind, "/bin/sh", "-c", &script]);
+    assert_eq!(
+        stdout(&o),
+        "hello\nhello\nx.txt",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(!d.join("real/x.txt").exists());
+}
+
 /// A bwrap file bind inside a directory bind lists in that directory, as
 /// the mount point bubblewrap creates would make it.
 #[test]

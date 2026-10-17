@@ -251,18 +251,22 @@ mod tests {
             ],
         );
         let made = create(&fs_view);
-        assert_eq!(
-            made,
-            vec![Placeholder {
-                path: root.join("ro"),
-                dir: true
-            }]
-        );
+        assert!(made.contains(&Placeholder {
+            path: root.join("ro"),
+            dir: true
+        }));
+        assert!(made.iter().all(|p| p.path.starts_with(&root)));
         assert!(!outside.join("escape").exists());
+        assert!(
+            root.join(outside.strip_prefix("/").unwrap())
+                .join("escape")
+                .is_file()
+        );
         assert!(!ro.join("inner").exists());
         assert!(!root.join("etc/missing").exists());
         assert_eq!(fs::read(root.join("etc/hosts")).unwrap(), b"real");
         remove(&made);
+        assert!(!root.join("tmp").exists());
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -118,14 +118,45 @@ impl Fs {
         bindings.reverse();
         bindings.sort_by_key(|b| std::cmp::Reverse(b.guest.len()));
         let identity = root == b"/" && bindings.iter().all(|b| b.host == b.guest);
-        Fs {
+        let mut fs = Fs {
             root,
             bindings,
             identity,
             id: NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed),
             cache,
             procs,
+        };
+        fs.canonicalize_bindings();
+        fs
+    }
+
+    /// Rewrites every binding's guest path to the canonical form lookups use.
+    ///
+    /// A lookup is canonicalized through the view before the binding table is
+    /// consulted, so a guest path given through a symlink of the rootfs, such
+    /// as `/lib/ld-linux.so.2` on a merged-usr host where `/lib` points to
+    /// `usr/lib`, would never match unless the table holds the
+    /// `/usr/lib/ld-linux.so.2` the lookup resolves to.  The final component
+    /// is kept as given, and a path whose intermediate components are missing
+    /// stays lexical, as the walk stops there.  The table is re-sorted and the
+    /// identity flag recomputed when anything changed.
+    fn canonicalize_bindings(&mut self) {
+        let canonical: Vec<Vec<u8>> = self
+            .bindings
+            .iter()
+            .map(|b| match super::canon::canonicalize(self, 0, &b.guest, false) {
+                Ok(c) => trim_slashes(c),
+                Err(_) => b.guest.clone(),
+            })
+            .collect();
+        if self.bindings.iter().zip(&canonical).all(|(b, c)| b.guest == *c) {
+            return;
         }
+        for (b, c) in self.bindings.iter_mut().zip(canonical) {
+            b.guest = c;
+        }
+        self.bindings.sort_by_key(|b| std::cmp::Reverse(b.guest.len()));
+        self.identity = self.root == b"/" && self.bindings.iter().all(|b| b.host == b.guest);
     }
 
     /// Whether `guest` is a canonical directory the cache has seen in this view.

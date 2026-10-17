@@ -428,7 +428,10 @@ walks a guest path component by component, lstat-ing the host side and
 re-entering symlink targets as guest paths, so a link inside the rootfs can
 never escape it.  `fs/translate.rs` resolves `dirfd`-relative paths by reading
 the descriptor's path from `/proc/<pid>/fd` and detranslating it, then
-canonicalizes the joined guest path.
+canonicalizes the joined guest path.  A binding's guest path is canonicalized
+the same way when the view is built, final component kept as given, so a
+path named through a symlink of the rootfs (`/lib/ld-linux.so.2` on a
+merged-usr host) lands on the entry lookups resolve to.
 
 ## Mount points
 
