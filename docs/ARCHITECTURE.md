@@ -83,7 +83,10 @@ from the exec), and `--args`, `--file` and `--seccomp` descriptors are read
 through `/proc/<pid>/fd`.  The root and the host side of every binding are
 translated through the requester's view, so the result is a flat table in
 host terms: a nested view can see no more than the view it was asked from,
-and a third level composes the same way.  The table, with the launch's
+and a third level composes the same way.  The requester's bindings beneath a
+nested bind are carried along under it, as a recursive bind mount carries
+submounts, while a nested root stays the plain directory it names: pressure-vessel binds the host `/` at `/run/host` and
+points the container's 32-bit loader at the one it finds there.  The table, with the launch's
 `-k`/`-0`/`--hostname` values, is a `View` (`state.rs`); each process record
 holds an `Arc` to its view, inherited at fork, and the directory cache is
 shared across views and keyed by view.

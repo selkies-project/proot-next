@@ -27,7 +27,9 @@
 
 use super::{ExecPlan, Trampoline};
 use crate::cli::{self, CliError, host::Host};
-use crate::config::Config;
+use crate::config::{Binding, Config};
+use crate::fs::Fs;
+use crate::fs::binding::{is_prefix, join_prefix, rest_after};
 use crate::fs::translate::{detranslate_path, guest_cwd, read_link, translate_path};
 use crate::note;
 use crate::state::{Ctx, View};
@@ -246,6 +248,7 @@ pub fn plan(
     if !uname_served {
         config.hostname = None;
     }
+    compose_sub_bindings(&view.fs, &mut config);
     let keep = std::env::var_os("PROOT_BWRAP_KEEP").is_some();
     let nested = Arc::new(View::new(&config, ctx.procs.clone(), ctx.cache.clone(), !keep));
     note!(
@@ -329,6 +332,43 @@ pub fn plan(
 
 /// Adds what the nested command line asks the trampoline to do before the exec.
 ///
+/// Carries the requester's bindings beneath a nested bind along with it, the
+/// way a recursive bind mount carries the submounts under its source.
+///
+/// The front ends translate the host side of every nested binding through
+/// the requester's view, which flattens the table to one host path per entry
+/// and drops whatever the requester had bound further down.  pressure-vessel
+/// binds the host `/` at `/run/host` and, finding a 32-bit loader at the
+/// host's `/usr/lib/ld-linux.so.2` (one the outer launch bound there),
+/// symlinks the container's `/lib/ld-linux.so.2` to it; without the outer
+/// binding carried under `/run/host` that link dangles and no 32-bit program
+/// in the container can execute.  The nested root is left alone: it is a
+/// plain directory, as PRoot's rootfs is, not a bind of the requester's `/`.
+///
+/// # Arguments
+/// * `outer` - The requester's view.
+/// * `config` - The parsed nested launch, whose bindings already name host
+///   paths; bindings found beneath them are appended.
+fn compose_sub_bindings(outer: &Fs, config: &mut Config) {
+    let targets: Vec<(Vec<u8>, Vec<u8>, bool)> = config
+        .bindings
+        .iter()
+        .map(|b| (b.host.clone(), b.guest.clone(), b.read_only))
+        .collect();
+    for (host, guest, read_only) in targets {
+        let source = detranslate_path(outer, &host);
+        for b in &outer.bindings {
+            if b.guest != source && is_prefix(&source, &b.guest) {
+                config.bindings.push(Binding {
+                    host: b.host.clone(),
+                    guest: join_prefix(&guest, rest_after(&source, &b.guest)),
+                    read_only: read_only || b.read_only,
+                });
+            }
+        }
+    }
+}
+
 /// A plan that already carries a trampoline (a launch nested inside the
 /// nested one) keeps the innermost view and gets the outer launch's
 /// process setup on top; the innermost environment wins when both set one.

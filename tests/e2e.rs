@@ -446,6 +446,35 @@ fn binding_given_through_a_symlink_matches_canonical_lookups() {
     assert!(!d.join("real/x.txt").exists());
 }
 
+/// A nested bwrap bind of a directory carries the outer launch's bindings
+/// beneath it, as a recursive bind mount carries submounts.  pressure-vessel
+/// binds the host `/` at `/run/host` and points the container's 32-bit
+/// loader at the one it finds there, which the outer launch bound in.
+#[test]
+fn nested_bind_carries_outer_bindings_beneath_its_source() {
+    if no_ptrace_suite() {
+        return;
+    }
+    let d = tmpdir("nested-sub-bind");
+    let bwrap = d.join("bwrap");
+    std::os::unix::fs::symlink(proot(), &bwrap).unwrap();
+    std::fs::create_dir_all(d.join("real")).unwrap();
+    std::fs::write(d.join("src.txt"), "hello\n").unwrap();
+    let file_bind = format!("{0}/src.txt:{0}/real/x.txt", d.display());
+    let script = format!(
+        "{0} --bind / / --bind / /run/host -- /bin/sh -c 'cat /run/host{1}/real/x.txt {1}/real/x.txt'",
+        bwrap.display(),
+        d.display()
+    );
+    let o = run(&["-r", "/", "-b", &file_bind, "/bin/sh", "-c", &script]);
+    assert_eq!(
+        stdout(&o),
+        "hello\nhello",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
 /// A bwrap file bind inside a directory bind lists in that directory, as
 /// the mount point bubblewrap creates would make it.
 #[test]
