@@ -6,6 +6,15 @@
 //! descriptor.  The kernel never sees an untranslated guest path for the
 //! syscalls routed here.
 //!
+//! The syscall is made on what the walk resolved, not on a host path string
+//! the kernel would walk again: the `*at` form relative to the pinned parent
+//! directory with `O_NOFOLLOW`/`AT_SYMLINK_NOFOLLOW`, since the walk already
+//! followed a final symlink when asked to.  A symlink found at that point was
+//! swapped in by the guest after the walk; the handler then walks again, a
+//! few times, so the link is resolved inside the guest namespace, and gives
+//! up with `ELOOP`.  Syscalls without a `dirfd` form act on the object's
+//! `/proc/self/fd/<n>`, which the kernel resolves to the open inode.
+//!
 //! Every notification is answered exactly once.  After tracee memory has been
 //! read and before anything irreversible happens, the notification id is
 //! re-validated; a stale id (the tracee died or was interrupted by a signal)
@@ -13,7 +22,8 @@
 
 use crate::abi::{Abi, Variant};
 use crate::fs::Fs;
-use crate::fs::translate::{detranslate_path, guest_cwd, read_link, translate_path};
+use crate::fs::canon::{RETRY, Resolved, fd_path, readlinkat};
+use crate::fs::translate::{detranslate_path, guest_cwd, read_link, translate};
 use crate::note;
 use crate::seccomp::notify::{reply, reply_continue, reply_fd, still_valid};
 use crate::state::{Ctx, View};
@@ -22,11 +32,17 @@ use crate::syscall::direct;
 use crate::syscall::nr::*;
 use std::cell::OnceCell;
 use std::ffi::CString;
+use std::io::Read;
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
 /// Sentinel errno meaning "the notification is stale, do not answer".
 const DROPPED: Errno = -1;
+
+/// Walks of one call after a swapped-in symlink was found where the walk
+/// had followed none, before the call fails with `ELOOP`.
+const RETRIES: u32 = 3;
 
 /// Largest extended attribute value or list we shuttle through.
 const XATTR_MAX: usize = 65536;
@@ -110,18 +126,18 @@ impl<'a> Req<'a> {
         Ok(rewrite_proc_self(&raw, self.pid))
     }
 
-    /// Translates `path` relative to `dirfd` into a host path.
-    pub fn translate(&self, dirfd: i32, path: &[u8], deref_final: bool) -> Result<Vec<u8>> {
-        let host = translate_path(self.fs(), self.pid, dirfd, path, deref_final)?;
+    /// Translates `path` relative to `dirfd` into the object to act on.
+    pub fn translate(&self, dirfd: i32, path: &[u8], deref_final: bool) -> Result<Resolved> {
+        let resolved = translate(self.fs(), self.pid, dirfd, path, deref_final)?;
         note!(
             self.ctx,
             2,
             "pid {} {} -> {}",
             self.pid,
             String::from_utf8_lossy(path),
-            String::from_utf8_lossy(&host)
+            String::from_utf8_lossy(&resolved.host)
         );
-        Ok(host)
+        Ok(resolved)
     }
 
     /// Re-validates the notification; `Err(DROPPED)` when the tracee is gone.
@@ -133,10 +149,9 @@ impl<'a> Req<'a> {
         }
     }
 
-    /// Refuses with `EROFS` when `host` lies under a read-only binding.
-    pub fn check_writable(&self, host: &[u8]) -> Result<()> {
-        let guest = detranslate_path(self.fs(), host);
-        match self.fs().binding_for_guest(&guest) {
+    /// Refuses with `EROFS` when the resolved path lies under a read-only binding.
+    pub fn check_writable(&self, resolved: &Resolved) -> Result<()> {
+        match self.fs().binding_for_guest(&resolved.guest) {
             Some(b) if b.read_only => Err(libc::EROFS),
             _ => Ok(()),
         }
@@ -396,10 +411,41 @@ fn proc_magic_link(guest: &[u8]) -> Option<(i32, bool)> {
     }
 }
 
-/// Whether `host` names a FIFO; opening one may block the supervisor.
-fn is_fifo(host: &CString) -> bool {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    unsafe { libc::stat(host.as_ptr(), &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO }
+/// Runs a handler again while it reports a swapped-in symlink ([`RETRY`]).
+fn retrying<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
+    for _ in 0..RETRIES {
+        match f() {
+            Err(RETRY) => continue,
+            r => return r,
+        }
+    }
+    Err(libc::ELOOP)
+}
+
+/// Whether the resolved object is a FIFO; opening one may block the supervisor.
+fn is_fifo(resolved: &Resolved) -> bool {
+    resolved
+        .mode_nofollow()
+        .is_ok_and(|m| m & libc::S_IFMT == libc::S_IFIFO)
+}
+
+/// Reads all of an open descriptor without taking ownership of it.
+fn read_all(fd: i32) -> Result<Vec<u8>> {
+    let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    let mut out = Vec::new();
+    (&*file)
+        .read_to_end(&mut out)
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+    Ok(out)
+}
+
+/// The `AT_SYMLINK_NOFOLLOW` bit to pass for an act on a resolved path.
+fn nofollow_flag(nofollow: bool) -> i64 {
+    if nofollow {
+        libc::AT_SYMLINK_NOFOLLOW as i64
+    } else {
+        0
+    }
 }
 
 /// Reads a `struct timeval[2]` from the tracee and converts it to 64-bit timespecs.
@@ -443,11 +489,12 @@ fn timespecs_from_tracee(r: &Req, addr: u64) -> Result<Option<[u8; 32]>> {
     Ok(Some(ts))
 }
 
-/// Runs `utimensat(2)` on a host path with an optional timespec pair.
-fn host_utimensat(host: &[u8], times: Option<&[u8; 32]>, flags: i64) -> Result<i64> {
-    let c = cstr(host)?;
+/// Runs `utimensat(2)` on a resolved path with an optional timespec pair.
+fn host_utimensat(r: &Req, resolved: &Resolved, times: Option<&[u8; 32]>, nofollow: bool) -> Result<i64> {
+    r.check_writable(resolved)?;
+    let (dfd, c, nofollow) = resolved.at(nofollow)?;
     let tp = times.map(|t| t.as_ptr()).unwrap_or(std::ptr::null());
-    check(unsafe { libc::syscall(libc::SYS_utimensat, libc::AT_FDCWD, c.as_ptr(), tp, flags) })
+    check(unsafe { libc::syscall(libc::SYS_utimensat, dfd, c.as_ptr(), tp, nofollow_flag(nofollow)) })
 }
 
 /// Deref policy derived from `AT_SYMLINK_NOFOLLOW`.
@@ -473,58 +520,57 @@ fn do_open(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64, mode: i
     }
     let o_excl_create = flags & libc::O_CREAT as i64 != 0 && flags & libc::O_EXCL as i64 != 0;
     let deref = flags & libc::O_NOFOLLOW as i64 == 0 && !o_excl_create;
-    let host = r.translate(dirfd, path, deref)?;
-    r.valid()?;
-    if flags & WRITE_INTENT != 0 {
-        r.check_writable(&host)?;
-    }
-    let c = cstr(&host)?;
-    if host == path && is_fifo(&c) {
-        // Identity path: let the tracee block on the FIFO itself rather than us.
-        return Ok(Outcome::Continue);
-    }
-    if flags & WRITE_INTENT == 0
-        && let Some(fd) =
-            fake_proc_status(&host, fake_ids_for_status(r, &host))?.or(fake_proc_cmdline(r.ctx, &host)?)
-    {
-        return Ok(Outcome::Fd {
-            fd,
-            cloexec: flags & libc::O_CLOEXEC as i64 != 0,
-        });
-    }
-    let fd = check(unsafe {
-        libc::syscall(
-            libc::SYS_openat,
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            flags | libc::O_CLOEXEC as i64,
-            mode,
-        )
-    })?;
-    Ok(Outcome::Fd {
-        fd: fd as i32,
-        cloexec: flags & libc::O_CLOEXEC as i64 != 0,
+    let cloexec = flags & libc::O_CLOEXEC as i64 != 0;
+    retrying(|| {
+        let resolved = r.translate(dirfd, path, deref)?;
+        r.valid()?;
+        if flags & WRITE_INTENT != 0 {
+            r.check_writable(&resolved)?;
+        }
+        if resolved.host == path && is_fifo(&resolved) {
+            // Identity path: let the tracee block on the FIFO itself rather than us.
+            return Ok(Outcome::Continue);
+        }
+        let (dfd, c, nofollow) = resolved.at(!deref)?;
+        let host_flags = flags | libc::O_CLOEXEC as i64 | if nofollow { libc::O_NOFOLLOW as i64 } else { 0 };
+        let fd = match check(unsafe { libc::syscall(libc::SYS_openat, dfd, c.as_ptr(), host_flags, mode) }) {
+            // A symlink where the walk followed none: swapped in since.
+            Err(libc::ELOOP) if deref && resolved.pinned() => return Err(RETRY),
+            rc => rc? as i32,
+        };
+        if flags & WRITE_INTENT == 0 {
+            match fake_proc_file(r, &resolved.host, fd) {
+                Ok(Some(fake)) => {
+                    unsafe { libc::close(fd) };
+                    return Ok(Outcome::Fd { fd: fake, cloexec });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    unsafe { libc::close(fd) };
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Outcome::Fd { fd, cloexec })
     })
 }
 
-/// Serves `/proc/<pid>/status` with our own pid hidden from `TracerPid` and,
-/// under `-0`, root in the `Uid`/`Gid` lines.
-///
-/// Programs read that field to decide whether a debugger is attached and may
-/// change behaviour or trap when it is.  A transparent supervisor must not
-/// show up there, so the file is copied into a memfd with the field zeroed.
+/// Serves an opened `/proc/<pid>/status` or `cmdline` from a rewritten copy.
 ///
 /// # Arguments
-/// * `host` - Translated host path about to be opened.
+/// * `host` - Host path of the opened file, which tells which it is.
+/// * `fd` - The open descriptor, read and left at its start when no copy is made.
 ///
 /// # Returns
-/// A descriptor on the rewritten copy, or `None` when the path is not a status file.
-fn fake_proc_status(host: &[u8], fake_root: Option<crate::procs::Ids>) -> Result<Option<i32>> {
+/// A descriptor on the copy, or `None` when the file is neither or needs no rewrite.
+fn fake_proc_file(r: &Req, host: &[u8], fd: i32) -> Result<Option<i32>> {
     let Some(rest) = host.strip_prefix(b"/proc/") else {
         return Ok(None);
     };
-    let Some(rest) = rest.strip_suffix(b"/status") else {
-        return Ok(None);
+    let (rest, status) = match (rest.strip_suffix(b"/status"), rest.strip_suffix(b"/cmdline")) {
+        (Some(p), _) => (p, true),
+        (_, Some(p)) => (p, false),
+        _ => return Ok(None),
     };
     let is_num = |b: &[u8]| !b.is_empty() && b.iter().all(|c| c.is_ascii_digit());
     let ok = match rest.splitn(3, |&c| c == b'/').collect::<Vec<_>>().as_slice() {
@@ -535,8 +581,32 @@ fn fake_proc_status(host: &[u8], fake_root: Option<crate::procs::Ids>) -> Result
     if !ok {
         return Ok(None);
     }
-    let text = std::fs::read(std::ffi::OsStr::from_bytes(host))
-        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+    let text = read_all(fd)?;
+    let fake = if status {
+        Some(fake_proc_status(&text, fake_ids_for_status(r, host))?)
+    } else {
+        fake_proc_cmdline(r.ctx, rest, &text)?
+    };
+    if fake.is_none() {
+        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+    }
+    Ok(fake)
+}
+
+/// Serves `/proc/<pid>/status` with our own pid hidden from `TracerPid` and,
+/// under `-0`, root in the `Uid`/`Gid` lines.
+///
+/// Programs read that field to decide whether a debugger is attached and may
+/// change behaviour or trap when it is.  A transparent supervisor must not
+/// show up there, so the file is copied into a memfd with the field zeroed.
+///
+/// # Arguments
+/// * `text` - The file as the kernel gives it.
+/// * `fake_root` - The virtual identity to show, under `-0`.
+///
+/// # Returns
+/// A descriptor on the rewritten copy.
+fn fake_proc_status(text: &[u8], fake_root: Option<crate::procs::Ids>) -> Result<i32> {
     let me = format!("TracerPid:\t{}\n", std::process::id()).into_bytes();
     let mut out = Vec::with_capacity(text.len());
     for line in text.split_inclusive(|&c| c == b'\n') {
@@ -556,7 +626,7 @@ fn fake_proc_status(host: &[u8], fake_root: Option<crate::procs::Ids>) -> Result
             out.extend_from_slice(line);
         }
     }
-    Ok(Some(readonly_memfd("proc-status", &out)?))
+    readonly_memfd("proc-status", &out)
 }
 
 /// Serves `/proc/<pid>/cmdline` as the process was started, without the
@@ -574,32 +644,16 @@ fn fake_proc_status(host: &[u8], fake_root: Option<crate::procs::Ids>) -> Result
 ///
 /// # Arguments
 /// * `ctx` - Shared supervisor state.
-/// * `host` - Translated host path about to be opened.
+/// * `rest` - The `<pid>` or `<pid>/task/<tid>` of the path.
+/// * `text` - The file as the kernel gives it.
 ///
 /// # Returns
-/// A descriptor on the rewritten copy, or `None` when the path is not a
-/// cmdline file or the file carries no loader prefix.
+/// A descriptor on the rewritten copy, or `None` when the file carries no
+/// loader prefix.
 ///
 /// # Errors
-/// An errno when the file cannot be read or the copy made.
-fn fake_proc_cmdline(ctx: &Ctx, host: &[u8]) -> Result<Option<i32>> {
-    let Some(rest) = host.strip_prefix(b"/proc/") else {
-        return Ok(None);
-    };
-    let Some(rest) = rest.strip_suffix(b"/cmdline") else {
-        return Ok(None);
-    };
-    let is_num = |b: &[u8]| !b.is_empty() && b.iter().all(|c| c.is_ascii_digit());
-    let ok = match rest.splitn(3, |&c| c == b'/').collect::<Vec<_>>().as_slice() {
-        [pid] => is_num(pid),
-        [pid, b"task", tid] => is_num(pid) && is_num(tid),
-        _ => false,
-    };
-    if !ok {
-        return Ok(None);
-    }
-    let text = std::fs::read(std::ffi::OsStr::from_bytes(host))
-        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+/// An errno when the copy cannot be made.
+fn fake_proc_cmdline(ctx: &Ctx, rest: &[u8], text: &[u8]) -> Result<Option<i32>> {
     let args: Vec<&[u8]> = text.split(|&c| c == 0).collect();
     if ctx.trap_mode() {
         let pid: i32 = std::str::from_utf8(rest.split(|&c| c == b'/').next().unwrap_or_default())
@@ -675,7 +729,6 @@ fn do_openat2(r: &Req) -> Result<Outcome> {
     let flags = r
         .abi
         .open_flags_to_host(u64::from_ne_bytes(how[0..8].try_into().unwrap()) as i64);
-    how[0..8].copy_from_slice(&(flags as u64).to_ne_bytes());
     if flags & libc::O_PATH as i64 != 0 {
         // An O_PATH descriptor cannot be injected; ENOSYS makes callers fall
         // back to openat(2), which the filter routes to the ptrace tier.
@@ -683,24 +736,26 @@ fn do_openat2(r: &Req) -> Result<Outcome> {
     }
     let o_excl_create = flags & libc::O_CREAT as i64 != 0 && flags & libc::O_EXCL as i64 != 0;
     let deref = flags & libc::O_NOFOLLOW as i64 == 0 && !o_excl_create;
-    let host = r.translate(r.dirfd(0), &path, deref)?;
-    r.valid()?;
-    if flags & WRITE_INTENT != 0 {
-        r.check_writable(&host)?;
-    }
-    let c = cstr(&host)?;
-    let fd = check(unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            how.as_ptr(),
-            24usize,
-        )
-    })?;
-    Ok(Outcome::Fd {
-        fd: fd as i32,
-        cloexec: flags & libc::O_CLOEXEC as i64 != 0,
+    retrying(|| {
+        let resolved = r.translate(r.dirfd(0), &path, deref)?;
+        r.valid()?;
+        if flags & WRITE_INTENT != 0 {
+            r.check_writable(&resolved)?;
+        }
+        let (dfd, c, nofollow) = resolved.at(!deref)?;
+        let mut how = how;
+        let host_flags = flags | if nofollow { libc::O_NOFOLLOW as i64 } else { 0 };
+        how[0..8].copy_from_slice(&(host_flags as u64).to_ne_bytes());
+        let fd = match check(unsafe {
+            libc::syscall(libc::SYS_openat2, dfd, c.as_ptr(), how.as_ptr(), 24usize)
+        }) {
+            Err(libc::ELOOP) if deref && resolved.pinned() => return Err(RETRY),
+            rc => rc? as i32,
+        };
+        Ok(Outcome::Fd {
+            fd,
+            cloexec: flags & libc::O_CLOEXEC as i64 != 0,
+        })
     })
 }
 
@@ -712,20 +767,27 @@ fn do_stat(r: &Req, dirfd: i32, path: &[u8], buf: u64, flags: i64) -> Result<Out
     if targets_fd(path, flags) {
         return Ok(Outcome::Continue);
     }
-    let host = r.translate(dirfd, path, follow(flags))?;
-    r.valid()?;
-    let c = cstr(&host)?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let host_flags = flags & (libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT) as i64;
-    check(unsafe {
-        libc::syscall(
-            libc::SYS_newfstatat,
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            &mut st as *mut libc::stat,
-            host_flags,
-        )
+    let st = retrying(|| {
+        let resolved = r.translate(dirfd, path, follow(flags))?;
+        r.valid()?;
+        let (dfd, c, nofollow) = resolved.at(!follow(flags))?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let host_flags = flags & libc::AT_NO_AUTOMOUNT as i64 | nofollow_flag(nofollow);
+        check(unsafe {
+            libc::syscall(
+                libc::SYS_newfstatat,
+                dfd,
+                c.as_ptr(),
+                &mut st as *mut libc::stat,
+                host_flags,
+            )
+        })?;
+        if follow(flags) && resolved.pinned() && st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(RETRY);
+        }
+        Ok(st)
     })?;
+    let mut st = st;
     fake_owner(r, &mut st.st_uid, &mut st.st_gid);
     match r.variant {
         Variant::Stat64 => r.write(buf, &crate::abi::stat_to_stat64(&st))?,
@@ -743,6 +805,7 @@ fn do_stat(r: &Req, dirfd: i32, path: &[u8], buf: u64, flags: i64) -> Result<Out
 
 /// `statx`: fill a 256-byte `struct statx` in the tracee.
 fn do_statx(r: &Req) -> Result<Outcome> {
+    const STATX_TYPE: u32 = 0x1;
     let flags = r.arg_i64(2);
     if r.arg(1) == 0 {
         return Ok(Outcome::Continue);
@@ -751,20 +814,29 @@ fn do_statx(r: &Req) -> Result<Outcome> {
     if targets_fd(&path, flags) {
         return Ok(Outcome::Continue);
     }
-    let host = r.translate(r.dirfd(0), &path, follow(flags))?;
-    r.valid()?;
-    let c = cstr(&host)?;
-    let mut st = [0u8; 256];
-    let host_flags = flags & !(libc::AT_EMPTY_PATH as i64);
-    check(unsafe {
-        libc::syscall(
-            libc::SYS_statx,
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            host_flags,
-            r.arg(3) as u32,
-            st.as_mut_ptr(),
-        )
+    let mut st = retrying(|| {
+        let resolved = r.translate(r.dirfd(0), &path, follow(flags))?;
+        r.valid()?;
+        let (dfd, c, nofollow) = resolved.at(!follow(flags))?;
+        let mut st = [0u8; 256];
+        let host_flags =
+            flags & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW) as i64 | nofollow_flag(nofollow);
+        // The type is asked for as well, to tell a swapped-in symlink.
+        check(unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                dfd,
+                c.as_ptr(),
+                host_flags,
+                r.arg(3) as u32 | STATX_TYPE,
+                st.as_mut_ptr(),
+            )
+        })?;
+        let mode = u16::from_ne_bytes(st[28..30].try_into().unwrap()) as u32;
+        if follow(flags) && resolved.pinned() && mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(RETRY);
+        }
+        Ok(st)
     })?;
     let (mut uid, mut gid) = (
         u32::from_ne_bytes(st[20..24].try_into().unwrap()),
@@ -779,11 +851,16 @@ fn do_statx(r: &Req) -> Result<Outcome> {
 
 /// `statfs`: fill a 120-byte `struct statfs` in the tracee.
 fn do_statfs(r: &Req) -> Result<Outcome> {
-    let host = r.translate(libc::AT_FDCWD, &r.path(0)?, true)?;
-    r.valid()?;
-    let c = cstr(&host)?;
-    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    check(unsafe { libc::syscall(libc::SYS_statfs, c.as_ptr(), &mut st as *mut libc::statfs) })?;
+    let path = r.path(0)?;
+    let st = retrying(|| {
+        let resolved = r.translate(libc::AT_FDCWD, &path, true)?;
+        r.valid()?;
+        let (fd, _) = resolved.object(true)?;
+        let c = fd_path(&fd);
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        check(unsafe { libc::syscall(libc::SYS_statfs, c.as_ptr(), &mut st as *mut libc::statfs) })?;
+        Ok(st)
+    })?;
     match r.variant {
         // statfs64(path, size, buf)
         Variant::Statfs64 => r.write(r.arg(2), &crate::abi::statfs_to_statfs64(&st))?,
@@ -800,10 +877,11 @@ fn do_statfs(r: &Req) -> Result<Outcome> {
 
 /// `access`/`faccessat`/`faccessat2`.
 fn do_access(r: &Req, dirfd: i32, path: &[u8], mode: i64, flags: i64) -> Result<Outcome> {
-    let host = r.translate(dirfd, path, follow(flags))?;
+    let resolved = r.translate(dirfd, path, follow(flags))?;
     r.valid()?;
-    let c = cstr(&host)?;
-    let rc = check(unsafe { libc::syscall(libc::SYS_faccessat2, libc::AT_FDCWD, c.as_ptr(), mode, flags) });
+    let (dfd, c, nofollow) = resolved.at(!follow(flags))?;
+    let host_flags = flags & libc::AT_EACCESS as i64 | nofollow_flag(nofollow);
+    let rc = check(unsafe { libc::syscall(libc::SYS_faccessat2, dfd, c.as_ptr(), mode, host_flags) });
     Ok(Outcome::Value(rc))
 }
 
@@ -811,19 +889,27 @@ fn do_access(r: &Req, dirfd: i32, path: &[u8], mode: i64, flags: i64) -> Result<
 
 /// `readlink`/`readlinkat`: raw target, except `/proc` magic links are detranslated.
 fn do_readlink(r: &Req, dirfd: i32, path: &[u8], buf: u64, bufsiz: usize) -> Result<Outcome> {
-    let host = r.translate(dirfd, path, false)?;
+    let resolved = r.translate(dirfd, path, false)?;
     r.valid()?;
-    let guest = lexical_clean(&detranslate_path(r.fs(), &host));
+    let read = || -> Result<Vec<u8>> {
+        match &resolved.at {
+            crate::fs::canon::At::Child { parent, name } => readlinkat(parent, name),
+            // A mount point's host side is never a symlink.
+            crate::fs::canon::At::Object(_) => Err(libc::EINVAL),
+            crate::fs::canon::At::Path => read_link(&resolved.host),
+        }
+    };
+    let guest = lexical_clean(&resolved.guest);
     let target = match proc_magic_link(&guest) {
         Some((pid, true)) => match r.ctx.tracee(pid).exe_guest {
             Some(exe) => exe,
-            None => detranslate_path(r.fs(), &read_link(&host)?),
+            None => detranslate_path(r.fs(), &read()?),
         },
         Some((pid, false)) => match r.fs().virtual_cwd(pid).filter(|_| guest.ends_with(b"/cwd")) {
             Some(cwd) => cwd,
-            None => detranslate_path(r.fs(), &read_link(&host)?),
+            None => detranslate_path(r.fs(), &read()?),
         },
-        None => read_link(&host)?,
+        None => read()?,
     };
     let len = target.len().min(bufsiz);
     if len > 0 {
@@ -1137,101 +1223,116 @@ fn fake_ids_for_status(r: &Req, host: &[u8]) -> Option<crate::procs::Ids> {
 
 /// `mkdir`/`mkdirat`.
 fn do_mkdir(r: &Req, dirfd: i32, path: &[u8], mode: i64) -> Result<Outcome> {
-    let host = r.translate(dirfd, path, false)?;
+    let resolved = r.translate(dirfd, path, false)?;
     r.valid()?;
-    r.check_writable(&host)?;
-    let c = cstr(&host)?;
-    let rc = check(unsafe { libc::syscall(libc::SYS_mkdirat, libc::AT_FDCWD, c.as_ptr(), mode) });
+    r.check_writable(&resolved)?;
+    let (dfd, c, _) = resolved.at(true)?;
+    let rc = check(unsafe { libc::syscall(libc::SYS_mkdirat, dfd, c.as_ptr(), mode) });
     r.fs().flush_cache();
     Ok(Outcome::Value(rc))
 }
 
-/// `unlink`/`unlinkat`/`rmdir`.
+/// `unlink`/`unlinkat`/`rmdir`.  A mount point of the view is busy, as a
+/// mount point is.
 fn do_unlink(r: &Req, dirfd: i32, path: &[u8], flags: i64) -> Result<Outcome> {
-    let host = r.translate(dirfd, path, false)?;
+    let resolved = r.translate(dirfd, path, false)?;
     r.valid()?;
-    r.check_writable(&host)?;
-    let c = cstr(&host)?;
-    let rc = check(unsafe { libc::syscall(libc::SYS_unlinkat, libc::AT_FDCWD, c.as_ptr(), flags) });
+    r.check_writable(&resolved)?;
+    if resolved.is_mount_point() {
+        return Err(libc::EBUSY);
+    }
+    let (dfd, c, _) = resolved.at(true)?;
+    let rc = check(unsafe { libc::syscall(libc::SYS_unlinkat, dfd, c.as_ptr(), flags) });
     r.fs().flush_cache();
     Ok(Outcome::Value(rc))
 }
 
-/// `rename`/`renameat`/`renameat2`.
+/// `rename`/`renameat`/`renameat2`.  A mount point of the view is busy, as a
+/// mount point is.
 fn do_rename(r: &Req, olddirfd: i32, old: &[u8], newdirfd: i32, new: &[u8], flags: i64) -> Result<Outcome> {
-    let host_old = r.translate(olddirfd, old, false)?;
-    let host_new = r.translate(newdirfd, new, false)?;
+    let from = r.translate(olddirfd, old, false)?;
+    let to = r.translate(newdirfd, new, false)?;
     r.valid()?;
-    r.check_writable(&host_old)?;
-    r.check_writable(&host_new)?;
-    let (co, cn) = (cstr(&host_old)?, cstr(&host_new)?);
-    let rc = check(unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            co.as_ptr(),
-            libc::AT_FDCWD,
-            cn.as_ptr(),
-            flags,
-        )
-    });
+    r.check_writable(&from)?;
+    r.check_writable(&to)?;
+    if from.is_mount_point() || to.is_mount_point() {
+        return Err(libc::EBUSY);
+    }
+    let (dfo, co, _) = from.at(true)?;
+    let (dfn, cn, _) = to.at(true)?;
+    let rc = check(unsafe { libc::syscall(libc::SYS_renameat2, dfo, co.as_ptr(), dfn, cn.as_ptr(), flags) });
     r.fs().flush_cache();
     Ok(Outcome::Value(rc))
 }
 
 /// `link`/`linkat`.  An empty old path with `AT_EMPTY_PATH` links the tracee's
-/// descriptor via its `/proc` entry.
+/// descriptor via its `/proc` entry.  The walk followed the old side when
+/// asked to, so the kernel is never asked to follow it again.
 fn do_link(r: &Req, olddirfd: i32, old: &[u8], newdirfd: i32, new: &[u8], flags: i64) -> Result<Outcome> {
-    let (host_old, host_flags) = if targets_fd(old, flags) {
-        (
-            format!("/proc/{}/fd/{}", r.pid, olddirfd).into_bytes(),
-            libc::AT_SYMLINK_FOLLOW as i64,
-        )
+    let from = if targets_fd(old, flags) {
+        None
     } else {
-        let deref = flags & libc::AT_SYMLINK_FOLLOW as i64 != 0;
-        (
-            r.translate(olddirfd, old, deref)?,
-            flags & libc::AT_SYMLINK_FOLLOW as i64,
-        )
+        Some(r.translate(olddirfd, old, flags & libc::AT_SYMLINK_FOLLOW as i64 != 0)?)
     };
-    let host_new = r.translate(newdirfd, new, false)?;
+    let to = r.translate(newdirfd, new, false)?;
     r.valid()?;
-    r.check_writable(&host_new)?;
-    let (co, cn) = (cstr(&host_old)?, cstr(&host_new)?);
-    let rc = check(unsafe {
-        libc::syscall(
-            libc::SYS_linkat,
+    r.check_writable(&to)?;
+    let (dfo, co, host_flags) = match &from {
+        None => (
             libc::AT_FDCWD,
-            co.as_ptr(),
-            libc::AT_FDCWD,
-            cn.as_ptr(),
-            host_flags,
-        )
-    });
+            cstr(format!("/proc/{}/fd/{}", r.pid, olddirfd).as_bytes())?,
+            libc::AT_SYMLINK_FOLLOW as i64,
+        ),
+        Some(from) => {
+            let (dfd, c, _) = from.at(true)?;
+            // Only a mount point, through its /proc/self/fd link, needs following.
+            let follow = if from.is_mount_point() {
+                libc::AT_SYMLINK_FOLLOW as i64
+            } else {
+                0
+            };
+            (dfd, c, follow)
+        }
+    };
+    let (dfn, cn, _) = to.at(true)?;
+    let rc =
+        check(unsafe { libc::syscall(libc::SYS_linkat, dfo, co.as_ptr(), dfn, cn.as_ptr(), host_flags) });
     r.fs().flush_cache();
     Ok(Outcome::Value(rc))
 }
 
 /// `symlink`/`symlinkat`: the target is stored verbatim, only the link path is translated.
 fn do_symlink(r: &Req, target: &[u8], newdirfd: i32, linkpath: &[u8]) -> Result<Outcome> {
-    let host = r.translate(newdirfd, linkpath, false)?;
+    let resolved = r.translate(newdirfd, linkpath, false)?;
     r.valid()?;
-    r.check_writable(&host)?;
-    let (ct, cl) = (cstr(target)?, cstr(&host)?);
-    let rc = check(unsafe { libc::syscall(libc::SYS_symlinkat, ct.as_ptr(), libc::AT_FDCWD, cl.as_ptr()) });
+    r.check_writable(&resolved)?;
+    let (dfd, cl, _) = resolved.at(true)?;
+    let ct = cstr(target)?;
+    let rc = check(unsafe { libc::syscall(libc::SYS_symlinkat, ct.as_ptr(), dfd, cl.as_ptr()) });
     r.fs().flush_cache();
     Ok(Outcome::Value(rc))
 }
 
 // ---- attributes --------------------------------------------------------------
 
-/// `chmod`/`fchmodat`/`fchmodat2`.
+/// `chmod`/`fchmodat`/`fchmodat2`, on the object's `/proc/self/fd` link.
+///
+/// A symlink itself has no mode to change: `EOPNOTSUPP`, as `fchmodat2`
+/// says of `AT_SYMLINK_NOFOLLOW` on one.
 fn do_chmod(r: &Req, dirfd: i32, path: &[u8], mode: i64, flags: i64) -> Result<Outcome> {
-    let host = r.translate(dirfd, path, follow(flags))?;
-    r.valid()?;
-    r.check_writable(&host)?;
-    let c = cstr(&host)?;
-    let rc = check(unsafe { libc::syscall(SYS_FCHMODAT2_HOST, libc::AT_FDCWD, c.as_ptr(), mode, flags) });
+    let rc = retrying(|| {
+        let resolved = r.translate(dirfd, path, follow(flags))?;
+        r.valid()?;
+        r.check_writable(&resolved)?;
+        let (fd, st_mode) = resolved.object(follow(flags))?;
+        if st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Ok(Err(libc::EOPNOTSUPP));
+        }
+        let c = fd_path(&fd);
+        Ok(check(unsafe {
+            libc::syscall(SYS_FCHMODAT2_HOST, libc::AT_FDCWD, c.as_ptr(), mode, 0)
+        }))
+    })?;
     Ok(Outcome::Value(rc))
 }
 
@@ -1240,47 +1341,52 @@ fn do_chown(r: &Req, dirfd: i32, path: &[u8], uid: i64, gid: i64, flags: i64) ->
     if targets_fd(path, flags) {
         return Ok(Outcome::Continue);
     }
-    let host = r.translate(dirfd, path, follow(flags))?;
+    let resolved = r.translate(dirfd, path, follow(flags))?;
     r.valid()?;
-    r.check_writable(&host)?;
-    let c = cstr(&host)?;
-    let host_flags = flags & libc::AT_SYMLINK_NOFOLLOW as i64;
+    r.check_writable(&resolved)?;
+    let (dfd, c, nofollow) = resolved.at(!follow(flags))?;
     let rc = check(unsafe {
         libc::syscall(
             libc::SYS_fchownat,
-            libc::AT_FDCWD,
+            dfd,
             c.as_ptr(),
             uid,
             gid,
-            host_flags,
+            nofollow_flag(nofollow),
         )
     });
     Ok(Outcome::Value(forgive_as_root(r, rc)))
 }
 
-/// `truncate`.
+/// `truncate`, on the object's `/proc/self/fd` link.
 fn do_truncate(r: &Req) -> Result<Outcome> {
-    let host = r.translate(libc::AT_FDCWD, &r.path(0)?, true)?;
-    r.valid()?;
-    r.check_writable(&host)?;
-    let c = cstr(&host)?;
+    let path = r.path(0)?;
     // truncate64(path, len_lo, len_hi) on i386; ARM pads to an even register pair.
     let len = match r.variant {
         Variant::Truncate64 => (r.arg(1) | (r.arg(2) << 32)) as i64,
         Variant::Truncate64Arm => (r.arg(2) | (r.arg(3) << 32)) as i64,
         _ => r.arg_i64(1),
     };
-    let rc = check(unsafe { libc::syscall(libc::SYS_truncate, c.as_ptr(), len) });
+    let rc = retrying(|| {
+        let resolved = r.translate(libc::AT_FDCWD, &path, true)?;
+        r.valid()?;
+        r.check_writable(&resolved)?;
+        let (fd, _) = resolved.object(true)?;
+        let c = fd_path(&fd);
+        Ok(check(unsafe {
+            libc::syscall(libc::SYS_truncate, c.as_ptr(), len)
+        }))
+    })?;
     Ok(Outcome::Value(rc))
 }
 
 /// `mknod`/`mknodat`.
 fn do_mknod(r: &Req, dirfd: i32, path: &[u8], mode: i64, dev: i64) -> Result<Outcome> {
-    let host = r.translate(dirfd, path, false)?;
+    let resolved = r.translate(dirfd, path, false)?;
     r.valid()?;
-    r.check_writable(&host)?;
-    let c = cstr(&host)?;
-    let rc = check(unsafe { libc::syscall(libc::SYS_mknodat, libc::AT_FDCWD, c.as_ptr(), mode, dev) });
+    r.check_writable(&resolved)?;
+    let (dfd, c, _) = resolved.at(true)?;
+    let rc = check(unsafe { libc::syscall(libc::SYS_mknodat, dfd, c.as_ptr(), mode, dev) });
     Ok(Outcome::Value(forgive_as_root(r, rc)))
 }
 
@@ -1304,20 +1410,28 @@ fn do_utime(r: &Req) -> Result<Outcome> {
         }
         Some(ts)
     };
-    let host = r.translate(libc::AT_FDCWD, &path, true)?;
+    let resolved = r.translate(libc::AT_FDCWD, &path, true)?;
     r.valid()?;
-    r.check_writable(&host)?;
-    Ok(Outcome::Value(host_utimensat(&host, times.as_ref(), 0)))
+    Ok(Outcome::Value(host_utimensat(
+        r,
+        &resolved,
+        times.as_ref(),
+        false,
+    )))
 }
 
 /// `utimes`/`futimesat`: `struct timeval[2]` to timespecs.
 fn do_utimes(r: &Req, dirfd: i32, path_idx: usize, times_idx: usize) -> Result<Outcome> {
     let path = r.path(path_idx)?;
     let times = timevals_to_timespecs(r, r.arg(times_idx))?;
-    let host = r.translate(dirfd, &path, true)?;
+    let resolved = r.translate(dirfd, &path, true)?;
     r.valid()?;
-    r.check_writable(&host)?;
-    Ok(Outcome::Value(host_utimensat(&host, times.as_ref(), 0)))
+    Ok(Outcome::Value(host_utimensat(
+        r,
+        &resolved,
+        times.as_ref(),
+        false,
+    )))
 }
 
 /// `utimensat`.  A NULL path targets the descriptor itself and is passed through.
@@ -1331,11 +1445,32 @@ fn do_utimensat(r: &Req) -> Result<Outcome> {
         return Ok(Outcome::Continue);
     }
     let times = timespecs_from_tracee(r, r.arg(2))?;
-    let host = r.translate(r.dirfd(0), &path, follow(flags))?;
+    let resolved = r.translate(r.dirfd(0), &path, follow(flags))?;
     r.valid()?;
-    r.check_writable(&host)?;
-    let host_flags = flags & libc::AT_SYMLINK_NOFOLLOW as i64;
-    Ok(Outcome::Value(host_utimensat(&host, times.as_ref(), host_flags)))
+    Ok(Outcome::Value(host_utimensat(
+        r,
+        &resolved,
+        times.as_ref(),
+        !follow(flags),
+    )))
+}
+
+/// The path an extended-attribute syscall acts on.
+///
+/// The `l` variants act on the name as it is now, through the pinned parent
+/// (`/proc/self/fd/<parent>/<name>`), since a symlink is what they are for.
+/// The others act on the object's own `/proc/self/fd` link, which the
+/// kernel resolves to the inode, once the object is seen not to be a symlink
+/// swapped in after the walk.
+///
+/// # Returns
+/// The path, and the descriptor that keeps it valid.
+fn xattr_target(resolved: &Resolved, nofollow: bool) -> Result<(CString, Option<Arc<std::os::fd::OwnedFd>>)> {
+    if nofollow && !resolved.is_mount_point() {
+        return Ok((resolved.parent_path()?, None));
+    }
+    let (fd, _) = resolved.object(true)?;
+    Ok((fd_path(&fd), Some(fd)))
 }
 
 /// `setxattr`/`lsetxattr`.
@@ -1347,17 +1482,20 @@ fn do_setxattr(r: &Req, nofollow: bool) -> Result<Outcome> {
         return Err(libc::E2BIG);
     }
     let value = r.read(r.arg(2), size)?;
-    let host = r.translate(libc::AT_FDCWD, &path, !nofollow)?;
-    r.valid()?;
-    r.check_writable(&host)?;
-    let c = cstr(&host)?;
-    let nr = if nofollow {
-        libc::SYS_lsetxattr
-    } else {
-        libc::SYS_setxattr
-    };
-    let rc =
-        check(unsafe { libc::syscall(nr, c.as_ptr(), name.as_ptr(), value.as_ptr(), size, r.arg_i64(4)) });
+    let rc = retrying(|| {
+        let resolved = r.translate(libc::AT_FDCWD, &path, !nofollow)?;
+        r.valid()?;
+        r.check_writable(&resolved)?;
+        let (c, _keep) = xattr_target(&resolved, nofollow)?;
+        let nr = if nofollow && !resolved.is_mount_point() {
+            libc::SYS_lsetxattr
+        } else {
+            libc::SYS_setxattr
+        };
+        Ok(check(unsafe {
+            libc::syscall(nr, c.as_ptr(), name.as_ptr(), value.as_ptr(), size, r.arg_i64(4))
+        }))
+    })?;
     Ok(Outcome::Value(rc))
 }
 
@@ -1366,16 +1504,18 @@ fn do_getxattr(r: &Req, nofollow: bool) -> Result<Outcome> {
     let path = r.path(0)?;
     let name = cstr(&r.ctx.mem.read_cstr(r.pid, r.arg(1))?)?;
     let size = (r.arg(3) as usize).min(XATTR_MAX);
-    let host = r.translate(libc::AT_FDCWD, &path, !nofollow)?;
-    r.valid()?;
-    let c = cstr(&host)?;
     let mut buf = vec![0u8; size];
-    let nr = if nofollow {
-        libc::SYS_lgetxattr
-    } else {
-        libc::SYS_getxattr
-    };
-    let rc = check(unsafe { libc::syscall(nr, c.as_ptr(), name.as_ptr(), buf.as_mut_ptr(), size) })?;
+    let rc = retrying(|| {
+        let resolved = r.translate(libc::AT_FDCWD, &path, !nofollow)?;
+        r.valid()?;
+        let (c, _keep) = xattr_target(&resolved, nofollow)?;
+        let nr = if nofollow && !resolved.is_mount_point() {
+            libc::SYS_lgetxattr
+        } else {
+            libc::SYS_getxattr
+        };
+        check(unsafe { libc::syscall(nr, c.as_ptr(), name.as_ptr(), buf.as_mut_ptr(), size) })
+    })?;
     if size > 0 && rc > 0 {
         r.write(r.arg(2), &buf[..rc as usize])?;
     }
@@ -1386,16 +1526,18 @@ fn do_getxattr(r: &Req, nofollow: bool) -> Result<Outcome> {
 fn do_listxattr(r: &Req, nofollow: bool) -> Result<Outcome> {
     let path = r.path(0)?;
     let size = (r.arg(2) as usize).min(XATTR_MAX);
-    let host = r.translate(libc::AT_FDCWD, &path, !nofollow)?;
-    r.valid()?;
-    let c = cstr(&host)?;
     let mut buf = vec![0u8; size];
-    let nr = if nofollow {
-        libc::SYS_llistxattr
-    } else {
-        libc::SYS_listxattr
-    };
-    let rc = check(unsafe { libc::syscall(nr, c.as_ptr(), buf.as_mut_ptr(), size) })?;
+    let rc = retrying(|| {
+        let resolved = r.translate(libc::AT_FDCWD, &path, !nofollow)?;
+        r.valid()?;
+        let (c, _keep) = xattr_target(&resolved, nofollow)?;
+        let nr = if nofollow && !resolved.is_mount_point() {
+            libc::SYS_llistxattr
+        } else {
+            libc::SYS_listxattr
+        };
+        check(unsafe { libc::syscall(nr, c.as_ptr(), buf.as_mut_ptr(), size) })
+    })?;
     if size > 0 && rc > 0 {
         r.write(r.arg(1), &buf[..rc as usize])?;
     }
@@ -1406,16 +1548,18 @@ fn do_listxattr(r: &Req, nofollow: bool) -> Result<Outcome> {
 fn do_removexattr(r: &Req, nofollow: bool) -> Result<Outcome> {
     let path = r.path(0)?;
     let name = cstr(&r.ctx.mem.read_cstr(r.pid, r.arg(1))?)?;
-    let host = r.translate(libc::AT_FDCWD, &path, !nofollow)?;
-    r.valid()?;
-    r.check_writable(&host)?;
-    let c = cstr(&host)?;
-    let nr = if nofollow {
-        libc::SYS_lremovexattr
-    } else {
-        libc::SYS_removexattr
-    };
-    let rc = check(unsafe { libc::syscall(nr, c.as_ptr(), name.as_ptr()) });
+    let rc = retrying(|| {
+        let resolved = r.translate(libc::AT_FDCWD, &path, !nofollow)?;
+        r.valid()?;
+        r.check_writable(&resolved)?;
+        let (c, _keep) = xattr_target(&resolved, nofollow)?;
+        let nr = if nofollow && !resolved.is_mount_point() {
+            libc::SYS_lremovexattr
+        } else {
+            libc::SYS_removexattr
+        };
+        Ok(check(unsafe { libc::syscall(nr, c.as_ptr(), name.as_ptr()) }))
+    })?;
     Ok(Outcome::Value(rc))
 }
 
@@ -1428,9 +1572,9 @@ fn do_removexattr(r: &Req, nofollow: bool) -> Result<Outcome> {
 fn do_inotify_add_watch(r: &Req) -> Result<Outcome> {
     let path = r.path(1)?;
     let deref = r.arg(2) & IN_DONT_FOLLOW == 0;
-    let host = r.translate(libc::AT_FDCWD, &path, deref)?;
+    let resolved = r.translate(libc::AT_FDCWD, &path, deref)?;
     r.valid()?;
-    if host == path {
+    if resolved.host == path {
         return Ok(Outcome::Continue);
     }
     note!(

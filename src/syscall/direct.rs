@@ -35,7 +35,8 @@
 use crate::exec::nested::EnvSource;
 use crate::exec::shim::Trapped;
 use crate::exec::{self, ExecPlan, shim};
-use crate::fs::translate::{detranslate_path, guest_fd_path, read_link};
+use crate::fs::canon::RETRY;
+use crate::fs::translate::{guest_fd_path, read_link};
 use crate::guest_stub::layout;
 use crate::note;
 use crate::seccomp::notify::{addfd, addfd_at, reply_continue};
@@ -518,29 +519,43 @@ fn open_host(host: &[u8], flags: i32) -> Result<i32> {
 
 /// Moves the virtual working directory to `path`, with `chdir`'s own checks.
 fn set_cwd(r: &Req, dirfd: i32, path: &[u8]) -> Result<Outcome> {
-    let host = r.translate(dirfd, path, true)?;
-    let c = CString::new(host.clone()).map_err(|_| libc::ENOENT)?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::stat(c.as_ptr(), &mut st) } < 0 {
-        return Err(errno());
-    }
-    if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
-        return Err(libc::ENOTDIR);
-    }
-    if unsafe { libc::access(c.as_ptr(), libc::X_OK) } < 0 {
-        return Err(errno());
-    }
-    let guest = detranslate_path(r.fs(), &host);
+    let guest = retry(|| {
+        let resolved = r.translate(dirfd, path, true)?;
+        let mode = resolved.mode_nofollow()?;
+        if mode & libc::S_IFMT == libc::S_IFLNK && resolved.pinned() {
+            return Err(RETRY);
+        }
+        if mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(libc::ENOTDIR);
+        }
+        let (dfd, c, nofollow) = resolved.at(false)?;
+        let flags = if nofollow { libc::AT_SYMLINK_NOFOLLOW } else { 0 };
+        if unsafe { libc::syscall(libc::SYS_faccessat2, dfd, c.as_ptr(), libc::X_OK, flags) } < 0 {
+            return Err(errno());
+        }
+        Ok(resolved.guest)
+    })?;
     r.valid()?;
     r.ctx.procs.set_cwd(r.pid as i32, guest);
     Ok(Outcome::Value(Ok(0)))
 }
 
+/// Runs a lookup again while it finds a symlink swapped in since the walk.
+fn retry<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
+    for _ in 0..3 {
+        match f() {
+            Err(RETRY) => continue,
+            r => return r,
+        }
+    }
+    Err(libc::ELOOP)
+}
+
 /// `chroot`: the guest root is a no-op, anything else is refused as it would
 /// be for an unprivileged process.
 fn do_chroot(r: &Req) -> Result<Outcome> {
-    let host = r.translate(libc::AT_FDCWD, &r.path(0)?, true)?;
-    if detranslate_path(r.fs(), &host) == b"/" {
+    let resolved = r.translate(libc::AT_FDCWD, &r.path(0)?, true)?;
+    if resolved.guest == b"/" {
         return Ok(Outcome::Value(Ok(0)));
     }
     Err(libc::EPERM)
@@ -550,8 +565,12 @@ fn do_chroot(r: &Req) -> Result<Outcome> {
 ///
 /// The tracee's socket cannot be reached (`pidfd_getfd` is not allowed in a
 /// default container), so a new socket of the same type, with the same
-/// `O_NONBLOCK` and `O_CLOEXEC`, is connected or bound to the host path by
-/// the supervisor and installed over the tracee's descriptor number.
+/// `O_NONBLOCK` and `O_CLOEXEC`, is connected or bound by the supervisor
+/// and installed over the tracee's descriptor number.  The address names
+/// the socket through its pinned parent, `/proc/self/fd/<parent>/<name>`,
+/// since the socket calls have no `dirfd` form: the parents cannot be
+/// redirected, while the kernel resolves the final name itself, so a
+/// symlink the guest swaps in there during a `connect` is followed.
 /// Options set on the old socket before this call, and a `bind` made before
 /// a `connect`, do not carry over.  A descriptor that is not a unix socket
 /// is left to the kernel, which reports the mismatch.
@@ -572,13 +591,14 @@ fn do_sockaddr(r: &Req, sockfd: i32, addr: u64, len: usize, connect: bool) -> Re
     }
     let end = sa[2..].iter().position(|&b| b == 0).map(|p| p + 2).unwrap_or(len);
     let path = sa[2..end].to_vec();
-    let host = r.translate(libc::AT_FDCWD, &path, connect)?;
-    if host == path {
+    let resolved = r.translate(libc::AT_FDCWD, &path, connect)?;
+    if resolved.host == path {
         return Ok(Outcome::Continue);
     }
     if !connect {
-        r.check_writable(&host)?;
+        r.check_writable(&resolved)?;
     }
+    let host = resolved.parent_path()?.into_bytes();
     if host.len() >= 108 {
         return Err(libc::ENAMETOOLONG);
     }
@@ -623,7 +643,7 @@ fn do_sockaddr(r: &Req, sockfd: i32, addr: u64, len: usize, connect: bool) -> Re
         r.pid,
         if connect { "connect" } else { "bind" },
         sockfd,
-        String::from_utf8_lossy(&host)
+        String::from_utf8_lossy(&resolved.host)
     );
     r.valid().inspect_err(|_| unsafe {
         libc::close(new);
@@ -665,32 +685,37 @@ fn socket_description(tid: u32, fd: i32) -> Option<(i32, i32)> {
 }
 
 /// `inotify_add_watch`: the watch goes on the tracee's own descriptor, so the
-/// path is rewritten to a transient alias.
+/// path is rewritten to a transient alias, which the tracee then walks.
 fn do_inotify_add_watch(r: &Req) -> Result<Outcome> {
     const IN_DONT_FOLLOW: u64 = 0x0200_0000;
     let path = r.path(1)?;
     let dont_follow = r.arg(2) & IN_DONT_FOLLOW != 0;
-    let host = r.translate(libc::AT_FDCWD, &path, !dont_follow)?;
-    if host == path {
+    let resolved = r.translate(libc::AT_FDCWD, &path, !dont_follow)?;
+    if resolved.host == path {
         return Ok(Outcome::Continue);
     }
-    let form = if dont_follow && is_symlink(&host) {
+    let form = if dont_follow
+        && resolved
+            .mode_nofollow()
+            .is_ok_and(|m| m & libc::S_IFMT == libc::S_IFLNK)
+    {
         Form::Dir
     } else {
         Form::File
     };
     let mut orig = path.clone();
     orig.push(0);
-    transient_rewrite(r, r.arg(1), &orig, &host, form)
+    transient_rewrite(r, r.arg(1), &orig, &resolved.host, form)
 }
 
 /// An `O_PATH` open without ptrace.
 ///
 /// Such descriptors cannot be injected, so directories and readable files
 /// are opened read-only instead, which serves the same purposes (`openat`
-/// relative to it, `fstat`, `/proc/self/fd/N`).  Anything else, a socket, a
-/// device, an unreadable file or a symlink opened with `O_NOFOLLOW`, goes
-/// through a transient alias so the kernel opens it in the tracee.
+/// relative to it, `fstat`, `/proc/self/fd/N`), through the pinned parent.
+/// Anything else, a socket, a device, an unreadable file or a symlink opened
+/// with `O_NOFOLLOW`, goes through a transient alias so the kernel opens it
+/// in the tracee, which walks the host path itself.
 ///
 /// # Arguments
 /// * `r` - The notification.
@@ -700,18 +725,13 @@ fn do_inotify_add_watch(r: &Req) -> Result<Outcome> {
 /// * `flags` - Host-form open flags, `O_PATH` included.
 pub fn do_open_path(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64) -> Result<Outcome> {
     let nofollow = flags & libc::O_NOFOLLOW as i64 != 0;
-    let host = r.translate(dirfd, path, !nofollow)?;
+    let resolved = r.translate(dirfd, path, !nofollow)?;
     if r.ctx.trap_mode() {
-        return rewrite_staged(r, path_addr, &host);
+        return rewrite_staged(r, path_addr, &resolved.host);
     }
     let cloexec = flags & libc::O_CLOEXEC as i64 != 0;
-    let c = CString::new(host.clone()).map_err(|_| libc::ENOENT)?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::lstat(c.as_ptr(), &mut st) } < 0 {
-        return Err(errno());
-    }
-    let kind = st.st_mode & libc::S_IFMT;
-    let base = libc::O_RDONLY | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
+    let kind = resolved.mode_nofollow()? & libc::S_IFMT;
+    let base = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
     let direct = match kind {
         libc::S_IFDIR => Some(base | libc::O_DIRECTORY),
         libc::S_IFREG => Some(base),
@@ -719,10 +739,13 @@ pub fn do_open_path(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64
     };
     if let Some(open_flags) = direct {
         r.valid()?;
-        match open_host(&host, open_flags) {
-            Ok(fd) => return Ok(Outcome::Fd { fd, cloexec }),
-            Err(libc::EACCES) => {}
-            Err(e) => return Err(e),
+        let (dfd, c, _) = resolved.at(true)?;
+        let fd = unsafe { libc::openat(dfd, c.as_ptr(), open_flags) };
+        if fd >= 0 {
+            return Ok(Outcome::Fd { fd, cloexec });
+        }
+        if errno() != libc::EACCES {
+            return Err(errno());
         }
     }
     if dirfd != libc::AT_FDCWD && path.first() != Some(&b'/') {
@@ -735,7 +758,7 @@ pub fn do_open_path(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64
     };
     let mut orig = path.to_vec();
     orig.push(0);
-    transient_rewrite(r, path_addr, &orig, &host, form)
+    transient_rewrite(r, path_addr, &orig, &resolved.host, form)
 }
 
 /// `clone`/`fork`/`vfork`/`clone3`: refuse a new namespace, snapshot the
@@ -989,15 +1012,6 @@ fn release_alias(name: u8) {
     if let Some(i) = ALIAS_CHARS.iter().position(|&c| c == name) {
         ALIASES.lock().unwrap().0[i] = false;
     }
-}
-
-/// Whether a host path is a symlink.
-fn is_symlink(host: &[u8]) -> bool {
-    let Ok(c) = CString::new(host.to_vec()) else {
-        return false;
-    };
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    unsafe { libc::lstat(c.as_ptr(), &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFLNK }
 }
 
 /// Whether ptrace can be used from here.
