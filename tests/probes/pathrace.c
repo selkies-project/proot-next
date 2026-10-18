@@ -37,10 +37,11 @@ static void add(volatile unsigned long *n) { __sync_fetch_and_add(n, 1); }
 
 static void deep(char *out, size_t len, const char *base, const char *leaf)
 {
-    int i, n = snprintf(out, len, "%s", base);
+    int i;
+    snprintf(out, len, "%s", base);
     for (i = 1; i <= DEPTH; i++)
-        n += snprintf(out + n, len - n, "/a%d", i);
-    snprintf(out + n, len - n, "/%s", leaf);
+        snprintf(out + strlen(out), len - strlen(out), "/a%d", i);
+    snprintf(out + strlen(out), len - strlen(out), "/%s", leaf);
 }
 
 static void *opener(void *x)
@@ -128,7 +129,8 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    FILE *f = fopen(rpath, "w");
+    int ffd = open(rpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    FILE *f = ffd < 0 ? NULL : fdopen(ffd, "w");
     if (!f) {
         perror("flag");
         return 2;
