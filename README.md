@@ -75,6 +75,17 @@ x86_64 hosts run x86_64 and i386 programs; aarch64 hosts run aarch64 and
 Works wherever Docker's default seccomp profile and AppArmor policy apply, with
 no capabilities and no user namespaces.
 
+## Security
+
+proot-next confines paths, not privileges: the guest runs as the user who
+started it, and nothing it reaches through a race is beyond what that user can
+reach already.  A symlink in the rootfs is resolved as the guest's, so it
+never leads a lookup out; but the supervisor performs the syscall on the host
+path it resolved, so a guest that renames a directory of its own and puts a
+symlink in its place during its own call can have that call land where the
+symlink points.  Like PRoot, it is no boundary against a guest working against
+it; run untrusted code in a container, which is.
+
 ## License
 
 This project is licensed under the **Mozilla Public License Version 2.0**.

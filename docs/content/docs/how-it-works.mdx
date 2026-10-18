@@ -109,7 +109,11 @@ already warm. The spin budget decays to zero when requests stop arriving.
 
 A guest path is walked one component at a time. Each component's host
 counterpart is `lstat`ed; a symlink is read and its target re-entered as a
-guest path, so a link inside the rootfs can never escape it. Relative paths
+guest path, so a link inside the rootfs never leads the walk out of it. The
+supervisor then acts on the host path the walk built, so a guest racing a
+rename of its own directories against its own call can land that call where a
+symlink it swapped in points: proot-next confines paths, not privileges, and
+is no boundary against a guest working against it. Relative paths
 are resolved against the tracee's directory descriptor by reading its path
 from `/proc`. A directory cache skips one `lstat` per component.
 

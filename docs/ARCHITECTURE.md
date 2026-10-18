@@ -428,8 +428,13 @@ spot on a 32-core powersave host; 32 threads was 3x slower than one.
 
 `fs/binding.rs` holds the longest-prefix tables both ways.  `fs/canon.rs`
 walks a guest path component by component, lstat-ing the host side and
-re-entering symlink targets as guest paths, so a link inside the rootfs can
-never escape it.  `fs/translate.rs` resolves `dirfd`-relative paths by reading
+re-entering symlink targets as guest paths, so a link inside the rootfs never
+leads the walk out of it.  The supervisor then acts on the host path the walk
+built, which the kernel resolves again: a guest that swaps a directory of its
+own for a symlink between the two (a rename racing its own call) lands the call
+where that symlink points.  That reaches nothing the guest's user cannot reach
+already, and the README says so: proot-next confines paths, as PRoot does, and
+is no boundary against a guest working against it.  `fs/translate.rs` resolves `dirfd`-relative paths by reading
 the descriptor's path from `/proc/<pid>/fd` and detranslating it, then
 canonicalizes the joined guest path.  A binding's guest path is canonicalized
 the same way when the view is built, final component kept as given, so a
