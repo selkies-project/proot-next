@@ -20,6 +20,12 @@ tracer is also run against a desktop app through proot-apps and, when it touches
 webhelper in a selkies container. Everything here can be tested
 empirically on the host, so every claim in a report has been run, and anything that could not be run says so.
 
+CodeQL's code scanning alerts are at least stylistic recommendations: each is fixed in the code and closed by the
+next scan, never dismissed or closed by hand, a case that is so by design included. Code that is safe through a check
+CodeQL cannot follow (a validator in another function, a bound set elsewhere) is rewritten so the check sits where
+the query recognizes it (its `*Customizations.qll` in github/codeql lists the forms), so the scan keeps watching
+that path.
+
 Architecture and the lessons that cost the most time are in `docs/ARCHITECTURE.md`; read it before changing the
 tracer, the filter or canonicalization. A supervisor must stay invisible to its tracees (no `TracerPid`, breakpoints
 resumed, no translation of `/proc/<pid>/fd` links) and must never leave a tracee blocked in a notification: every
