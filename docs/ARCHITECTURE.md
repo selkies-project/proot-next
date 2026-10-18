@@ -426,20 +426,71 @@ spot on a 32-core powersave host; 32 threads was 3x slower than one.
 
 ## Path translation
 
-`fs/binding.rs` holds the longest-prefix tables both ways.  `fs/canon.rs`
-walks a guest path component by component, lstat-ing the host side and
-re-entering symlink targets as guest paths, so a link inside the rootfs never
-leads the walk out of it.  The supervisor then acts on the host path the walk
-built, which the kernel resolves again: a guest that swaps a directory of its
-own for a symlink between the two (a rename racing its own call) lands the call
-where that symlink points.  That reaches nothing the guest's user cannot reach
-already, and the README says so: proot-next confines paths, as PRoot does, and
-is no boundary against a guest working against it.  `fs/translate.rs` resolves `dirfd`-relative paths by reading
-the descriptor's path from `/proc/<pid>/fd` and detranslating it, then
-canonicalizes the joined guest path.  A binding's guest path is canonicalized
-the same way when the view is built, final component kept as given, so a
-path named through a symlink of the rootfs (`/lib/ld-linux.so.2` on a
-merged-usr host) lands on the entry lookups resolve to.
+`fs/binding.rs` holds the longest-prefix tables both ways, and keeps the
+host side of the root and of every binding open as an `O_PATH` descriptor.
+`fs/canon.rs` walks a guest path component by component from those
+descriptors: each intermediate component is opened `O_PATH` relative to the
+directory walked so far (`openat2` with `RESOLVE_NO_SYMLINKS`, so a symlink
+reports itself), a symlink's target is re-entered as a guest path, and a
+component that is a mount point of the view switches to that binding's own
+descriptor.  The walk never touches a textual host path, so neither a
+symlink inside the rootfs nor a rename of the rootfs's own parents on the
+host (the rootfs under a bound `$HOME`) leads it out.  Its result is the
+canonical guest path plus the pinned parent directory and the final name,
+and the handlers in `syscall/notify.rs` act on that pair with the `*at`
+syscalls and `O_NOFOLLOW`/`AT_SYMLINK_NOFOLLOW`, since the walk already
+followed a final symlink when asked to.  A symlink found there was swapped
+in by the guest after the walk: the call is walked again, three times at
+most, so the link is resolved inside the guest, then fails with `ELOOP`.
+Syscalls without a `dirfd` form (`truncate`, `statfs`, `chmod`, the xattr
+family) act on the object's `/proc/self/fd/<n>`, which the kernel resolves
+to the open inode once the object is seen not to be a symlink; the
+`l*xattr` variants act on `/proc/self/fd/<parent>/<name>`, since the name as
+it is now is what they are for.  A mount point itself (`/`, a binding) is
+acted on through its own descriptor the same way, and is busy to `unlink`,
+`rmdir` and `rename` as a mount point is.  A `/proc/<pid>/fd/N` link as the
+last component is left to the kernel, which re-opens the object behind it
+(a memfd, a pipe); followed by more components it must be a directory,
+whose path is re-entered as a guest path.
+
+A missing final component is returned as a name in its parent, so the
+kernel creates it or reports `ENOENT` through the pinned directory.  A
+missing intermediate component fails the lookup with `ENOENT`, as the
+kernel's would: `stat("/missing/..")` is `ENOENT`, where PRoot resolves it
+lexically to `/`.  The binding table is the exception: a binding's guest
+path is canonicalized when the view is built with the rest kept lexical and
+the final component as given, so a binding named through a symlink of the
+rootfs (`/lib/ld-linux.so.2` on a merged-usr host) lands on the entry
+lookups resolve to.  A binding whose host side does not exist yet is walked
+textually, and pinned by the first lookup that finds it there.  So is a
+directory the view has only because a binding lies below it, where `glue`
+could not make a placeholder (a rootfs the user cannot write): the walk goes
+on by name to the binding's own descriptor, as PRoot resolves it lexically.
+
+The directory cache (`DirCache`) holds the `O_PATH` descriptors of canonical
+guest directories already walked, keyed by view, capped at 512 descriptors
+and flushed on every syscall that may replace a directory.  A lookup through
+a cached entry lands in the directory the entry pinned, whatever the name
+points to now, so the stale answer a change made outside proot-next can give
+is that directory, never a path the kernel walks.  Without the cache
+(`PROOT_NO_PATH_CACHE=1`) every component costs one `openat2`, about a
+quarter more on a `stat` loop.
+
+What stays textual is what the tracee must walk itself.  The ptrace tier
+rewrites the paths of `execve`, `chdir`, `chroot`, `connect`, `bind`,
+`inotify_add_watch` and `O_PATH` opens in the tracee's memory
+(`syscall/traced.rs`); without ptrace the exec trampoline runs the host path
+of the program and the loader, and the alias directory's transient symlinks
+stand for the host paths of `inotify_add_watch` and of `O_PATH` opens of
+special files.  A unix socket address names the socket as
+`/proc/self/fd/<parent>/<name>`, so its parents are pinned while a swap of
+the final name during a `connect` is followed.  There a guest racing its own
+call lands where its symlink points, which reaches nothing its user cannot
+reach already, and the README says so: proot-next confines paths, as PRoot
+does, and is no boundary against a guest working against it.
+`fs/translate.rs` resolves `dirfd`-relative paths by reading the
+descriptor's path from `/proc/<pid>/fd` and detranslating it, then walks the
+joined guest path.
 
 ## Mount points
 

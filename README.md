@@ -78,13 +78,18 @@ no capabilities and no user namespaces.
 ## Security
 
 proot-next confines paths, not privileges: the guest runs as the user who
-started it, and nothing it reaches through a race is beyond what that user can
-reach already.  A symlink in the rootfs is resolved as the guest's, so it
-never leads a lookup out; but the supervisor performs the syscall on the host
-path it resolved, so a guest that renames a directory of its own and puts a
-symlink in its place during its own call can have that call land where the
-symlink points.  Like PRoot, it is no boundary against a guest working against
-it; run untrusted code in a container, which is.
+started it, and nothing it reaches is beyond what that user can reach
+already.  A symlink in the rootfs is resolved as the guest's, so it never
+leads a lookup out.  The syscalls the supervisor serves act through directory
+descriptors its walk pinned, not on a host path the kernel would walk again,
+so a guest that renames a directory of its own and puts a symlink in its
+place during its own call gets the directory it had, or the link resolved
+inside the guest, never the host directory the link names.  The few syscalls
+the tracee must run itself (an exec, and under ptrace `chdir`, `connect`,
+`bind`, `inotify_add_watch` and `O_PATH` opens) still walk a host path, so
+there such a swap lands where the link points.  Like PRoot, it is no boundary
+against a guest working against it; run untrusted code in a container, which
+is.
 
 ## License
 

@@ -107,15 +107,22 @@ already warm. The spin budget decays to zero when requests stop arriving.
 
 ## Path translation
 
-A guest path is walked one component at a time. Each component's host
-counterpart is `lstat`ed; a symlink is read and its target re-entered as a
-guest path, so a link inside the rootfs never leads the walk out of it. The
-supervisor then acts on the host path the walk built, so a guest racing a
-rename of its own directories against its own call can land that call where a
-symlink it swapped in points: proot-next confines paths, not privileges, and
-is no boundary against a guest working against it. Relative paths
-are resolved against the tracee's directory descriptor by reading its path
-from `/proc`. A directory cache skips one `lstat` per component.
+A guest path is walked one component at a time, on descriptors: the root
+and every binding are held open, each component is opened relative to the
+directory walked so far, and a symlink is read and its target re-entered as
+a guest path, so a link inside the rootfs never leads the walk out of it.
+The syscall is then made through the directory the walk ended in, on the
+final name with no symlink following, rather than on a host path the kernel
+would walk again: a guest that renames a directory of its own and puts a
+symlink in its place while its call is in flight gets the directory it had,
+or the link resolved inside the guest on a retry, never the host directory
+the link names. The syscalls the tracee must run itself (an exec; under
+ptrace also `chdir`, `connect`, `bind`, `inotify_add_watch` and `O_PATH`
+opens) still walk a host path. proot-next confines paths, not privileges,
+and is no boundary against a guest working against it. Relative paths are
+resolved against the tracee's directory descriptor by reading its path from
+`/proc`. A cache of directory descriptors skips the open of a component
+already walked.
 
 ## execve
 
