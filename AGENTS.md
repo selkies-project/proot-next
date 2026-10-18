@@ -22,10 +22,11 @@ empirically on the host, so every claim in a report has been run, and anything t
 
 CodeQL's code scanning and the other checkers (clippy, rustfmt and codespell through pre-commit) are at least
 stylistic recommendations: a finding is fixed in the code and its alert closed by the next scan or update, never
-dismissed or closed by hand, a case that is so by design included, and a lint is not silenced (`#[allow]`) where the
-code can be written its way. Code that is safe through a check a checker cannot follow (a validator in another
-function, a bound set elsewhere) is rewritten so the check sits where it is recognized (CodeQL's `*Customizations.qll`
-in github/codeql lists the forms), so the checker keeps watching that path.
+dismissed or closed by hand, and a lint is not silenced (`#[allow]`) where the code can be written its way. Code that
+is safe through a check a checker cannot follow (a validator in another function, a bound set elsewhere) is rewritten
+so the check sits where it is recognized (CodeQL's `*Customizations.qll` in github/codeql lists the forms), so the
+checker keeps watching that path. A protocol requirement alone is dismissed, with the standard that fixes it named (a
+hash, port or file format the protocol or its tools prescribe).
 
 Architecture and the lessons that cost the most time are in `docs/ARCHITECTURE.md`; read it before changing the
 tracer, the filter or canonicalization. A supervisor must stay invisible to its tracees (no `TracerPid`, breakpoints
