@@ -90,15 +90,31 @@ static void join_path(char *dst, size_t size, const char *dir, const char *name)
 	}
 }
 
-static void setup_tree(void)
+/* The canonical path of the directory TMPDIR names (or /tmp), as the kernel resolves it. */
+static void temp_dir(char *dst, size_t size)
 {
 	const char *tmp = getenv("TMPDIR");
+	int here = open(".", O_RDONLY | O_DIRECTORY);
+
+	if (tmp == NULL || *tmp == '\0')
+		tmp = "/tmp";
+	if (chdir(tmp) < 0 || getcwd(dst, size) == NULL)
+		die("TMPDIR");
+	if (here >= 0) {
+		if (fchdir(here) < 0)
+			die("fchdir");
+		close(here);
+	}
+}
+
+static void setup_tree(void)
+{
+	char tmp[PATH_MAX];
 	char name[32];
 	char cur[PATH_MAX];
 	int fd;
 
-	if (tmp == NULL || *tmp == '\0')
-		tmp = "/tmp";
+	temp_dir(tmp, sizeof(tmp));
 	snprintf(name, sizeof(name), "sysbench.%d", (int) getpid());
 	join_path(base, sizeof(base), tmp, name);
 	if (mkdir(base, 0700) < 0)
