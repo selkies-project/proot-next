@@ -1,25 +1,37 @@
-//! Binding tables: longest-prefix substitution between guest and host paths.
+//! Binding tables: longest-prefix substitution between guest and host paths,
+//! and the descriptors the path walk starts from.
 
 use crate::config::{Binding, Config, trim_slashes};
 use crate::procs::ProcTable;
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
-/// Entries kept in the directory cache before it is cleared wholesale.
-const DIR_CACHE_MAX: usize = 65_536;
+/// A cache entry's key: the view's id and the canonical guest directory.
+type CacheKey = (u64, Vec<u8>);
 
-/// Canonical guest directories known to exist and not be symlinks, shared
-/// by every view of one supervisor.
+/// Directory descriptors kept in the cache before it is cleared wholesale.
 ///
-/// Lets the walk skip one `lstat` per intermediate component.  Entries are
-/// keyed by the view they were resolved in, since the same guest path names
-/// different host directories in different views, and the whole cache is
-/// flushed by [`DirCache::flush`] after any syscall that may replace a
-/// directory, whichever view made it: the host directories are shared.
+/// Each entry holds an open descriptor, so the cap bounds the supervisor's
+/// descriptor table rather than its memory.
+const DIR_CACHE_MAX: usize = 512;
+
+/// `O_PATH` descriptors of canonical guest directories already walked,
+/// shared by every view of one supervisor.
+///
+/// Lets the walk skip the `openat` of an intermediate component, and pins
+/// the directory the component named when it was walked: a later lookup
+/// through the entry lands in that directory whatever the name now points
+/// to.  Entries are keyed by the view they were resolved in, since the same
+/// guest path names different host directories in different views, and the
+/// whole cache is flushed by [`DirCache::flush`] after any syscall that may
+/// replace a directory, whichever view made it: the host directories are
+/// shared.
 #[derive(Debug)]
 pub struct DirCache {
-    entries: RwLock<HashSet<(u64, Vec<u8>)>>,
+    entries: RwLock<HashMap<CacheKey, Arc<OwnedFd>>>,
     /// False when `PROOT_NO_PATH_CACHE` is set.
     enabled: bool,
 }
@@ -28,7 +40,7 @@ impl DirCache {
     /// Creates an empty cache, disabled when `PROOT_NO_PATH_CACHE` is set.
     pub fn new() -> DirCache {
         DirCache {
-            entries: RwLock::new(HashSet::new()),
+            entries: RwLock::new(HashMap::new()),
             enabled: std::env::var_os("PROOT_NO_PATH_CACHE").is_none(),
         }
     }
@@ -37,12 +49,53 @@ impl DirCache {
     ///
     /// Call after `mkdir`, `rmdir`, `rename`, `unlink`, `symlink`, `link`,
     /// `mknod` or any other syscall that can turn a directory into something
-    /// else (or the reverse); changes made from outside PRoot are not seen.
+    /// else (or the reverse); changes made from outside PRoot are not seen
+    /// until then, and a lookup through a stale entry stays in the directory
+    /// it pinned.
     pub fn flush(&self) {
         if let Ok(mut c) = self.entries.write() {
             c.clear();
         }
     }
+}
+
+/// The host side of the root or of a binding, held open once.
+///
+/// Every walk starts from one of these descriptors rather than from the
+/// textual host prefix, so a rename of the prefix's parents on the host (the
+/// rootfs under a bound `$HOME`, say) cannot redirect it.  A host that does
+/// not exist yet is opened on the first lookup that finds it there.
+#[derive(Debug)]
+pub struct Pin {
+    host: Vec<u8>,
+    fd: OnceLock<Arc<OwnedFd>>,
+}
+
+impl Pin {
+    fn new(host: Vec<u8>) -> Pin {
+        Pin {
+            host,
+            fd: OnceLock::new(),
+        }
+    }
+
+    /// The descriptor, opening the host side on first use; `None` while it
+    /// does not exist (a symlink is never a host side: `resolve_host` ran).
+    pub fn get(&self) -> Option<Arc<OwnedFd>> {
+        if let Some(fd) = self.fd.get() {
+            return Some(fd.clone());
+        }
+        let fd = open_path(&self.host, libc::O_NOFOLLOW)?;
+        let _ = self.fd.set(Arc::new(fd));
+        self.fd.get().cloned()
+    }
+}
+
+/// Opens a host path as an `O_PATH|O_CLOEXEC` descriptor with extra `flags`.
+fn open_path(host: &[u8], flags: i32) -> Option<OwnedFd> {
+    let c = CString::new(host.to_vec()).ok()?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC | flags) };
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 impl Default for DirCache {
@@ -63,6 +116,13 @@ pub struct Fs {
     pub bindings: Vec<Binding>,
     /// True when root is `/` and there are no bindings: translation is a no-op.
     pub identity: bool,
+    /// True when guest `/proc` is the host's: its magic links mean what they
+    /// mean on the host.
+    pub proc_is_host: bool,
+    /// The root's host side, held open.
+    root_pin: Pin,
+    /// Each binding's host side, held open; same order as `bindings`.
+    pins: Vec<Pin>,
     /// Identifies this view's entries in the shared directory cache.
     id: u64,
     /// Directory cache shared with every other view of the supervisor.
@@ -118,15 +178,20 @@ impl Fs {
         bindings.reverse();
         bindings.sort_by_key(|b| std::cmp::Reverse(b.guest.len()));
         let identity = root == b"/" && bindings.iter().all(|b| b.host == b.guest);
+        let pins = bindings.iter().map(|b| Pin::new(b.host.clone())).collect();
         let mut fs = Fs {
+            root_pin: Pin::new(root.clone()),
             root,
             bindings,
             identity,
+            proc_is_host: false,
+            pins,
             id: NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed),
             cache,
             procs,
         };
         fs.canonicalize_bindings();
+        fs.proc_is_host = fs.substitute_guest_to_host(b"/proc") == b"/proc";
         fs
     }
 
@@ -155,29 +220,36 @@ impl Fs {
         for (b, c) in self.bindings.iter_mut().zip(canonical) {
             b.guest = c;
         }
-        self.bindings.sort_by_key(|b| std::cmp::Reverse(b.guest.len()));
+        let mut pairs: Vec<(Binding, Pin)> = std::mem::take(&mut self.bindings)
+            .into_iter()
+            .zip(std::mem::take(&mut self.pins))
+            .collect();
+        pairs.sort_by_key(|(b, _)| std::cmp::Reverse(b.guest.len()));
+        (self.bindings, self.pins) = pairs.into_iter().unzip();
         self.identity = self.root == b"/" && self.bindings.iter().all(|b| b.host == b.guest);
     }
 
-    /// Whether `guest` is a canonical directory the cache has seen in this view.
+    /// The pinned directory of a canonical guest directory the cache has seen in this view.
     ///
     /// # Arguments
     /// * `guest` - Canonical absolute guest path.
-    pub fn cache_has_dir(&self, guest: &[u8]) -> bool {
-        self.cache.enabled
-            && self
-                .cache
-                .entries
-                .read()
-                .map(|c| c.contains(&(self.id, guest.to_vec())))
-                .unwrap_or(false)
+    pub fn cache_get(&self, guest: &[u8]) -> Option<Arc<OwnedFd>> {
+        if !self.cache.enabled {
+            return None;
+        }
+        self.cache
+            .entries
+            .read()
+            .ok()
+            .and_then(|c| c.get(&(self.id, guest.to_vec())).cloned())
     }
 
-    /// Records that `guest` resolved to a real directory in this view.
+    /// Records the directory `guest` resolved to in this view.
     ///
     /// # Arguments
     /// * `guest` - Canonical absolute guest path.
-    pub fn cache_add_dir(&self, guest: &[u8]) {
+    /// * `fd` - Its `O_PATH` descriptor.
+    pub fn cache_put(&self, guest: &[u8], fd: Arc<OwnedFd>) {
         if !self.cache.enabled {
             return;
         }
@@ -185,7 +257,54 @@ impl Fs {
             if c.len() >= DIR_CACHE_MAX {
                 c.clear();
             }
-            c.insert((self.id, guest.to_vec()));
+            c.insert((self.id, guest.to_vec()), fd);
+        }
+    }
+
+    /// Whether `guest` is a canonical directory the cache has seen in this view.
+    #[cfg(test)]
+    pub fn cache_has_dir(&self, guest: &[u8]) -> bool {
+        self.cache_get(guest).is_some()
+    }
+
+    /// The pinned host side of the binding whose guest path is exactly
+    /// `guest`, or of the root for `/`.
+    ///
+    /// # Returns
+    /// `None` when `guest` is no mount point of this view; `Some(None)` when
+    /// it is one whose host side does not exist.
+    pub fn mount_pin(&self, guest: &[u8]) -> Option<Option<Arc<OwnedFd>>> {
+        if let Some(i) = self.bindings.iter().position(|b| b.guest == guest) {
+            return Some(self.pins[i].get());
+        }
+        (guest == b"/").then(|| self.root_pin.get())
+    }
+
+    /// Whether a binding lies below `guest`, which then stands in the view as a
+    /// directory even where the host side has nothing under the name: in a
+    /// rootfs the placeholders of `glue` could not be made in, say.
+    ///
+    /// # Arguments
+    /// * `guest` - Canonical absolute guest path.
+    pub fn binding_below(&self, guest: &[u8]) -> bool {
+        self.bindings
+            .iter()
+            .any(|b| b.guest.len() > guest.len() && is_prefix(guest, &b.guest))
+    }
+
+    /// The pinned mount point under which `guest` lies, and the path from there.
+    ///
+    /// # Arguments
+    /// * `guest` - Canonical absolute guest path.
+    ///
+    /// # Returns
+    /// The binding's (or root's) descriptor, `None` when its host side does
+    /// not exist, and the remainder of `guest` below it with its leading
+    /// slash (empty for the mount point itself).
+    pub fn pin_for_guest<'a>(&self, guest: &'a [u8]) -> (Option<Arc<OwnedFd>>, &'a [u8]) {
+        match self.bindings.iter().position(|b| is_prefix(&b.guest, guest)) {
+            Some(i) => (self.pins[i].get(), rest_after(&self.bindings[i].guest, guest)),
+            None => (self.root_pin.get(), rest_after(b"/", guest)),
         }
     }
 

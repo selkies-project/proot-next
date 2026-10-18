@@ -1,9 +1,8 @@
-//! Translating a tracee's `(dirfd, path)` into a host path, and back.
-//!
-//! OWNER: fs subagent.
+//! Translating a tracee's `(dirfd, path)` into the object to act on, or
+//! into a host path, and back.
 
 use super::Fs;
-use super::canon::canonicalize;
+use super::canon::{Resolved, resolve};
 use crate::sys::{PATH_MAX, Result};
 
 /// The guest path of a tracee's working directory.
@@ -24,7 +23,7 @@ pub fn guest_cwd(fs: &Fs, pid: u32) -> Result<Vec<u8>> {
 }
 
 /// Drops the ` (deleted)` marker `/proc` appends to links of unlinked targets.
-fn strip_deleted(mut host: Vec<u8>) -> Vec<u8> {
+pub fn strip_deleted(mut host: Vec<u8>) -> Vec<u8> {
     const MARK: &[u8] = b" (deleted)";
     if host.len() > MARK.len() + 1 && host.ends_with(MARK) {
         host.truncate(host.len() - MARK.len());
@@ -50,11 +49,12 @@ pub fn guest_fd_path(fs: &Fs, pid: u32, fd: i32) -> Result<Vec<u8>> {
     Ok(detranslate_path(fs, &host))
 }
 
-/// Translates a path as seen by a tracee into the host path to operate on.
+/// Translates a path as seen by a tracee into the object to operate on.
 ///
 /// Relative paths are resolved against `dirfd` (`AT_FDCWD` means the tracee's
 /// cwd) by reading the descriptor's own path from `/proc`, so the whole path
-/// is canonicalized inside the guest namespace before substitution.
+/// is canonicalized inside the guest namespace, on the descriptors the view
+/// holds open (see [`resolve`]).
 ///
 /// # Arguments
 /// * `fs` - Guest filesystem view.
@@ -64,11 +64,12 @@ pub fn guest_fd_path(fs: &Fs, pid: u32, fd: i32) -> Result<Vec<u8>> {
 /// * `deref_final` - Follow a symlink in the final component.
 ///
 /// # Returns
-/// An absolute host path.
+/// The canonical guest path, its host path, and the pinned directory and
+/// name to act on.
 ///
 /// # Errors
 /// Errno from the walk, or `EBADF` when `dirfd` cannot be resolved.
-pub fn translate_path(fs: &Fs, pid: u32, dirfd: i32, path: &[u8], deref_final: bool) -> Result<Vec<u8>> {
+pub fn translate(fs: &Fs, pid: u32, dirfd: i32, path: &[u8], deref_final: bool) -> Result<Resolved> {
     let guest = if path.first() == Some(&b'/') {
         path.to_vec()
     } else {
@@ -85,11 +86,25 @@ pub fn translate_path(fs: &Fs, pid: u32, dirfd: i32, path: &[u8], deref_final: b
         }
         base
     };
-    let canon = canonicalize(fs, pid, &guest, deref_final)?;
-    if canon.len() >= PATH_MAX {
+    let resolved = resolve(fs, pid, &guest, deref_final)?;
+    if resolved.guest.len() >= PATH_MAX {
         return Err(libc::ENAMETOOLONG);
     }
-    Ok(fs.substitute_guest_to_host(&canon))
+    Ok(resolved)
+}
+
+/// Translates a path as seen by a tracee into a textual host path, for the
+/// callers that hand the path to a program or to the tracee itself (the
+/// exec plan, the ptrace tier's in-place rewrites): the kernel then resolves
+/// it again on the host.
+///
+/// # Arguments
+/// As [`translate`].
+///
+/// # Returns
+/// An absolute host path.
+pub fn translate_path(fs: &Fs, pid: u32, dirfd: i32, path: &[u8], deref_final: bool) -> Result<Vec<u8>> {
+    translate(fs, pid, dirfd, path, deref_final).map(|r| r.host)
 }
 
 /// Translates a host path back into the guest's view (for `readlink` on
