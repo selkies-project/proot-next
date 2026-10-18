@@ -434,6 +434,81 @@ fn bound_files_show_in_directory_listings() {
     assert_eq!(std::fs::read(d.join("icd.json")).unwrap(), b"{\"nvidia\":1}");
 }
 
+/// A guest renaming a directory of its own away and planting a symlink to a
+/// host directory in its place, while another of its threads opens or
+/// creates a file through it (`tests/probes/pathrace.c`), never gets the
+/// host directory: the supervisor acts through the directory descriptors
+/// the walk pinned, not on a path string the kernel walks again.  The guest
+/// root is a bare directory with the host's `/usr` bound in for the probe,
+/// so the host directory the link points to is outside every binding.
+#[test]
+fn racing_a_lookup_against_a_rename_stays_inside_the_guest() {
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: no C compiler for the race probe");
+        return;
+    }
+    let d = tmpdir("pathrace");
+    let probe = d.join("pathrace");
+    let cc = Command::new("cc")
+        .args(["-O1", "-pthread", "-o"])
+        .arg(&probe)
+        .arg(repo().join("tests/probes/pathrace.c"))
+        .status()
+        .unwrap();
+    assert!(cc.success(), "compiling pathrace.c");
+    let root = d.join("root");
+    std::fs::create_dir_all(root.join("work")).unwrap();
+    // The chain the planted link points to, as the host would serve it.
+    let outside = d.join("outside");
+    let mut host_chain = outside.clone();
+    for i in 1..=6 {
+        host_chain.push(format!("a{i}"));
+    }
+    std::fs::create_dir_all(&host_chain).unwrap();
+    std::fs::write(host_chain.join("flag"), "outside\n").unwrap();
+    let mut args: Vec<String> = vec!["-r".into(), root.display().to_string()];
+    for dir in ["/usr", "/lib", "/lib64", "/bin"] {
+        if Path::new(dir).exists() {
+            args.push("-b".into());
+            args.push(format!("{dir}:{dir}"));
+        }
+    }
+    args.push("-b".into());
+    args.push(format!("{}:/probe", d.display()));
+    args.extend(
+        [
+            "/probe/pathrace",
+            "/work",
+            &outside.display().to_string(),
+            "5",
+            "4",
+        ]
+        .iter()
+        .map(|a| a.to_string()),
+    );
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let o = run(&argv);
+    let out = stdout(&o);
+    let err = String::from_utf8_lossy(&o.stderr);
+    let final_line = out.lines().find(|l| l.starts_with("FINAL ")).unwrap_or_default();
+    let count = |key: &str| -> u64 {
+        final_line
+            .split_whitespace()
+            .find_map(|f| f.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(u64::MAX)
+    };
+    assert_eq!(o.status.code(), Some(0), "{out}\n{err}");
+    assert_eq!(count("outside"), 0, "{out}\n{err}");
+    assert!(count("inside") > 0, "{out}\n{err}");
+    assert!(count("created") > 0, "{out}\n{err}");
+    assert!(
+        !host_chain.join("wn").exists(),
+        "a file was created outside the guest"
+    );
+    assert_eq!(std::fs::read(host_chain.join("flag")).unwrap(), b"outside\n");
+}
+
 /// A binding whose guest path runs through a symlink of the rootfs is found
 /// under the canonical path lookups resolve to.  Steam's 32-bit reaper asks
 /// for `/lib/ld-linux.so.2` on a merged-usr host where `/lib` points to

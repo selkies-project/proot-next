@@ -13,6 +13,7 @@ regression shows up here before it shows up in a browser or a game.
 | `bsstail.c` | x86_64 or aarch64 host, `cc` (and `-m32` on x86_64) | The page after a program's bss reads zero once the guest stub's loader has mapped it, as the kernel leaves it; Ubuntu's i386 `ld.so` allocates its first link map there. |
 | `winefilter.c` | x86_64 host, `cc` | Installs the seccomp filter Proton's Wine uses for some games, which traps syscalls made from low addresses as Windows code; the guest stub's gates must lie above its line. |
 | `denyunknown.c` | x86_64 or aarch64 host, `cc` | Runs a command under a seccomp filter that refuses unknown syscall numbers, as container runtimes' default profiles do. |
+| `pathrace.c` | host, `cc` | A guest renaming its own directories away and planting symlinks to a host directory in their place, while its other threads open and create files through them, never reaches the host directory: the supervisor acts through the descriptors its walk pinned. Built by the test. |
 | `dumpable.c` | host, `cc` | A process that clears its dumpable flag with `prctl`, as Bitwarden's process isolation and Chromium's sandbox do, keeps opening paths, descriptor-relative paths and threads, and reads the flag back as it set it. Built by the test. |
 
 `build.sh` builds the two Rust probes into `tests/probes/bin/`, which the
