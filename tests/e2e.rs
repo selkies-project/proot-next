@@ -879,6 +879,29 @@ fn namespaces_are_refused_inside_the_guest() {
     }
 }
 
+/// A child the tracer hears from before its creator's fork event waits for
+/// the event: run on, it exec'd in no view and the event then overwrote its
+/// record with the parent's, so `/proc/self/exe` read as the shell about once
+/// in a thousand execs in a nested view.  Four nested views fork and exec at
+/// once here, and every program must find itself.
+#[test]
+fn a_child_seen_before_its_fork_event_keeps_its_exec() {
+    let p = proot();
+    let p = p.to_str().unwrap();
+    let inner = format!("{p} -r / /bin/sh -c 'for i in $(seq 200); do readlink /proc/self/exe; done'");
+    let outer = format!("for j in 1 2 3 4; do {inner} & done; wait");
+    let o = run(&["-r", "/", "/bin/sh", "-c", &outer]);
+    let out = stdout(&o);
+    let wrong: Vec<&str> = out.lines().filter(|l| !l.ends_with("readlink")).collect();
+    assert_eq!(out.lines().count(), 800, "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        wrong.is_empty(),
+        "{} of 800 read another program: {:?}",
+        wrong.len(),
+        &wrong[..wrong.len().min(3)]
+    );
+}
+
 /// proot-apps' GUI installer runs `proot -R app /install` from inside its own
 /// guest.  The inner proot gets a view of its own: its bindings and working
 /// directory, inherited by its children, invisible to the outer guest, and

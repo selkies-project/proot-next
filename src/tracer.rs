@@ -30,6 +30,11 @@ pub fn run(ctx: &Arc<Ctx>, root: i32) -> i32 {
     // must not keep the supervisor alive.
     let mut tracees: std::collections::HashSet<i32> = std::collections::HashSet::new();
     tracees.insert(root);
+    // Children whose first stop came before their creator's fork or clone
+    // event.  Each waits there until the event copies the creator's state to
+    // it: run on, it would exec in no view, and the event would then
+    // overwrite what its exec recorded (`/proc/self/exe` read as the parent).
+    let mut unregistered: std::collections::HashSet<i32> = std::collections::HashSet::new();
     loop {
         let mut status = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
@@ -53,6 +58,15 @@ pub fn run(ctx: &Arc<Ctx>, root: i32) -> i32 {
             }
             ctx.forget(pid);
             tracees.remove(&pid);
+            // A creator killed in its fork stop never reports the event: a
+            // child left waiting for it goes on with no state copied.
+            unregistered.retain(|&child| {
+                let waits = creator(child).is_some_and(|c| tracees.contains(&c));
+                if !waits {
+                    resume(ctx, child);
+                }
+                waits
+            });
             if tracees.is_empty() {
                 break;
             }
@@ -81,8 +95,12 @@ pub fn run(ctx: &Arc<Ctx>, root: i32) -> i32 {
             },
             libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
                 if let Ok(child) = ptrace::geteventmsg(pid) {
-                    tracees.insert(child as i32);
-                    ctx.fork(pid, child as i32);
+                    let child = child as i32;
+                    tracees.insert(child);
+                    ctx.fork(pid, child);
+                    if unregistered.remove(&child) {
+                        resume(ctx, child);
+                    }
                 }
             }
             libc::PTRACE_EVENT_EXEC => {
@@ -90,8 +108,12 @@ pub fn run(ctx: &Arc<Ctx>, root: i32) -> i32 {
                 // the record set by the execve handler.
             }
             libc::PTRACE_EVENT_STOP => {
-                // A new child may report its first stop before the parent's clone event.
-                tracees.insert(pid);
+                // A new child may report its first stop before the parent's
+                // clone event; it is held until the event registers it.
+                if tracees.insert(pid) && sig == libc::SIGTRAP {
+                    unregistered.insert(pid);
+                    continue;
+                }
                 // Group-stop: keep the tracee stopped (job control, SIGSTOP from
                 // outside) but stay able to hear about it.  Anything else here is
                 // a freshly attached child or a PTRACE_INTERRUPT: just resume.
@@ -185,6 +207,32 @@ pub fn run(ctx: &Arc<Ctx>, root: i32) -> i32 {
         }
     }
     exit_code
+}
+
+/// Resumes a tracee held at its first stop.
+fn resume(ctx: &Ctx, pid: i32) {
+    if let Err(e) = ptrace::cont(pid, 0)
+        && e != libc::ESRCH
+    {
+        note!(ctx, 1, "pid {pid}: cont: {}", strerror(e));
+    }
+}
+
+/// The tracee whose fork or clone event registers `pid`: its thread group's
+/// leader for a new thread, else its parent process.  `None` once it is gone.
+///
+/// # Arguments
+/// * `pid` - A tracee held at its first stop.
+fn creator(pid: i32) -> Option<i32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().parse::<i32>().ok())
+    };
+    let tgid = field("Tgid:")?;
+    if tgid != pid { Some(tgid) } else { field("PPid:") }
 }
 
 /// One line describing a tracee's address space, for fatal-signal reports:
