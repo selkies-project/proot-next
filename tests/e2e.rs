@@ -404,6 +404,66 @@ fn bwrap_mode_builds_a_container() {
     );
 }
 
+/// bwrap mode starts where bubblewrap does and exports `PWD` as the directory
+/// it entered: GE-Proton's protonfixes reads the game's library out of `PWD`
+/// and stopped with a `KeyError` under pressure-vessel without it.  Without
+/// `--chdir` the caller's directory is kept where the sandbox has it, else
+/// `$HOME`, else `/`.
+#[test]
+fn bwrap_mode_exports_pwd_where_it_starts() {
+    let d = tmpdir("bwrap-pwd");
+    let bwrap = d.join("bwrap");
+    std::os::unix::fs::symlink(proot(), &bwrap).unwrap();
+    std::fs::create_dir_all(d.join("work")).unwrap();
+    std::fs::create_dir_all(d.join("home")).unwrap();
+    let home = d.join("home");
+    let home = home.to_str().unwrap();
+    let base = [
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+    ];
+    let show = "printf '%s %s\\n' \"$PWD\" \"$(/bin/pwd)\"";
+    let run = |cwd: &Path, extra: &[&str]| {
+        let o = Command::new(&bwrap)
+            .current_dir(cwd)
+            .env("PWD", "/stale")
+            .env("HOME", home)
+            .args(base)
+            .args(extra)
+            .args(["/bin/sh", "-c", show])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        stdout(&o)
+    };
+    let work = d.join("work");
+    let work = work.to_str().unwrap();
+    assert_eq!(run(&d, &["--bind", work, "/w", "--chdir", "/w"]), "/w /w");
+    assert_eq!(
+        run(&d.join("work"), &["--bind", work, work]),
+        format!("{work} {work}")
+    );
+    assert_eq!(
+        run(&d.join("work"), &["--bind", home, home]),
+        format!("{home} {home}")
+    );
+    assert_eq!(run(&d.join("work"), &[]), "/ /");
+}
+
 /// NVIDIA under proot-apps: driver files bound one by one into the rootfs's
 /// vendor directories were found by name but missing from the listings
 /// libglvnd and the Vulkan loader take drivers from, so Chrome ran on Mesa.

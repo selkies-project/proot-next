@@ -21,6 +21,7 @@
 //! plan the supervisor wrote before letting it go.
 
 use crate::access;
+use crate::cli::bwrap;
 use crate::config::Config;
 use crate::exec::shim;
 use crate::fs::translate::{detranslate_path, translate_path};
@@ -187,7 +188,35 @@ pub fn run(config: Config) -> Result<i32, String> {
     .chain(ctx.config.command.iter().skip(1).map(|c| c.as_ptr()))
     .chain(std::iter::once(std::ptr::null()))
     .collect();
-    let env_storage: Option<Vec<*const libc::c_char>> = ctx.config.env.as_ref().map(|e| {
+    // The initial cwd is a guest path; the child's chdir(2) is a traced syscall
+    // so the tracer translates it like any other.
+    let is_dir = |guest: &[u8]| {
+        translate_path(&ctx.root.fs, std::process::id(), libc::AT_FDCWD, guest, true)
+            .map(|h| {
+                std::fs::metadata(std::ffi::OsStr::from_bytes_hack(&h))
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    };
+    let start = bwrap::start_dir(&ctx.config, is_dir);
+    let host_cwd_exists = start.is_some();
+    if !host_cwd_exists && !(ctx.config.bwrap_mode && ctx.config.cwd_default) {
+        eprintln!(
+            "proot: can't chdir to {} in the guest rootfs, using /",
+            String::from_utf8_lossy(&ctx.config.cwd)
+        );
+    }
+    let start = start.unwrap_or_else(|| b"/".to_vec());
+    let cwd = CString::new(start.clone()).map_err(|_| "cwd contains NUL")?;
+    let env = ctx.config.env.as_ref().map(|e| {
+        if ctx.config.bwrap_mode {
+            bwrap::with_pwd(e, &start)
+        } else {
+            e.clone()
+        }
+    });
+    let env_storage: Option<Vec<*const libc::c_char>> = env.as_ref().map(|e| {
         e.iter()
             .map(|c| c.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
@@ -197,28 +226,6 @@ pub fn run(config: Config) -> Result<i32, String> {
         Some(v) => v.as_ptr(),
         None => unsafe { environ },
     };
-    // The initial cwd is a guest path; the child's chdir(2) is a traced syscall
-    // so the tracer translates it like any other.
-    let cwd = CString::new(ctx.config.cwd.clone()).map_err(|_| "cwd contains NUL")?;
-    let host_cwd_exists = translate_path(
-        &ctx.root.fs,
-        std::process::id(),
-        libc::AT_FDCWD,
-        &ctx.config.cwd,
-        true,
-    )
-    .map(|h| {
-        std::fs::metadata(std::ffi::OsStr::from_bytes_hack(&h))
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-    })
-    .unwrap_or(false);
-    if !host_cwd_exists {
-        eprintln!(
-            "proot: can't chdir to {} in the guest rootfs, using /",
-            String::from_utf8_lossy(&ctx.config.cwd)
-        );
-    }
     let slash = CString::new("/").unwrap();
     let mailbox = ctx.mailbox;
     let pinned_cwd: Option<CString> = if no_ptrace {
@@ -229,15 +236,9 @@ pub fn run(config: Config) -> Result<i32, String> {
         None
     };
     let initial_cwd: Vec<u8> = if host_cwd_exists {
-        translate_path(
-            &ctx.root.fs,
-            std::process::id(),
-            libc::AT_FDCWD,
-            &ctx.config.cwd,
-            true,
-        )
-        .map(|h| detranslate_path(&ctx.root.fs, &h))
-        .unwrap_or_else(|_| b"/".to_vec())
+        translate_path(&ctx.root.fs, std::process::id(), libc::AT_FDCWD, &start, true)
+            .map(|h| detranslate_path(&ctx.root.fs, &h))
+            .unwrap_or_else(|_| b"/".to_vec())
     } else {
         b"/".to_vec()
     };
@@ -382,7 +383,7 @@ pub fn run(config: Config) -> Result<i32, String> {
         &format!("{{\"child-pid\": {pid}}}\n"),
     );
     let go = if trap_mode {
-        match plan_first_trapped(&ctx, pid) {
+        match plan_first_trapped(&ctx, pid, env.as_deref()) {
             Ok(()) => 0u8,
             Err(libc::ENOENT) => 127,
             Err(_) => 126,
@@ -426,10 +427,11 @@ pub fn run(config: Config) -> Result<i32, String> {
 /// # Arguments
 /// * `ctx` - Shared supervisor state, with the first tracee registered.
 /// * `pid` - The first tracee.
+/// * `env` - The environment the child execs with, `None` for the supervisor's.
 ///
 /// # Errors
 /// The errno the exec would have failed with.
-fn plan_first_trapped(ctx: &Ctx, pid: i32) -> crate::sys::Result<()> {
+fn plan_first_trapped(ctx: &Ctx, pid: i32, env: Option<&[CString]>) -> crate::sys::Result<()> {
     let argv: Vec<Vec<u8>> = std::iter::once(ctx.config.argv0.as_ref().unwrap_or(&ctx.config.command[0]))
         .chain(ctx.config.command.iter().skip(1))
         .map(|c| c.as_bytes().to_vec())
@@ -438,7 +440,7 @@ fn plan_first_trapped(ctx: &Ctx, pid: i32) -> crate::sys::Result<()> {
         Some(i) => (e[..i].to_vec(), e[i + 1..].to_vec()),
         None => (e.to_vec(), Vec::new()),
     };
-    let env: Vec<(Vec<u8>, Vec<u8>)> = match &ctx.config.env {
+    let env: Vec<(Vec<u8>, Vec<u8>)> = match env {
         Some(e) => e.iter().map(|c| split(c.as_bytes())).collect(),
         None => std::env::vars_os()
             .map(|(k, v)| (k.into_vec(), v.into_vec()))

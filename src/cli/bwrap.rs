@@ -165,6 +165,12 @@ pub fn parse(args: Vec<OsString>, host: &dyn Host) -> Result<Config, CliError> {
         let _ = fs::remove_dir_all(&root);
         return Err(e);
     }
+    if !ops.iter().any(|op| op.option == "--chdir") {
+        // bubblewrap stays in the caller's working directory where the
+        // sandbox has it (see [`start_dir`]).
+        cfg.cwd = host.cwd();
+        cfg.cwd_default = true;
+    }
     cfg.env = Some(
         env.into_iter()
             .map(|(mut k, v)| {
@@ -181,6 +187,47 @@ pub fn parse(args: Vec<OsString>, host: &dyn Host) -> Result<Config, CliError> {
     cfg.argv0 = argv0.map(|a| CString::new(a).unwrap_or_default());
     cfg.bwrap_mode = true;
     Ok(cfg)
+}
+
+/// The directory a launch starts the command in, given which guest paths
+/// are directories of its view: `config.cwd` where the view has it, and in
+/// bwrap mode without `--chdir`, then `$HOME` of the command's environment, as
+/// bubblewrap goes on to.  `None` leaves the command at `/`.
+///
+/// # Arguments
+/// * `config` - The launch, its `cwd` a guest path.
+/// * `is_dir` - Whether a guest path is a directory of the view.
+pub fn start_dir(config: &Config, is_dir: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
+    if is_dir(&config.cwd) {
+        return Some(config.cwd.clone());
+    }
+    if !(config.bwrap_mode && config.cwd_default) {
+        return None;
+    }
+    let home = config.env.as_deref().and_then(|env| var(env, b"HOME"))?;
+    is_dir(&home).then_some(home)
+}
+
+/// `env` with `PWD` naming `dir`, as bubblewrap exports it once it has entered
+/// the directory the command starts in; a program reads its working directory
+/// from it, as Proton's protonfixes does to find the game's library.
+pub fn with_pwd(env: &[CString], dir: &[u8]) -> Vec<CString> {
+    let mut pwd = b"PWD=".to_vec();
+    pwd.extend_from_slice(dir);
+    env.iter()
+        .filter(|e| !e.as_bytes().starts_with(b"PWD="))
+        .cloned()
+        .chain(CString::new(pwd).ok())
+        .collect()
+}
+
+/// The value of `name` in an environment of `NAME=value` entries.
+fn var(env: &[CString], name: &[u8]) -> Option<Vec<u8>> {
+    env.iter().find_map(|e| {
+        let e = e.as_bytes();
+        (e.len() > name.len() && e.starts_with(name) && e[name.len()] == b'=')
+            .then(|| e[name.len() + 1..].to_vec())
+    })
 }
 
 /// Splits the command line into operations and the command.

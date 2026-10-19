@@ -260,7 +260,7 @@ pub fn plan(
         String::from_utf8_lossy(&nested.fs.root),
         nested.fs.bindings.len()
     );
-    let (cwd, warning) = nested_cwd(&tracee, &nested, &config);
+    let (cwd, pwd, warning) = nested_cwd(&tracee, &nested, &config);
     let cwd_host = translate_path(&nested.fs, pid, libc::AT_FDCWD, &cwd, true)
         .unwrap_or_else(|_| nested.fs.root.clone());
     let command = match resolve_command(&nested, pid, &config, &tracee, &cwd) {
@@ -289,7 +289,7 @@ pub fn plan(
     if let Some(a0) = &config.argv0 {
         cmd_argv[0] = a0.as_bytes().to_vec();
     }
-    let inner_env = match &config.env {
+    let mut inner_env: Vec<(Vec<u8>, Vec<u8>)> = match &config.env {
         Some(e) => e
             .iter()
             .map(|c| {
@@ -302,6 +302,11 @@ pub fn plan(
             .collect(),
         None => tracee.env.clone(),
     };
+    if config.bwrap_mode {
+        // bubblewrap exports the directory it entered (see `bwrap::with_pwd`).
+        inner_env.retain(|(k, _)| k != b"PWD");
+        inner_env.push((b"PWD".to_vec(), pwd));
+    }
     let mut plan = super::plan_in(
         ctx,
         &nested,
@@ -395,38 +400,52 @@ fn merge_setup(t: &mut Trampoline, config: &Config, warning: Option<String>) {
 ///
 /// A directory given on the command line is a path of the nested view.
 /// Without one, PRoot starts in the caller's working directory when it is
-/// visible in the new view, else in `/`.
-fn nested_cwd(tracee: &Tracee, nested: &View, config: &Config) -> (Vec<u8>, Option<String>) {
-    let wanted: Vec<u8> = if config.cwd_default {
+/// visible in the new view, else in `/`; bwrap mode tries `$HOME` before `/`,
+/// as bubblewrap does.
+///
+/// # Returns
+/// The canonical guest directory, the path as it was named (bwrap mode's
+/// `PWD`), and the warning for a directory the command line named in vain.
+fn nested_cwd(tracee: &Tracee, nested: &View, config: &Config) -> (Vec<u8>, Vec<u8>, Option<String>) {
+    let wanted: Option<Vec<u8>> = if config.cwd_default {
         let host = tracee.host_path(&tracee.cwd());
-        match nested.fs.substitute_host_to_guest(&host) {
-            Some(g) => g,
-            None => return (b"/".to_vec(), None),
-        }
+        nested.fs.substitute_host_to_guest(&host)
     } else if config.cwd.first() == Some(&b'/') {
-        config.cwd.clone()
+        Some(config.cwd.clone())
     } else {
         let mut p = b"/".to_vec();
         p.extend_from_slice(&config.cwd);
-        p
+        Some(p)
     };
-    let ok = translate_path(&nested.fs, tracee.pid, libc::AT_FDCWD, &wanted, true)
-        .map(|h| std::fs::metadata(std::ffi::OsStr::from_bytes(&h)).is_ok_and(|m| m.is_dir()))
-        .unwrap_or(false);
-    if ok {
-        let canonical = translate_path(&nested.fs, tracee.pid, libc::AT_FDCWD, &wanted, true)
+    let canonical = |guest: &[u8]| {
+        translate_path(&nested.fs, tracee.pid, libc::AT_FDCWD, guest, true)
+            .ok()
+            .filter(|h| std::fs::metadata(std::ffi::OsStr::from_bytes(h)).is_ok_and(|m| m.is_dir()))
             .map(|h| detranslate_path(&nested.fs, &h))
-            .unwrap_or(wanted);
-        return (canonical, None);
+    };
+    if let Some(wanted) = &wanted
+        && let Some(c) = canonical(wanted)
+    {
+        return (c, wanted.clone(), None);
     }
     if config.cwd_default {
-        return (b"/".to_vec(), None);
+        let home = config.env.as_deref().and_then(|env| {
+            env.iter()
+                .find_map(|e| e.as_bytes().strip_prefix(b"HOME=").map(<[u8]>::to_vec))
+        });
+        if let Some(home) = home.filter(|_| config.bwrap_mode)
+            && let Some(c) = canonical(&home)
+        {
+            return (c, home, None);
+        }
+        return (b"/".to_vec(), b"/".to_vec(), None);
     }
     (
         b"/".to_vec(),
+        b"/".to_vec(),
         Some(format!(
             "proot: can't chdir to {} in the guest rootfs, using /\n",
-            String::from_utf8_lossy(&wanted)
+            String::from_utf8_lossy(&wanted.unwrap_or_default())
         )),
     )
 }
