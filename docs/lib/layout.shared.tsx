@@ -15,5 +15,8 @@ export function baseOptions(): BaseLayoutProps {
       },
     ],
     githubUrl: `https://github.com/${gitConfig.user}/${gitConfig.repo}`,
+    // Light, dark, or the system's: the provider follows the system until a
+    // reader picks one, and the switch offers that choice back.
+    themeSwitch: { mode: 'light-dark-system' },
   };
 }
