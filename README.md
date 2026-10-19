@@ -4,7 +4,7 @@
 
 # proot-next
 
-[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0) [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selkies-project.github.io/proot-next/) [![Tests](https://github.com/selkies-project/proot-next/actions/workflows/tests.yml/badge.svg)](https://github.com/selkies-project/proot-next/actions/workflows/tests.yml) [![Release](https://img.shields.io/github/v/release/selkies-project/proot-next?display_name=tag)](https://github.com/selkies-project/proot-next/releases/latest)
+[![Tests](https://github.com/selkies-project/proot-next/actions/workflows/tests.yml/badge.svg)](https://github.com/selkies-project/proot-next/actions/workflows/tests.yml) [![Release](https://img.shields.io/github/v/release/selkies-project/proot-next?display_name=tag)](https://github.com/selkies-project/proot-next/releases/latest) [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0) [![Docs](https://img.shields.io/badge/docs-proot.selkies.io-blue)](https://proot.selkies.io/) [![Discord](https://img.shields.io/badge/dynamic/json?logo=discord&label=Discord%20Members&query=approximate_member_count&url=https%3A%2F%2Fdiscordapp.com%2Fapi%2Finvites%2FwDNGDeSW5F%3Fwith_counts%3Dtrue)](https://discord.gg/wDNGDeSW5F) [![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-blue)](https://deepwiki.com/selkies-project/proot-next)
 
 PRoot reimplemented in Rust: `chroot`, `mount --bind` and a bubblewrap front
 end without any privilege, for containers where user namespaces and FUSE are
