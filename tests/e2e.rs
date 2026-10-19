@@ -404,6 +404,20 @@ fn bwrap_mode_builds_a_container() {
     );
 }
 
+/// A program named through a directory that does not exist fails to execute
+/// with `ENOENT`, as the kernel's own exec does.  Since the walk on pinned
+/// descriptors fails such a lookup itself, the ptrace tier refused the exec
+/// without setting its result and the program saw `ENOSYS`: a shell said
+/// "Function not implemented" and returned 126 where it says "not found" and
+/// returns 127, and a Steam runtime took a missing game for a broken system.
+#[test]
+fn exec_through_a_missing_directory_fails_with_enoent() {
+    let o = run(&["-r", "/", "/bin/sh", "-c", "/proot-e2e-missing/x; echo rc=$?"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(stdout(&o), "rc=127", "{err}");
+    assert!(!err.contains("not implemented"), "{err}");
+}
+
 /// bwrap mode starts where bubblewrap does and exports `PWD` as the directory
 /// it entered: GE-Proton's protonfixes reads the game's library out of `PWD`
 /// and stopped with a `KeyError` under pressure-vessel without it.  Without

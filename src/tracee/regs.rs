@@ -36,6 +36,11 @@ mod arch {
         r.orig_rax = nr as u64;
     }
 
+    /// The result a skipped syscall returns: `rax`, `eax` for i386.
+    pub fn set_ret(r: &mut Raw, v: i64) {
+        r.rax = v as u64;
+    }
+
     pub fn arg(r: &Raw, i: usize) -> u64 {
         match abi(r) {
             Abi::I386 => {
@@ -202,6 +207,15 @@ mod arch {
         r.sysnum_override = Some(nr as i32);
     }
 
+    /// The result a skipped syscall returns: `x0`, `r0` for a compat tracee.
+    pub fn set_ret(r: &mut Raw, v: i64) {
+        r.regs[0] = if r.compat {
+            v as u64 & 0xffff_ffff
+        } else {
+            v as u64
+        };
+    }
+
     /// Arguments are x0..x5 or r0..r5 on both ABIs.
     pub fn arg(r: &Raw, i: usize) -> u64 {
         let v = r.regs[i.min(5)];
@@ -266,9 +280,13 @@ impl Regs {
         arch::sysnum(&self.cur)
     }
 
-    /// Replaces the syscall number (`-1` makes the kernel return `ENOSYS`).
-    pub fn set_sysnum(&mut self, nr: i64) {
-        arch::set_sysnum(&mut self.cur, nr);
+    /// Skips the syscall and makes it fail with `errno`: a tracer that sets the
+    /// number to `-1` at the entry or seccomp stop has the tracee see whatever
+    /// it put in the result register (seccomp(2), `SECCOMP_RET_TRACE`), which
+    /// is `ENOSYS` left alone.
+    pub fn fail(&mut self, errno: i32) {
+        arch::set_sysnum(&mut self.cur, -1);
+        arch::set_ret(&mut self.cur, -i64::from(errno));
     }
 
     /// Syscall argument `i` (0..6), in the register order of the tracee's ABI.

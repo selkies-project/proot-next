@@ -48,7 +48,7 @@ pub fn handle(ctx: &Ctx, regs: &mut Regs) {
                 regs.pid(),
                 crate::sys::strerror(e)
             );
-            regs.set_sysnum(-1);
+            regs.fail(e);
         }
         return;
     }
@@ -82,7 +82,7 @@ pub fn handle(ctx: &Ctx, regs: &mut Regs) {
             name(nr),
             crate::sys::strerror(e)
         );
-        regs.set_sysnum(-1);
+        regs.fail(e);
     }
 }
 
