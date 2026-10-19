@@ -1,3 +1,4 @@
 [codespell]
 skip = ./target,./docs/node_modules,./docs/.next,./docs/out,./docs/.source,./docs/package-lock.json,./LICENSE,./dist,./rootfs
-ignore-words-list = crate,ans,wont,crashers
+# fpr: GnuPG's colon-listing record of a key's fingerprint (GnuPG doc/DETAILS), read by install-steam.sh.
+ignore-words-list = crate,ans,wont,crashers,fpr

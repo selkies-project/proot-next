@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   workflows:
-    name: Lint the workflow files
+    name: Lint the workflow files and scripts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,6 +43,30 @@ jobs:
           tar -xzf actionlint.tar.gz actionlint
           tar -xJf shellcheck.tar.xz --strip-components=1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
           PATH="${PWD}:${PATH}" ./actionlint -color
+      - name: Lint the Steam installer and check
+        run: |
+          sh -n install-steam.sh
+          bash -n tests/steam/check.sh
+          ./shellcheck install-steam.sh tests/steam/check.sh
+
+  windows-probe:
+    name: Windows OpenGL probe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cross-compile the program tests/steam/check.sh runs through Proton
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-mingw-w64-x86-64
+          x86_64-w64-mingw32-gcc -O2 -o wgltri.exe tests/steam/wgltri.c \
+              -lopengl32 -lgdi32 -luser32 -mconsole
+          file wgltri.exe
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wgltri
+          path: wgltri.exe
 
   cargo:
     name: cargo test (${{ matrix.target.arch }})

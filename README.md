@@ -41,7 +41,7 @@ mkdir -p ~/.local/bin && cd ~/.local/bin \
   && chmod +x proot && ln -sf proot bwrap && ./proot --version
 ```
 
-Full documentation: https://selkies-project.github.io/proot-next/
+Full documentation: https://proot.selkies.io/
 
 ## Usage
 
@@ -56,6 +56,23 @@ ln -s proot bwrap && ./bwrap --ro-bind /usr /usr --proc /proc -- /bin/sh   # bwr
 The binary switches to the bubblewrap command line when its `argv[0]` ends in
 `bwrap`, busybox style.  Steam's pressure-vessel honours `$BWRAP`, so pointing
 that at the symlink is enough.
+
+## Steam
+
+Steam, Proton and Wine in a Debian-based amd64 container that has no user
+namespaces, where a stock Steam stops at "Steam now requires user namespaces
+to be enabled":
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/selkies-project/proot-next/main/install-steam.sh | sudo sh
+```
+
+That installs Steam with the 32-bit libraries it needs, puts the latest
+release's binary in `/usr/local/lib/proot-next` with the `bwrap` name beside
+it, and points Steam's own launcher at it (`PROOT_NEXT_VERSION` picks another
+release). Start Steam as usual. The Steam Linux Runtime is used exactly as
+Valve ships it, and the client's browser helper, native games and Proton all
+run through bwrap mode. `tests/steam/check.sh` exercises it the way Steam does.
 
 ## Building
 

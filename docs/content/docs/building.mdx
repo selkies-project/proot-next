@@ -45,7 +45,38 @@ through bindings, the i386 `socketcall` client and the 32-bit ARM probe.
 Each case is a failure first seen in a real application. Cases whose rootfs
 or probe is absent skip with a message. A change to translation, exec or the tracer
 is also run against a desktop application through proot-apps and, when it
-touches bwrap mode, against Steam in a selkies container.
+touches bwrap mode, against Steam in a selkies container with
+`tests/steam/check.sh`:
+
+```bash
+tests/steam/check.sh --home ~/steamtest --display :20 --force \
+    --games ~/steamtest/games --wgltri ~/steamtest/games/wgltri.exe --client /usr/lib/steam/bin_steam.sh
+```
+
+It runs the soldier, sniper and scout-on-soldier containers, OpenGL and Vulkan
+for both architectures against what the host itself renders with, an X11
+client, a native benchmark, a Windows OpenGL program through GE-Proton from
+`~/Steam/compatibilitytools.d`, and the client's sign-in window. `--games`
+names a root holding `usr/bin/glmark2` and `usr/bin/vkcube` under the home,
+where the containers see it (`dpkg-deb -x` of the packages will do); a binary
+the runtime cannot load is skipped. GE-Proton runs in the runtime its manifest
+asks for, as Steam runs it: GE-Proton 10 in sniper, GE-Proton 11 in Steam
+Linux Runtime 4, which an anonymous steamcmd cannot fetch. `--home`
+holds the runtimes as Steam installs them under `Steam/steamapps/common`.
+`--force` makes pressure-vessel take the stand-in even where its own
+bubblewrap works, and `--proot` names a build to check rather than the
+installed one. The Windows program is built from `tests/steam/wgltri.c`:
+
+```bash
+x86_64-w64-mingw32-gcc -O2 -o wgltri.exe tests/steam/wgltri.c -lopengl32 -lgdi32 -luser32 -mconsole
+```
+
+A host without 32-bit driver libraries leaves native 32-bit games on llvmpipe
+while 64-bit Proton keeps the GPU; on NVIDIA that is the container runtime's
+doing, whose CDI specification carries no 32-bit libraries
+([nvidia-container-toolkit#2035](https://github.com/NVIDIA/nvidia-container-toolkit/pull/2035)).
+The check compares each architecture's renderer in the container with the
+host's, which tells that apart from a fault of bwrap mode.
 
 ### Diagnostics while developing
 

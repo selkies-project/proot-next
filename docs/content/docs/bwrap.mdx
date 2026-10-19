@@ -62,6 +62,24 @@ unsandboxed. The match on the name `bwrap` can be turned off with
 
 ## Steam
 
+`install-steam.sh` sets a Debian-based amd64 image or system up for it: Steam
+from Valve's repository, its keys checked against their fingerprints, the
+32-bit libraries the client and games need, the release binary for the
+architecture, checked against the SHA-256 the release publishes, in
+`/usr/local/lib/proot-next` with `bwrap` beside it, and Steam's launcher
+diverted so that every way of starting Steam exports `BWRAP` to it. The
+`bwrap` name stays off `PATH`, so nothing but Steam picks it up. Run it as
+root, or under fakeroot in a rootless image build:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/selkies-project/proot-next/main/install-steam.sh | sudo sh
+```
+
+`PROOT_NEXT_VERSION=0.3.3` installs that release rather than the latest, and
+`PREFIX` moves `/usr/local`. Run again, it rewires an earlier install,
+proot-bwrap's included, to the binary it installs. The selkies KDE desktop
+images carry it.
+
 With `BWRAP` set, the Steam client's own browser helper, every Steam Linux
 Runtime container and every Proton launch run through proot-next. The things
 that made the helper impossible under PRoot are handled: a supervisor must not
