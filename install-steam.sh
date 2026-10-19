@@ -151,4 +151,4 @@ chmod 755 /usr/bin/steam
 
 apt-get clean
 rm -rf /var/lib/apt/lists/*
-echo "proot-next $("${libexec}/proot" --version 2>&1 | head -1) installed at ${libexec} and wired into /usr/bin/steam"
+echo "$("${libexec}/proot" --version 2>&1 | head -1) installed at ${libexec} and wired into /usr/bin/steam"
