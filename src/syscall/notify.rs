@@ -497,6 +497,22 @@ fn host_utimensat(r: &Req, resolved: &Resolved, times: Option<&[u8; 32]>, nofoll
     check(unsafe { libc::syscall(libc::SYS_utimensat, dfd, c.as_ptr(), tp, nofollow_flag(nofollow)) })
 }
 
+/// `O_NOFOLLOW` when the host open must not follow a final symlink.
+///
+/// The tracee's own `O_NOFOLLOW` is dropped first: a mount point is opened
+/// through its pinned descriptor's `/proc/self/fd` link, which the flag
+/// would refuse with `ELOOP` (libpulse opens `PULSE_RUNTIME_PATH` that way
+/// before connecting).
+///
+/// # Arguments
+/// * `nofollow` - What [`Resolved::at`] reported for the path.
+///
+/// # Returns
+/// `O_NOFOLLOW` or `0`.
+fn nofollow_open_flag(nofollow: bool) -> i64 {
+    if nofollow { libc::O_NOFOLLOW as i64 } else { 0 }
+}
+
 /// Deref policy derived from `AT_SYMLINK_NOFOLLOW`.
 fn follow(flags: i64) -> bool {
     flags & libc::AT_SYMLINK_NOFOLLOW as i64 == 0
@@ -532,7 +548,8 @@ fn do_open(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64, mode: i
             return Ok(Outcome::Continue);
         }
         let (dfd, c, nofollow) = resolved.at(!deref)?;
-        let host_flags = flags | libc::O_CLOEXEC as i64 | if nofollow { libc::O_NOFOLLOW as i64 } else { 0 };
+        let host_flags =
+            (flags & !(libc::O_NOFOLLOW as i64)) | libc::O_CLOEXEC as i64 | nofollow_open_flag(nofollow);
         let fd = match check(unsafe { libc::syscall(libc::SYS_openat, dfd, c.as_ptr(), host_flags, mode) }) {
             // A symlink where the walk followed none: swapped in since.
             Err(libc::ELOOP) if deref && resolved.pinned() => return Err(RETRY),
@@ -744,8 +761,13 @@ fn do_openat2(r: &Req) -> Result<Outcome> {
         }
         let (dfd, c, nofollow) = resolved.at(!deref)?;
         let mut how = how;
-        let host_flags = flags | if nofollow { libc::O_NOFOLLOW as i64 } else { 0 };
+        let host_flags = (flags & !(libc::O_NOFOLLOW as i64)) | nofollow_open_flag(nofollow);
         how[0..8].copy_from_slice(&(host_flags as u64).to_ne_bytes());
+        if resolved.is_mount_point() {
+            let resolve = u64::from_ne_bytes(how[16..24].try_into().unwrap());
+            let keep = resolve & !(libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS);
+            how[16..24].copy_from_slice(&keep.to_ne_bytes());
+        }
         let fd = match check(unsafe {
             libc::syscall(libc::SYS_openat2, dfd, c.as_ptr(), how.as_ptr(), 24usize)
         }) {

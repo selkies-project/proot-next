@@ -151,6 +151,44 @@ fn opath_opens_resolve_inside_the_guest() {
     assert_eq!(stdout(&o), "/", "{}", String::from_utf8_lossy(&o.stderr));
 }
 
+/// libpulse opens `PULSE_RUNTIME_PATH` with `O_NOFOLLOW` before connecting to
+/// the socket in it, and proot-apps binds that directory at its own name, so
+/// the open lands on a mount point of the view: it is served through the
+/// pinned descriptor, which the flag must not refuse.
+#[test]
+fn mount_points_open_with_o_nofollow() {
+    let d = tmpdir("mp-nofollow");
+    std::fs::write(d.join("file"), "data").unwrap();
+    let f = tmpdir("mp-nofollow-file").join("bound");
+    std::fs::write(&f, "leaf").unwrap();
+    let script = "import os\n\
+                  fd = os.open('/pn-mp', os.O_RDONLY | os.O_NOFOLLOW); print(sorted(os.listdir(fd)))\n\
+                  fd = os.open('/pn-mp', os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY); print(sorted(os.listdir(fd)))\n\
+                  fd = os.open('/pn-mp/file', os.O_RDONLY | os.O_NOFOLLOW); print(os.read(fd, 8).decode())\n\
+                  fd = os.open('/pn-leaf', os.O_RDONLY | os.O_NOFOLLOW); print(os.read(fd, 8).decode())\n\
+                  for p in ('/pn-mp', '/pn-leaf'):\n\
+                  \x20   fd = os.open(p, os.O_PATH | os.O_NOFOLLOW); print(os.fstat(fd).st_ino == os.stat(p).st_ino)";
+    let args = [
+        "-r",
+        "/",
+        "-b",
+        &format!("{}:/pn-mp", d.display()),
+        "-b",
+        &format!("{}:/pn-leaf", f.display()),
+        "python3",
+        "-c",
+        script,
+    ];
+    for o in [run(&args), run_no_ptrace(&args)] {
+        assert_eq!(
+            stdout(&o),
+            "['file']\n['file']\ndata\nleaf\nTrue\nTrue",
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+}
+
 #[test]
 fn unix_connect_is_translated_through_a_binding() {
     let d = tmpdir("sock");

@@ -731,7 +731,8 @@ pub fn do_open_path(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64
     }
     let cloexec = flags & libc::O_CLOEXEC as i64 != 0;
     let kind = resolved.mode_nofollow()? & libc::S_IFMT;
-    let base = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let (dfd, c, nofollow) = resolved.at(true)?;
+    let base = libc::O_RDONLY | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
     let direct = match kind {
         libc::S_IFDIR => Some(base | libc::O_DIRECTORY),
         libc::S_IFREG => Some(base),
@@ -739,7 +740,6 @@ pub fn do_open_path(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64
     };
     if let Some(open_flags) = direct {
         r.valid()?;
-        let (dfd, c, _) = resolved.at(true)?;
         let fd = unsafe { libc::openat(dfd, c.as_ptr(), open_flags) };
         if fd >= 0 {
             return Ok(Outcome::Fd { fd, cloexec });

@@ -201,7 +201,7 @@ pub fn run(config: Config) -> Result<i32, String> {
     };
     let start = bwrap::start_dir(&ctx.config, is_dir);
     let host_cwd_exists = start.is_some();
-    if !host_cwd_exists && !(ctx.config.bwrap_mode && ctx.config.cwd_default) {
+    if !(host_cwd_exists || (ctx.config.bwrap_mode && ctx.config.cwd_default)) {
         eprintln!(
             "proot: can't chdir to {} in the guest rootfs, using /",
             String::from_utf8_lossy(&ctx.config.cwd)
