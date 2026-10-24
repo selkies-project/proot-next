@@ -35,4 +35,10 @@ request is answered exactly once.
 
 Releases: a push to `main` publishes the static binaries to a pre-release named by the short commit hash; a
 `MAJOR.MINOR.PATCH` tag releases with `release-notes/<tag>.md` as its body, so the notes are written with the
-change, and `Cargo.toml` carries the same version as the tag.
+change, and `Cargo.toml` carries the same version as the tag. Releases are cut by running the
+[Release](https://github.com/selkies-project/proot-next/actions/workflows/release.yml) workflow from the Actions
+tab, **Run workflow** with **Use workflow from** on `main` and the tag, or by pushing the tag. A run releases the
+commit it started from: a new tag is created on it once the checks pass, and a tag that already exists has to be on
+it, so an earlier commit's tag is released by a run started from that tag. The `latest` input decides the "Latest"
+badge: `auto` gives it to a release and not to a pre-release, `never` holds it back for a fix to an older series,
+and `always` gives it to a pre-release as well.
