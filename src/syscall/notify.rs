@@ -1307,8 +1307,11 @@ fn do_link(r: &Req, olddirfd: i32, old: &[u8], newdirfd: i32, new: &[u8], flags:
         ),
         Some(from) => {
             let (dfd, c, _) = from.at(true)?;
-            // Only a mount point, through its /proc/self/fd link, needs following.
-            let follow = if from.is_mount_point() {
+            // A mount point needs following through its /proc/self/fd link, and a
+            // /proc fd link the caller follows (an O_TMPFILE published) to its object.
+            let follow = if from.is_mount_point()
+                || (flags & libc::AT_SYMLINK_FOLLOW as i64 != 0 && from.is_proc_fd_link())
+            {
                 libc::AT_SYMLINK_FOLLOW as i64
             } else {
                 0

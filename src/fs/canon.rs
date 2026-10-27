@@ -90,6 +90,11 @@ impl Resolved {
         matches!(self.at, At::Object(_))
     }
 
+    /// Whether the path is a final `/proc/<pid>/fd/N` or `map_files/X` link left to the kernel.
+    pub fn is_proc_fd_link(&self) -> bool {
+        matches!(self.at, At::Path) && is_proc_fd_link(&self.guest)
+    }
+
     /// `st_mode` of the object, without following a final symlink.
     pub fn mode_nofollow(&self) -> Result<u32> {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };

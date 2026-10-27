@@ -15,6 +15,7 @@ regression shows up here before it shows up in a browser or a game.
 | `denyunknown.c` | x86_64 or aarch64 host, `cc` | Runs a command under a seccomp filter that refuses unknown syscall numbers, as container runtimes' default profiles do. |
 | `pathrace.c` | host, `cc` | A guest renaming its own directories away and planting symlinks to a host directory in their place, while its other threads open and create files through them, never reaches the host directory: the supervisor acts through the descriptors its walk pinned. Built by the test. |
 | `dumpable.c` | host, `cc` | A process that clears its dumpable flag with `prctl`, as Bitwarden's process isolation and Chromium's sandbox do, keeps opening paths, descriptor-relative paths and threads, and reads the flag back as it set it. Built by the test. |
+| `tmpfilelink.c` | host, `cc` | An `O_TMPFILE` published as Qt's `QSaveFile` does it, by `linkat` of its `/proc/self/fd` link with `AT_SYMLINK_FOLLOW`, lands through a binding, and the link itself is refused without the flag, as natively. Built by the test, checked natively first. |
 
 `build.sh` builds the two Rust probes into `tests/probes/bin/`, which the
 tests look for; a missing probe makes its test skip with a message rather

@@ -828,6 +828,34 @@ fn undumpable_process_is_still_served() {
     }
 }
 
+/// An `O_TMPFILE` is published by linking its `/proc/self/fd` link with
+/// `AT_SYMLINK_FOLLOW`, as Qt's `QSaveFile` does: the kernel follows the
+/// magic link to the open inode, through a binding as well.
+#[test]
+fn tmpfile_is_linked_through_its_proc_fd_link() {
+    let d = tmpdir("tmpfilelink");
+    let bin = d.join("tmpfilelink");
+    let cc = Command::new("cc")
+        .args(["-O1", "-o"])
+        .arg(&bin)
+        .arg(repo().join("tests/probes/tmpfilelink.c"))
+        .status()
+        .unwrap();
+    assert!(cc.success(), "compiling tmpfilelink.c");
+    let native = Command::new(&bin).arg(&d).output().unwrap();
+    if !native.status.success() {
+        eprintln!("skipping: {}", String::from_utf8_lossy(&native.stderr).trim());
+        return;
+    }
+    let want = stdout(&native);
+    assert!(want.ends_with("follow: ok tmp"), "natively: {want}");
+    let bind = format!("{}:/pn-tmpfile", d.display());
+    let args = ["-r", "/", "-b", &bind, bin.to_str().unwrap(), "/pn-tmpfile"];
+    for o in [run(&args), run_no_ptrace(&args)] {
+        assert_eq!(stdout(&o), want, "{}", String::from_utf8_lossy(&o.stderr));
+    }
+}
+
 #[test]
 fn fatal_signal_report_names_the_module() {
     if no_ptrace_suite() {
