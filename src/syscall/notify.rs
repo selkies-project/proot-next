@@ -23,7 +23,7 @@
 use crate::abi::{Abi, Variant};
 use crate::fs::Fs;
 use crate::fs::canon::{RETRY, Resolved, fd_path, readlinkat};
-use crate::fs::translate::{detranslate_path, guest_cwd, read_link, translate};
+use crate::fs::translate::{detranslate_path, guest_cwd, guest_dirfd_path, read_link, translate};
 use crate::note;
 use crate::seccomp::notify::{reply, reply_continue, reply_fd, still_valid};
 use crate::state::{Ctx, View};
@@ -138,6 +138,26 @@ impl<'a> Req<'a> {
             String::from_utf8_lossy(&resolved.host)
         );
         Ok(resolved)
+    }
+
+    /// Translates like [`Req::translate`], except that an empty path names `dirfd` itself.
+    ///
+    /// `AT_EMPTY_PATH` asks for that, and `readlinkat` always takes it; for
+    /// `AT_FDCWD` it is the tracee's working directory.
+    ///
+    /// # Arguments
+    /// * `dirfd` - Base descriptor for a relative path, or `libc::AT_FDCWD`.
+    /// * `path` - Path bytes as read from the tracee, without NUL.
+    /// * `deref_final` - Follow a symlink in the final component.
+    ///
+    /// # Errors
+    /// As [`Req::translate`], or the errno of reading the descriptor's path.
+    pub fn translate_or_dirfd(&self, dirfd: i32, path: &[u8], deref_final: bool) -> Result<Resolved> {
+        if !path.is_empty() {
+            return self.translate(dirfd, path, deref_final);
+        }
+        let guest = guest_dirfd_path(self.fs(), self.pid, dirfd)?;
+        self.translate(libc::AT_FDCWD, &guest, deref_final)
     }
 
     /// Re-validates the notification; `Err(DROPPED)` when the tracee is gone.
@@ -899,7 +919,11 @@ fn do_statfs(r: &Req) -> Result<Outcome> {
 
 /// `access`/`faccessat`/`faccessat2`.
 fn do_access(r: &Req, dirfd: i32, path: &[u8], mode: i64, flags: i64) -> Result<Outcome> {
-    let resolved = r.translate(dirfd, path, follow(flags))?;
+    let resolved = if flags & libc::AT_EMPTY_PATH as i64 != 0 {
+        r.translate_or_dirfd(dirfd, path, follow(flags))?
+    } else {
+        r.translate(dirfd, path, follow(flags))?
+    };
     r.valid()?;
     let (dfd, c, nofollow) = resolved.at(!follow(flags))?;
     let host_flags = flags & libc::AT_EACCESS as i64 | nofollow_flag(nofollow);
@@ -910,16 +934,26 @@ fn do_access(r: &Req, dirfd: i32, path: &[u8], mode: i64, flags: i64) -> Result<
 // ---- links and names ---------------------------------------------------------
 
 /// `readlink`/`readlinkat`: raw target, except `/proc` magic links are detranslated.
+///
+/// An empty path names the link `dirfd` was opened on.  Where that is no
+/// link, the answer is `ENOENT`, as the kernel's is.
 fn do_readlink(r: &Req, dirfd: i32, path: &[u8], buf: u64, bufsiz: usize) -> Result<Outcome> {
-    let resolved = r.translate(dirfd, path, false)?;
+    let resolved = r.translate_or_dirfd(dirfd, path, false)?;
     r.valid()?;
     let read = || -> Result<Vec<u8>> {
-        match &resolved.at {
+        let target = match &resolved.at {
             crate::fs::canon::At::Child { parent, name } => readlinkat(parent, name),
             // A mount point's host side is never a symlink.
             crate::fs::canon::At::Object(_) => Err(libc::EINVAL),
             crate::fs::canon::At::Path => read_link(&resolved.host),
-        }
+        };
+        target.map_err(|e| {
+            if e == libc::EINVAL && path.is_empty() {
+                libc::ENOENT
+            } else {
+                e
+            }
+        })
     };
     let guest = lexical_clean(&resolved.guest);
     let target = match proc_magic_link(&guest) {
@@ -1346,7 +1380,11 @@ fn do_symlink(r: &Req, target: &[u8], newdirfd: i32, linkpath: &[u8]) -> Result<
 /// says of `AT_SYMLINK_NOFOLLOW` on one.
 fn do_chmod(r: &Req, dirfd: i32, path: &[u8], mode: i64, flags: i64) -> Result<Outcome> {
     let rc = retrying(|| {
-        let resolved = r.translate(dirfd, path, follow(flags))?;
+        let resolved = if flags & libc::AT_EMPTY_PATH as i64 != 0 {
+            r.translate_or_dirfd(dirfd, path, follow(flags))?
+        } else {
+            r.translate(dirfd, path, follow(flags))?
+        };
         r.valid()?;
         r.check_writable(&resolved)?;
         let (fd, st_mode) = resolved.object(follow(flags))?;

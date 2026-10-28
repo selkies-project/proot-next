@@ -33,7 +33,7 @@ pub mod nested;
 pub mod shebang;
 pub mod shim;
 
-use crate::fs::translate::{detranslate_path, translate_path};
+use crate::fs::translate::{detranslate_path, guest_dirfd_path, translate_path};
 use crate::procs::PendingExec;
 use crate::state::{Ctx, View};
 use crate::sys::Result;
@@ -296,6 +296,10 @@ pub fn plan_in(
 /// * `ctx` - Shared supervisor state.
 /// * `regs` - Registers at the stop; edits are committed by the caller.
 ///
+/// An empty path is left for the kernel to refuse, unless `AT_EMPTY_PATH`
+/// makes it name `dirfd`: then the plan is made from the descriptor's own
+/// path, or the working directory's for `AT_FDCWD`.
+///
 /// # Errors
 /// `ELOOP` for too many nested `#!`, otherwise the errno of reading the tracee
 /// or translating a path.  A missing or unreadable program is not an error:
@@ -314,6 +318,17 @@ pub fn handle_execve(ctx: &Ctx, regs: &mut Regs) -> Result<()> {
     let deref_final = at_flags & libc::AT_SYMLINK_NOFOLLOW == 0;
 
     let user_path = ctx.mem.read_cstr(pid, regs.arg(path_idx))?;
+    let (dirfd, user_path) = if user_path.is_empty() {
+        if !is_at || at_flags & libc::AT_EMPTY_PATH == 0 {
+            return Ok(());
+        }
+        (
+            libc::AT_FDCWD,
+            guest_dirfd_path(&ctx.view(pid as i32).fs, pid, dirfd)?,
+        )
+    } else {
+        (dirfd, user_path)
+    };
     let argv = read_argv(ctx, pid, regs.arg(argv_idx), ptr_size)?;
     let env = EnvSource::Address {
         envp: regs.arg(argv_idx + 1),

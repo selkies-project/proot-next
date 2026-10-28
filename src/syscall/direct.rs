@@ -36,7 +36,7 @@ use crate::exec::nested::EnvSource;
 use crate::exec::shim::Trapped;
 use crate::exec::{self, ExecPlan, shim};
 use crate::fs::canon::RETRY;
-use crate::fs::translate::{guest_fd_path, read_link};
+use crate::fs::translate::{guest_dirfd_path, guest_fd_path, read_link};
 use crate::guest_stub::layout;
 use crate::note;
 use crate::seccomp::notify::{addfd, addfd_at, reply_continue};
@@ -178,7 +178,7 @@ fn do_execve(r: &Req, is_at: bool) -> Result<Outcome> {
         if at_flags & libc::AT_EMPTY_PATH == 0 {
             return Err(libc::ENOENT);
         }
-        let guest = guest_fd_path(r.fs(), r.pid, dirfd)?;
+        let guest = guest_dirfd_path(r.fs(), r.pid, dirfd)?;
         exec::plan(r.ctx, r.pid, libc::AT_FDCWD, &guest, argv, true, env)?
     } else {
         let deref = at_flags & libc::AT_SYMLINK_NOFOLLOW == 0;
@@ -270,7 +270,7 @@ fn do_execve_trapped(r: &Req, is_at: bool) -> Result<Outcome> {
         if at_flags & libc::AT_EMPTY_PATH == 0 {
             return Err(libc::ENOENT);
         }
-        let guest = guest_fd_path(r.fs(), r.pid, dirfd)?;
+        let guest = guest_dirfd_path(r.fs(), r.pid, dirfd)?;
         exec::plan(r.ctx, r.pid, libc::AT_FDCWD, &guest, argv, true, env)?
     } else {
         let deref = at_flags & libc::AT_SYMLINK_NOFOLLOW == 0;

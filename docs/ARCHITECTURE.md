@@ -453,6 +453,13 @@ last component is left to the kernel, which re-opens the object behind it
 (a memfd, a pipe); followed by more components it must be a directory,
 whose path is re-entered as a guest path.
 
+An empty path fails with `ENOENT` before any walk, as the kernel's lookup
+fails it, rather than naming the working directory: CUDA's driver unlinks
+`""` before it binds an abstract socket, and gives up on `EISDIR`.  The calls
+that let an empty path name `dirfd` itself, `AT_EMPTY_PATH` and `readlinkat`,
+resolve the descriptor's own path, or the working directory's for
+`AT_FDCWD`, and the ptrace tier leaves an empty path to the kernel.
+
 A missing final component is returned as a name in its parent, so the
 kernel creates it or reports `ENOENT` through the pinned directory.  A
 missing intermediate component fails the lookup with `ENOENT`, as the

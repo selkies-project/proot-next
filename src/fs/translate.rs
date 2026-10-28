@@ -49,12 +49,30 @@ pub fn guest_fd_path(fs: &Fs, pid: u32, fd: i32) -> Result<Vec<u8>> {
     Ok(detranslate_path(fs, &host))
 }
 
+/// The guest path of `dirfd` itself, or of the tracee's cwd for `AT_FDCWD`:
+/// what an empty path names in the calls that allow one (`AT_EMPTY_PATH`,
+/// and `readlinkat` always).
+///
+/// # Arguments
+/// * `fs` - Guest filesystem view.
+/// * `pid` - Tracee thread id.
+/// * `dirfd` - Descriptor number in the tracee, or `libc::AT_FDCWD`.
+pub fn guest_dirfd_path(fs: &Fs, pid: u32, dirfd: i32) -> Result<Vec<u8>> {
+    if dirfd == libc::AT_FDCWD {
+        guest_cwd(fs, pid)
+    } else {
+        guest_fd_path(fs, pid, dirfd)
+    }
+}
+
 /// Translates a path as seen by a tracee into the object to operate on.
 ///
 /// Relative paths are resolved against `dirfd` (`AT_FDCWD` means the tracee's
 /// cwd) by reading the descriptor's own path from `/proc`, so the whole path
 /// is canonicalized inside the guest namespace, on the descriptors the view
-/// holds open (see [`resolve`]).
+/// holds open (see [`resolve`]).  An empty path fails with `ENOENT`, as the
+/// kernel's lookup fails it; a call that lets it name `dirfd` itself
+/// resolves [`guest_dirfd_path`] instead.
 ///
 /// # Arguments
 /// * `fs` - Guest filesystem view.
@@ -68,22 +86,20 @@ pub fn guest_fd_path(fs: &Fs, pid: u32, fd: i32) -> Result<Vec<u8>> {
 /// name to act on.
 ///
 /// # Errors
-/// Errno from the walk, or `EBADF` when `dirfd` cannot be resolved.
+/// `ENOENT` for an empty path, errno from the walk, or `EBADF` when `dirfd`
+/// cannot be resolved.
 pub fn translate(fs: &Fs, pid: u32, dirfd: i32, path: &[u8], deref_final: bool) -> Result<Resolved> {
+    if path.is_empty() {
+        return Err(libc::ENOENT);
+    }
     let guest = if path.first() == Some(&b'/') {
         path.to_vec()
     } else {
-        let mut base = if dirfd == libc::AT_FDCWD {
-            guest_cwd(fs, pid)?
-        } else {
-            guest_fd_path(fs, pid, dirfd)?
-        };
-        if !path.is_empty() {
-            if base != b"/" {
-                base.push(b'/');
-            }
-            base.extend_from_slice(path);
+        let mut base = guest_dirfd_path(fs, pid, dirfd)?;
+        if base != b"/" {
+            base.push(b'/');
         }
+        base.extend_from_slice(path);
         base
     };
     let resolved = resolve(fs, pid, &guest, deref_final)?;

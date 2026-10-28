@@ -139,6 +139,8 @@ pub fn rewrite_path_arg_at(
 
 /// Translates the path in argument `index` and points it at the host path.
 ///
+/// An empty path is left as it is, for the kernel to refuse with `ENOENT`.
+///
 /// # Arguments
 /// * `ctx` - Shared supervisor state.
 /// * `fs` - The tracee's filesystem view.
@@ -148,6 +150,9 @@ pub fn rewrite_path_arg_at(
 pub fn rewrite_path_arg(ctx: &Ctx, fs: &Fs, regs: &mut Regs, index: usize, deref_final: bool) -> Result<()> {
     let pid = regs.pid() as u32;
     let path = ctx.mem.read_cstr(pid, regs.arg(index))?;
+    if path.is_empty() {
+        return Ok(());
+    }
     let host = translate_path(fs, pid, libc::AT_FDCWD, &path, deref_final)?;
     if host != path {
         let addr = push_cstr(ctx, regs, &host)?;
