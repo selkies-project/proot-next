@@ -203,9 +203,10 @@ pub fn canonicalize(fs: &Fs, pid: u32, guest: &[u8], deref_final: bool) -> Resul
 /// intermediate component fails here with the errno the kernel would give.
 ///
 /// `/proc` magic links are special: `/proc/self` and `/proc/thread-self`
-/// become the tracee's own entries (not the supervisor's), and the targets of
+/// become the tracee's own entries (not the supervisor's), the targets of
 /// `/proc/<pid>/{exe,cwd,root,fd/N,map_files/*}` are host paths, so they are
-/// detranslated instead of being re-walked as guest paths.
+/// detranslated instead of being re-walked as guest paths, and
+/// `/proc/<pid>/ns/*` name namespaces, which only the kernel resolves.
 ///
 /// # Arguments
 /// * `fs` - Guest filesystem view.
@@ -559,7 +560,7 @@ fn textual(fs: &Fs, guest: Vec<u8>) -> Resolved {
     }
 }
 
-/// Whether a canonical guest path names a `/proc/<pid>[/task/<tid>]/{exe,cwd,root,fd/N,map_files/X}` link.
+/// Whether a canonical guest path names a `/proc/<pid>[/task/<tid>]/{exe,cwd,root,fd/N,map_files/X,ns/X}` link.
 ///
 /// # Arguments
 /// * `path` - Canonical absolute guest path.
@@ -579,7 +580,7 @@ fn is_proc_magic_link(path: &[u8]) -> bool {
     match parts.as_slice() {
         [b"exe"] | [b"cwd"] | [b"root"] => true,
         [b"fd", n] => !n.is_empty() && n.iter().all(|c| c.is_ascii_digit()),
-        [b"map_files", _] => true,
+        [b"map_files", _] | [b"ns", _] => true,
         _ => false,
     }
 }
@@ -957,5 +958,20 @@ mod tests {
             assert_eq!(pinned_inode(&r), inode(&base.join("file")));
         }
         assert_eq!(resolve(&fs, me(), b"/nope/x", true).err(), Some(libc::ENOENT));
+    }
+
+    #[test]
+    fn classifies_proc_magic_links() {
+        for path in [
+            &b"/proc/12/exe"[..],
+            b"/proc/12/fd/3",
+            b"/proc/12/ns/pid",
+            b"/proc/12/task/13/ns/net",
+        ] {
+            assert!(is_proc_magic_link(path), "{}", String::from_utf8_lossy(path));
+        }
+        for path in [&b"/proc/12/ns"[..], b"/proc/12/status", b"/proc/self/ns/pid"] {
+            assert!(!is_proc_magic_link(path), "{}", String::from_utf8_lossy(path));
+        }
     }
 }

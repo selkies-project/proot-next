@@ -540,9 +540,11 @@ it.  Three things learned from Steam's webhelper:
 * An `int3` breakpoint (SIGTRAP with `si_code == SI_KERNEL`, `0xCC` at
   `rip-1`) is resumed past, as an attached debugger would.  A genuine crash
   sequence is `int3; ud2` and still dies on the `ud2`.
-* `/proc/<pid>/fd/N` and `map_files/*` links are not canonicalized: they name
-  open objects (memfds, pipes, deleted files) that only the kernel can re-open,
-  so the walk stops at the link and the host resolves it.
+* `/proc/<pid>/fd/N`, `map_files/*` and `ns/*` links are not canonicalized:
+  they name objects (memfds, pipes, deleted files, namespaces) that only the
+  kernel can reach, so the walk stops at the link and the host resolves it.
+  An `ns/*` link reads as `pid:[n]` and the like, not a path, so a `stat`
+  through one only works this way.
 
 Tracees are `PTRACE_SEIZE`d so group-stops arrive as `PTRACE_EVENT_STOP` and
 get `PTRACE_LISTEN`; forwarding them as signals re-stops the whole thread

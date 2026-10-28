@@ -136,6 +136,16 @@ fn proc_fd_links_reopen_the_object() {
 }
 
 #[test]
+fn proc_ns_links_stat_as_their_namespace() {
+    // CUDA's driver names a socket after the inode of /proc/<pid>/ns/pid, read through a stat.
+    let script = "import os\n\
+                  ino = int(os.readlink('/proc/self/ns/pid')[5:-1])\n\
+                  print(os.stat(f'/proc/{os.getpid()}/ns/pid').st_ino == ino, os.stat('/proc/self/ns/pid').st_ino == ino)";
+    let o = run(&["-r", "/", "python3", "-c", script]);
+    assert_eq!(stdout(&o), "True True", "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
 fn process_substitution_through_dev_fd() {
     let o = run(&["-r", "/", "/bin/bash", "-c", "cat <(echo via-dev-fd)"]);
     assert_eq!(stdout(&o), "via-dev-fd");
