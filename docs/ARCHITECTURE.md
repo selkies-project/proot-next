@@ -653,4 +653,8 @@ lookups.
   restore is not restored, and one read back in the microseconds before the
   restore shows the alias; `connect` after a `bind` on the same socket loses
   the bind; a failed `execve` whose failure the kernel reported (not one
-  refused here) leaves `e` in the caller's path string.
+  refused here) leaves `e` in the caller's path string.  An `O_PATH |
+  O_NOFOLLOW` open of a symlink by its bare name fails with `ENAMETOOLONG`:
+  only `<alias>/<name>` reaches the link itself, two bytes longer than the
+  string it would replace, and the descriptor cannot be injected (`./name`
+  and longer paths fit).
