@@ -135,14 +135,25 @@ fn proc_fd_links_reopen_the_object() {
     assert_eq!(stdout(&o), "0 hi", "{}", String::from_utf8_lossy(&o.stderr));
 }
 
+/// A stat that follows `/proc/<pid>/ns/*` gives the namespace's inode, as
+/// CUDA's driver needs to name its socket (`tests/probes/procns.c`).
 #[test]
 fn proc_ns_links_stat_as_their_namespace() {
-    // CUDA's driver names a socket after the inode of /proc/<pid>/ns/pid, read through a stat.
-    let script = "import os\n\
-                  ino = int(os.readlink('/proc/self/ns/pid')[5:-1])\n\
-                  print(os.stat(f'/proc/{os.getpid()}/ns/pid').st_ino == ino, os.stat('/proc/self/ns/pid').st_ino == ino)";
-    let o = run(&["-r", "/", "python3", "-c", script]);
-    assert_eq!(stdout(&o), "True True", "{}", String::from_utf8_lossy(&o.stderr));
+    let d = tmpdir("procns");
+    let bin = d.join("procns");
+    let cc = Command::new("cc")
+        .args(["-O1", "-o"])
+        .arg(&bin)
+        .arg(repo().join("tests/probes/procns.c"))
+        .status()
+        .unwrap();
+    assert!(cc.success(), "compiling procns.c");
+    let want = stdout(&Command::new(&bin).output().unwrap());
+    assert_eq!(want, "pid: namespace\nself: namespace", "natively");
+    let args = ["-r", "/", bin.to_str().unwrap()];
+    for o in [run(&args), run_no_ptrace(&args)] {
+        assert_eq!(stdout(&o), want, "{}", String::from_utf8_lossy(&o.stderr));
+    }
 }
 
 #[test]
