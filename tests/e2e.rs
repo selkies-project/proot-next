@@ -477,79 +477,59 @@ fn exec_through_a_missing_directory_fails_with_enoent() {
     assert!(!err.contains("not implemented"), "{err}");
 }
 
+/// Compiles `tests/probes/<name>.c` into `dir`.
+fn compile_probe(name: &str, dir: &Path) -> PathBuf {
+    let bin = dir.join(name);
+    let cc = Command::new("cc")
+        .args(["-O1", "-o"])
+        .arg(&bin)
+        .arg(repo().join(format!("tests/probes/{name}.c")))
+        .status()
+        .unwrap();
+    assert!(cc.success(), "compiling {name}.c");
+    bin
+}
+
+/// An empty path fails with `ENOENT`, as the kernel fails it, where it named
+/// the working directory: CUDA's driver unlinks `""` before it binds an
+/// abstract socket, and gave up on `EISDIR`.  The calls that let it name a
+/// descriptor still do: `AT_EMPTY_PATH`, and `readlinkat` always
+/// (`tests/probes/emptypath.c`; its native output is the answer).
+#[test]
+fn empty_paths_fail_as_the_kernel_fails_them() {
+    let d = tmpdir("emptypath");
+    let bin = compile_probe("emptypath", &d);
+    let want = stdout(&Command::new(&bin).arg(&d).output().unwrap());
+    assert!(want.contains("unlink: ENOENT"), "natively: {want}");
+    let bind = format!("{}:/pn-empty", d.display());
+    let args = ["-r", "/", "-b", &bind, bin.to_str().unwrap(), "/pn-empty"];
+    for o in [run(&args), run_no_ptrace(&args)] {
+        assert_eq!(stdout(&o), want, "{}", String::from_utf8_lossy(&o.stderr));
+    }
+}
+
+/// `execveat(fd, "", AT_EMPTY_PATH)` runs what the descriptor names, an ELF and
+/// a `#!` script alike (`tests/probes/fexecve.c`).
+#[test]
+fn fexecve_runs_the_descriptor_in_every_mode() {
+    let d = tmpdir("fexecve");
+    let bin = compile_probe("fexecve", &d);
+    std::fs::write(d.join("h.sh"), "#!/bin/sh\necho hello $1\n").unwrap();
+    chmod_x(&d.join("h.sh"));
+    let want = stdout(&Command::new(&bin).arg(&d).output().unwrap());
+    assert_eq!(want, "elf fd\nhello fd", "natively");
+    let bind = format!("{}:/pn-fexecve", d.display());
+    let args = ["-r", "/", "-b", &bind, bin.to_str().unwrap(), "/pn-fexecve"];
+    for o in [run(&args), run_no_ptrace(&args)] {
+        assert_eq!(stdout(&o), want, "{}", String::from_utf8_lossy(&o.stderr));
+    }
+}
+
 /// bwrap mode starts where bubblewrap does and exports `PWD` as the directory
 /// it entered: GE-Proton's protonfixes reads the game's library out of `PWD`
 /// and stopped with a `KeyError` under pressure-vessel without it.  Without
 /// `--chdir` the caller's directory is kept where the sandbox has it, else
 /// `$HOME`, else `/`.
-#[test]
-fn empty_paths_fail_as_the_kernel_fails_them() {
-    // CUDA's driver unlinks "" before it binds an abstract socket, and its cuInit fails on EISDIR.
-    // The calls that may name a descriptor with an empty path still do: readlinkat always, faccessat2
-    // and fchmodat2 (452, a kernel since 6.6) with AT_EMPTY_PATH, and execveat with it, where
-    // AT_FDCWD names the working directory, which the kernel refuses to run with EACCES.
-    let d = tmpdir("empty-path");
-    let script = "import ctypes, errno, os\n\
-                  libc = ctypes.CDLL(None, use_errno=True)\n\
-                  def e(rc): return ctypes.get_errno() if rc < 0 else 0\n\
-                  buf = ctypes.create_string_buffer(64)\n\
-                  argv = (ctypes.c_char_p * 2)(b'x', None)\n\
-                  got = [e(libc.unlink(b'')), e(libc.rmdir(b'')), e(libc.mkdir(b'', 0o755)), e(libc.open(b'', 0)),\n\
-                         e(libc.access(b'', 0)), e(libc.chdir(b'')), e(libc.rename(b'', b'x')), e(libc.readlink(b'', buf, 64)),\n\
-                         e(libc.chroot(b'')), e(libc.inotify_add_watch(libc.inotify_init1(0), b'', 0xfff)),\n\
-                         e(libc.execve(b'', argv, None)), e(libc.execveat(-100, b'', argv, None, 0))]\n\
-                  os.symlink('target', 'link')\n\
-                  n = libc.readlinkat(os.open(os.path.abspath('link'), os.O_PATH | os.O_NOFOLLOW), b'', buf, 64)\n\
-                  here = os.open('.', os.O_RDONLY | os.O_DIRECTORY)\n\
-                  f = os.open('file', os.O_CREAT | os.O_RDWR, 0o600)\n\
-                  rc = libc.syscall(452, f, b'', 0o640, 0x1000)\n\
-                  mode = oct(os.stat('file').st_mode & 0o777) if rc == 0 else 'no fchmodat2' if ctypes.get_errno() == errno.ENOSYS else ctypes.get_errno()\n\
-                  print(got == [errno.ENOENT] * len(got) or got, buf.raw[:n].decode(), libc.syscall(439, here, b'', 0, 0x1000), mode,\n\
-                        e(libc.execveat(-100, b'', argv, None, 0x1000)) == errno.EACCES)";
-    let o = run(&["-r", "/", "-w", d.to_str().unwrap(), "python3", "-c", script]);
-    let out = stdout(&o);
-    assert!(
-        out == "True target 0 0o640 True" || out == "True target 0 no fchmodat2 True",
-        "{out}\n{}",
-        String::from_utf8_lossy(&o.stderr)
-    );
-}
-
-#[test]
-fn fexecve_runs_the_descriptor_in_every_mode() {
-    // execveat(fd, "", ..., AT_EMPTY_PATH) runs what fd names, in whichever mode the suite runs: an
-    // empty path names the descriptor here, where every other call refuses it. A script's
-    // descriptor is inheritable, as the kernel needs it to be to run one.
-    let d = tmpdir("fexecve");
-    std::fs::copy("/bin/echo", d.join("echo")).unwrap();
-    std::fs::write(d.join("h.sh"), "#!/bin/sh\necho hello $1\n").unwrap();
-    chmod_x(&d.join("h.sh"));
-    let script = "import os, ctypes\n\
-                  for path, words in (('/pn-q/echo', [b'echo', b'elf', b'fd']), ('/pn-q/h.sh', [b'h', b'fd'])):\n\
-                  \x20   if os.fork() == 0:\n\
-                  \x20       libc = ctypes.CDLL(None, use_errno=True)\n\
-                  \x20       fd = os.open(path, os.O_RDONLY); os.set_inheritable(fd, True)\n\
-                  \x20       argv = (ctypes.c_char_p * (len(words) + 1))(*words, None)\n\
-                  \x20       libc.execveat(fd, b'', argv, None, 0x1000)\n\
-                  \x20       print('execveat failed', os.strerror(ctypes.get_errno()), flush=True); os._exit(1)\n\
-                  \x20   os.wait()";
-    let o = run(&[
-        "-r",
-        "/",
-        "-b",
-        &format!("{}:/pn-q", d.display()),
-        "python3",
-        "-c",
-        script,
-    ]);
-    assert_eq!(
-        stdout(&o),
-        "elf fd\nhello fd",
-        "{}",
-        String::from_utf8_lossy(&o.stderr)
-    );
-}
-
 #[test]
 fn bwrap_mode_exports_pwd_where_it_starts() {
     let d = tmpdir("bwrap-pwd");
