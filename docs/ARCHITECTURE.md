@@ -146,8 +146,20 @@ change registers, only answer, continue, or install a descriptor, so
   a dirfd-relative path also replaces the dirfd with the alias directory.
 * `inotify_add_watch` and the `O_PATH` opens that cannot be served with a
   read-only descriptor (sockets, devices, unreadable files, symlinks with
-  `O_NOFOLLOW`) get the same in-place rewrite to a transient one-character
-  symlink.  The original bytes are put back once the task has consumed the
+  `O_NOFOLLOW`; `O_DIRECTORY` on anything else is `ENOTDIR` before that, which
+  `mv` relies on to tell a destination file from a directory) get the same
+  in-place rewrite to a transient one-character
+  symlink, or `<alias>/<name>` through a symlink to the parent where the
+  final component must not be followed.  A bare name too short for that is
+  reached through a hard link to the final component instead, the same
+  inode: in the alias directory when that is on the target's mount, else as
+  `<alias>/<alias>` through a staging directory created on that mount
+  (`linkat` refuses a link across mounts, and `fs.protected_hardlinks` one to
+  another owner's symlink).  The link is removed once the path is consumed;
+  `readlinkat` with an empty path on such a descriptor is answered from the
+  inode, reopened through `/proc`.  A path relative to a directory
+  descriptor that joins onto it with nothing to translate is left to the
+  kernel.  The original bytes are put back once the task has consumed the
   argument, judged by CPU time from `/proc/<pid>/schedstat`
   (`/proc/<pid>/syscall` reads `running` both before and after the copy), and
   only if the memory still holds exactly what was written: a freed or reused
@@ -654,7 +666,9 @@ lookups.
   restore shows the alias; `connect` after a `bind` on the same socket loses
   the bind; a failed `execve` whose failure the kernel reported (not one
   refused here) leaves `e` in the caller's path string.  An `O_PATH |
-  O_NOFOLLOW` open of a symlink by its bare name fails with `ENAMETOOLONG`:
-  only `<alias>/<name>` reaches the link itself, two bytes longer than the
-  string it would replace, and the descriptor cannot be injected (`./name`
-  and longer paths fit).
+  O_NOFOLLOW` open of a symlink by a bare name fails with `ENAMETOOLONG`
+  when no hard link to the link can be made (a read-only mount, no writable
+  directory on it, another owner's link under `fs.protected_hardlinks`), and
+  for a name of one or two characters unless the alias directory is on the
+  link's mount; `/proc/self/fd/N` of a descriptor opened through such a link
+  names the removed link.

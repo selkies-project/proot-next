@@ -1418,6 +1418,77 @@ fn no_ptrace_inotify_and_opath_keep_the_callers_buffer() {
     );
 }
 
+/// A symlink opened `O_PATH | O_NOFOLLOW` by its bare name, which no
+/// `<alias>/<name>` fits, is reached through a hard link to it: the kernel's
+/// own inode, whose target the descriptor still reads once the link is gone
+/// and the name counts one link again.  Relative to a directory descriptor
+/// the kernel needs no help, and a device opened that way is the device.
+#[test]
+fn no_ptrace_opath_nofollow_reaches_a_symlink_by_its_bare_name() {
+    let d = tmpdir("np-bare-link");
+    std::os::unix::fs::symlink("target-file", d.join("link")).unwrap();
+    std::os::unix::fs::symlink("target-file", d.join("abc")).unwrap();
+    let script = "import os, stat, time\n\
+                  def same(name, **kw):\n\
+                  \x20   want = os.lstat(name, **kw); fd = os.open(name, os.O_PATH | os.O_NOFOLLOW, **kw)\n\
+                  \x20   time.sleep(0.1); got = os.fstat(fd)\n\
+                  \x20   return stat.S_ISLNK(got.st_mode) and (got.st_dev, got.st_ino) == (want.st_dev, want.st_ino) \\\n\
+                  \x20       and os.readlink('', dir_fd=fd) == 'target-file'\n\
+                  dfd = os.open('.', os.O_RDONLY | os.O_DIRECTORY)\n\
+                  print(same('link'), same('abc'), same('link', dir_fd=dfd))\n\
+                  null = os.open('/dev/null', os.O_PATH | os.O_NOFOLLOW)\n\
+                  print(os.lstat('link').st_nlink, os.lstat('abc').st_nlink, stat.S_ISCHR(os.fstat(null).st_mode))";
+    let o = run_no_ptrace(&[
+        "-r",
+        "/",
+        "-b",
+        &format!("{}:/pn-ln", d.display()),
+        "-w",
+        "/pn-ln",
+        "python3",
+        "-c",
+        script,
+    ]);
+    assert_eq!(
+        stdout(&o),
+        "True True True\n1 1 True",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// `mv` over an existing file probes the destination with `O_PATH |
+/// O_DIRECTORY` and moves into it when that succeeds; the kernel refuses
+/// a regular file with `ENOTDIR`, and the served open has to as well
+/// (Dolphin's `xdg-mime` lost `mimeapps.list` this way).
+#[test]
+fn no_ptrace_opath_directory_refuses_a_regular_file() {
+    let d = tmpdir("np-opath-dir");
+    std::fs::write(d.join("a"), "old").unwrap();
+    std::fs::write(d.join("a.new"), "new").unwrap();
+    let script = "import os, errno\n\
+                  try:\n\
+                  \x20   os.open('/pn-od/a', os.O_PATH | os.O_DIRECTORY); print('opened')\n\
+                  except OSError as e:\n\
+                  \x20   print(errno.errorcode[e.errno])\n\
+                  print(os.system('mv /pn-od/a.new /pn-od/a') == 0, open('/pn-od/a').read())";
+    let o = run_no_ptrace(&[
+        "-r",
+        "/",
+        "-b",
+        &format!("{}:/pn-od", d.display()),
+        "python3",
+        "-c",
+        script,
+    ]);
+    assert_eq!(
+        stdout(&o),
+        "ENOTDIR\nTrue new",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
 /// posix_spawn shares the parent's memory until the exec; fexecve names no
 /// path at all.
 #[test]

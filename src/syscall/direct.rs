@@ -18,7 +18,9 @@
 //!   resolves inside the alias directory, which the kernel cwd makes
 //!   reachable from any process: `e` is the exec trampoline (see
 //!   `exec::shim`) and a transient one-character symlink stands for any
-//!   other host path.  The syscall then continues.  Once the task has
+//!   other host path.  A symlink to be reached by a bare name, which no
+//!   `<alias>/<name>` fits, is reached through a hard link to it instead,
+//!   the same inode.  The syscall then continues.  Once the task has
 //!   consumed the argument, the original bytes are put back, but only when
 //!   the memory still holds exactly what was written: a buffer may have
 //!   been freed or reused by then, and must not be touched if so.
@@ -36,7 +38,7 @@ use crate::exec::nested::EnvSource;
 use crate::exec::shim::Trapped;
 use crate::exec::{self, ExecPlan, shim};
 use crate::fs::canon::RETRY;
-use crate::fs::translate::{guest_dirfd_path, guest_fd_path, read_link};
+use crate::fs::translate::{guest_dirfd_path, guest_fd_path, read_link, strip_deleted};
 use crate::guest_stub::layout;
 use crate::note;
 use crate::seccomp::notify::{addfd, addfd_at, reply_continue};
@@ -44,8 +46,10 @@ use crate::state::Ctx;
 use crate::sys::{Result, errno};
 use crate::syscall::notify::{Outcome, Req};
 use crate::syscall::nr::*;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -68,6 +72,13 @@ const ALIAS_CHARS: &[u8] = b"0123456789abcdfghijklmnopqstuvwxyzABCDFGHIJKLMNOPQS
 /// handed out round-robin so a name just released is not re-pointed while
 /// the kernel may still be walking through it.
 static ALIASES: Mutex<([bool; ALIAS_CHARS.len()], usize)> = Mutex::new(([false; ALIAS_CHARS.len()], 0));
+
+/// Directories holding hard links to symlinks, one per mount reached so far.
+///
+/// `linkat` refuses a link across mounts, and the alias directory usually
+/// sits on a tmpfs of its own, so a symlink elsewhere is linked from a
+/// directory created on its mount.
+static STAGING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Routes a former trace-tier syscall to its handler; `None` for any other.
 ///
@@ -713,6 +724,9 @@ fn do_inotify_add_watch(r: &Req) -> Result<Outcome> {
 /// Such descriptors cannot be injected, so directories and readable files
 /// are opened read-only instead, which serves the same purposes (`openat`
 /// relative to it, `fstat`, `/proc/self/fd/N`), through the pinned parent.
+/// `O_DIRECTORY` on anything but a directory is refused with `ENOTDIR`
+/// first, as the kernel does: `mv` probes its destination that way and
+/// takes a descriptor for a directory to move into.
 /// Anything else, a socket, a device, an unreadable file or a symlink opened
 /// with `O_NOFOLLOW`, goes through a transient alias so the kernel opens it
 /// in the tracee, which walks the host path itself.
@@ -731,6 +745,9 @@ pub fn do_open_path(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64
     }
     let cloexec = flags & libc::O_CLOEXEC as i64 != 0;
     let kind = resolved.mode_nofollow()? & libc::S_IFMT;
+    if flags & libc::O_DIRECTORY as i64 != 0 && kind != libc::S_IFDIR {
+        return Err(libc::ENOTDIR);
+    }
     let (dfd, c, nofollow) = resolved.at(true)?;
     let base = libc::O_RDONLY | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
     let direct = match kind {
@@ -749,16 +766,42 @@ pub fn do_open_path(r: &Req, dirfd: i32, path: &[u8], path_addr: u64, flags: i64
         }
     }
     if dirfd != libc::AT_FDCWD && path.first() != Some(&b'/') {
+        if kernel_walks_alike(r.pid, dirfd, path, &resolved.host) {
+            return Ok(Outcome::Continue);
+        }
         return Err(libc::EACCES);
     }
-    let form = if kind == libc::S_IFLNK {
-        Form::Dir
-    } else {
-        Form::File
-    };
+    let form = if nofollow { Form::Dir } else { Form::File };
     let mut orig = path.to_vec();
     orig.push(0);
     transient_rewrite(r, path_addr, &orig, &resolved.host, form)
+}
+
+/// Whether the kernel, walking `path` from the tracee's `dirfd` by itself,
+/// reaches `host`.
+///
+/// The descriptor is a host directory already, so a path that joins onto it
+/// with nothing to translate on the way (no symlink among its components,
+/// which canonicalization would have resolved) needs no rewrite.
+///
+/// # Arguments
+/// * `pid` - Tracee thread id.
+/// * `dirfd` - A directory descriptor of the tracee.
+/// * `path` - Path relative to it, as the tracee passed it.
+/// * `host` - What translation resolved it to.
+fn kernel_walks_alike(pid: u32, dirfd: i32, path: &[u8], host: &[u8]) -> bool {
+    let Ok(dir) = read_link(format!("/proc/{pid}/fd/{dirfd}").as_bytes()) else {
+        return false;
+    };
+    let mut joined = strip_deleted(dir);
+    if joined.first() != Some(&b'/') {
+        return false;
+    }
+    if joined != b"/" {
+        joined.push(b'/');
+    }
+    joined.extend_from_slice(path);
+    joined == host
 }
 
 /// `clone`/`fork`/`vfork`/`clone3`: refuse a new namespace, snapshot the
@@ -795,9 +838,17 @@ enum Form {
     /// The alias is a symlink to the target; the rewritten path is the alias name.
     File,
     /// The alias is a symlink to the target's parent directory; the rewritten
-    /// path is `<alias>/<basename>`, for syscalls that must not follow a
-    /// final symlink or that create the final component.
+    /// path is `<alias>/<basename>`, for syscalls that must not follow the
+    /// final component.  When that does not fit, a hard link to the target
+    /// stands in, see [`place_alias`].
     Dir,
+}
+
+/// A transient alias in place: the bytes that replace the tracee's string,
+/// and the hard link to remove once the syscall has consumed them.
+struct Placed {
+    repl: Vec<u8>,
+    staged: Option<PathBuf>,
 }
 
 /// Rewrites a path string in the tracee to a transient alias, continues the
@@ -814,17 +865,77 @@ enum Form {
 /// `Outcome::Replied`: the notification was answered here.
 ///
 /// # Errors
-/// `ENAMETOOLONG` when even the alias does not fit, or the errno of creating it.
+/// `ENAMETOOLONG` when no alias fits, or the errno of creating it.
 fn transient_rewrite(r: &Req, addr: u64, orig: &[u8], host: &[u8], form: Form) -> Result<Outcome> {
     if r.ctx.trap_mode() {
         return rewrite_staged(r, addr, host);
     }
     let dir = shim::dir_bytes().ok_or(libc::ENOENT)?;
     let name = acquire_alias().ok_or(libc::EAGAIN)?;
-    let release = |e: i32| {
+    let placed = match place_alias(&dir, name, orig.len(), host, form, &staging_candidates(r.ctx)) {
+        Ok(placed) => placed,
+        Err(e) => {
+            release_alias(name);
+            return Err(e);
+        }
+    };
+    let fail = |e: i32| {
+        unstage(&placed);
         release_alias(name);
         e
     };
+    let mut written = placed.repl.clone();
+    written.push(0);
+    r.valid().map_err(fail)?;
+    let cpu_before = cpu_time(r.pid);
+    r.ctx.mem.write_force(r.pid, addr, &written).map_err(fail)?;
+    note!(
+        r.ctx,
+        2,
+        "pid {} rewrote {} -> {} for {}",
+        r.pid,
+        String::from_utf8_lossy(&orig[..orig.len().saturating_sub(1)]),
+        String::from_utf8_lossy(&placed.repl),
+        String::from_utf8_lossy(host)
+    );
+    reply_continue(r.listener, r.id);
+    wait_syscall_consumed(r, cpu_before);
+    restore_if_intact(r, r.pid, addr, orig, &written);
+    unstage(&placed);
+    release_alias(name);
+    Ok(Outcome::Replied)
+}
+
+/// Places the alias `name` for `host` so that its path fits in `room` bytes,
+/// the tracee's string and its NUL.
+///
+/// A symlink in the alias directory comes first: to the target itself, or
+/// to its parent with `<name>/<basename>` for a final component that must
+/// be reached without following it.  When that does not fit, the final
+/// component is reached through a hard link to it, which is the same inode:
+/// as `<name>` in the alias directory when that is on the target's mount,
+/// else as `<name>/<name>` through a staging directory on that mount.
+///
+/// # Arguments
+/// * `dir` - The alias directory.
+/// * `name` - The alias name held by the caller.
+/// * `room` - Bytes available in the tracee for the path and its NUL.
+/// * `host` - Host path the alias stands for.
+/// * `form` - Alias form.
+/// * `candidates` - Where a staging directory may be created, in order.
+///
+/// # Errors
+/// `ENAMETOOLONG` when no placement fits, or the errno of creating the symlink.
+fn place_alias(
+    dir: &[u8],
+    name: u8,
+    room: usize,
+    host: &[u8],
+    form: Form,
+    candidates: &[PathBuf],
+) -> Result<Placed> {
+    let link = Path::new(OsStr::from_bytes(dir)).join(OsStr::from_bytes(&[name]));
+    let _ = std::fs::remove_file(&link);
     let (target, repl): (Vec<u8>, Vec<u8>) = match form {
         Form::File => (host.to_vec(), vec![name]),
         Form::Dir => {
@@ -839,39 +950,196 @@ fn transient_rewrite(r: &Req, addr: u64, orig: &[u8], host: &[u8], form: Form) -
             (parent, p)
         }
     };
-    if repl.len() + 1 > orig.len() {
-        return Err(release(libc::ENAMETOOLONG));
+    if repl.len() < room {
+        std::os::unix::fs::symlink(OsStr::from_bytes(&target), &link).map_err(io_errno)?;
+        return Ok(Placed { repl, staged: None });
     }
-    let mut link = dir.clone();
-    link.push(b'/');
-    link.push(name);
-    let (lt, ll) = (
-        CString::new(target).map_err(|_| release(libc::EINVAL))?,
-        CString::new(link.clone()).map_err(|_| release(libc::EINVAL))?,
-    );
-    unsafe { libc::unlink(ll.as_ptr()) };
-    if unsafe { libc::symlink(lt.as_ptr(), ll.as_ptr()) } < 0 {
-        return Err(release(errno()));
+    if form != Form::Dir || room < 2 {
+        return Err(libc::ENAMETOOLONG);
     }
-    let mut written = repl.clone();
-    written.push(0);
-    r.valid().map_err(release)?;
-    let cpu_before = cpu_time(r.pid);
-    r.ctx.mem.write_force(r.pid, addr, &written).map_err(release)?;
-    note!(
-        r.ctx,
-        2,
-        "pid {} rewrote {} -> {} for {}",
-        r.pid,
-        String::from_utf8_lossy(&orig[..orig.len().saturating_sub(1)]),
-        String::from_utf8_lossy(&repl),
-        String::from_utf8_lossy(host)
-    );
-    reply_continue(r.listener, r.id);
-    wait_syscall_consumed(r, cpu_before);
-    restore_if_intact(r, r.pid, addr, orig, &written);
-    release_alias(name);
-    Ok(Outcome::Replied)
+    if link_nofollow(host, &link).is_ok() {
+        return Ok(Placed {
+            repl: vec![name],
+            staged: Some(link),
+        });
+    }
+    if room < 4 {
+        return Err(libc::ENAMETOOLONG);
+    }
+    let staged = stage_hard_link(host, name, candidates).ok_or(libc::ENAMETOOLONG)?;
+    let stage_dir = staged.parent().ok_or(libc::ENAMETOOLONG)?;
+    if let Err(e) = std::os::unix::fs::symlink(stage_dir, &link) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(io_errno(e));
+    }
+    Ok(Placed {
+        repl: vec![name, b'/', name],
+        staged: Some(staged),
+    })
+}
+
+/// Removes the hard link an alias was placed through, once the syscall has
+/// consumed the rewritten path; a descriptor opened through it keeps the inode.
+///
+/// # Arguments
+/// * `placed` - The alias.
+fn unstage(placed: &Placed) {
+    if let Some(p) = &placed.staged {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// The errno of an I/O error, `EIO` for one without.
+///
+/// # Arguments
+/// * `e` - The error.
+fn io_errno(e: std::io::Error) -> i32 {
+    e.raw_os_error().unwrap_or(libc::EIO)
+}
+
+/// `linkat` without `AT_SYMLINK_FOLLOW`: a hard link to `host` itself, a
+/// symlink included.
+///
+/// # Arguments
+/// * `host` - Existing path.
+/// * `at` - Path of the new link.
+///
+/// # Errors
+/// The errno of `linkat`.
+fn link_nofollow(host: &[u8], at: &Path) -> Result<()> {
+    let src = CString::new(host.to_vec()).map_err(|_| libc::EINVAL)?;
+    let dst = CString::new(at.as_os_str().as_bytes().to_vec()).map_err(|_| libc::EINVAL)?;
+    if unsafe { libc::linkat(libc::AT_FDCWD, src.as_ptr(), libc::AT_FDCWD, dst.as_ptr(), 0) } < 0 {
+        return Err(errno());
+    }
+    Ok(())
+}
+
+/// Makes a hard link named `name` to `host` in a staging directory on its
+/// mount, creating one under the first of `candidates` that allows it.
+///
+/// # Arguments
+/// * `host` - Existing path.
+/// * `name` - The alias name held by the caller.
+/// * `candidates` - Where a staging directory may be created, in order.
+///
+/// # Returns
+/// The hard link's path, or `None` when no directory on that mount can hold
+/// one: a read-only mount, no writable candidate on it, or a symlink of
+/// another owner under `fs.protected_hardlinks`.
+fn stage_hard_link(host: &[u8], name: u8, candidates: &[PathBuf]) -> Option<PathBuf> {
+    let link_in = |d: &Path| {
+        let p = d.join(OsStr::from_bytes(&[name]));
+        let _ = std::fs::remove_file(&p);
+        link_nofollow(host, &p).ok().map(|()| p)
+    };
+    let mut staging = STAGING.lock().unwrap();
+    if let Some(p) = staging.iter().find_map(|d| link_in(d)) {
+        return Some(p);
+    }
+    for base in candidates {
+        let d = base.join(format!("proot-next-{}-stage", std::process::id()));
+        if std::fs::DirBuilder::new().mode(0o700).create(&d).is_err() {
+            continue;
+        }
+        if let Some(p) = link_in(&d) {
+            staging.push(d);
+            return Some(p);
+        }
+        let _ = std::fs::remove_dir(&d);
+    }
+    None
+}
+
+/// Where a staging directory may be created, in order: the user's cache
+/// directory, beside the rootfs, and the temporary directory.
+///
+/// # Arguments
+/// * `ctx` - Supervisor state.
+fn staging_candidates(ctx: &Ctx) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(c) = std::env::var_os("XDG_CACHE_HOME").filter(|c| !c.is_empty()) {
+        v.push(PathBuf::from(c));
+    } else if let Some(h) = std::env::var_os("HOME") {
+        v.push(PathBuf::from(h).join(".cache"));
+    }
+    if let Some(parent) = Path::new(OsStr::from_bytes(&ctx.config.root)).parent() {
+        v.push(parent.to_path_buf());
+    }
+    v.push(std::env::temp_dir());
+    v
+}
+
+/// Removes the staging directories, at exit.
+pub fn remove_staging() {
+    for d in STAGING.lock().unwrap().drain(..) {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// Whether `host` lies in the alias directory or a staging directory.
+///
+/// # Arguments
+/// * `host` - A host path.
+fn under_alias(host: &[u8]) -> bool {
+    let within = |d: &[u8]| host.len() > d.len() && host.starts_with(d) && host[d.len()] == b'/';
+    shim::dir_bytes().is_some_and(|d| within(&d))
+        || STAGING
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|d| within(d.as_os_str().as_bytes()))
+}
+
+/// `readlinkat` with an empty path on a descriptor opened through a hard
+/// link alias: the answer comes from the descriptor's own inode, reopened
+/// through `/proc`, since the link it was opened by is gone by then and its
+/// name may stand for something else.
+///
+/// # Arguments
+/// * `r` - The notification.
+/// * `dirfd` - The descriptor.
+/// * `path` - The path argument.
+///
+/// # Returns
+/// `None` when the call is not such a read, which the caller serves by path.
+pub fn readlink_alias_fd(r: &Req, dirfd: i32, path: &[u8]) -> Option<Result<Vec<u8>>> {
+    if !r.ctx.no_ptrace || !path.is_empty() || dirfd < 0 {
+        return None;
+    }
+    let proc_link = format!("/proc/{}/fd/{}", r.pid, dirfd);
+    let host = strip_deleted(read_link(proc_link.as_bytes()).ok()?);
+    if !under_alias(&host) {
+        return None;
+    }
+    Some(readlink_reopened(&proc_link))
+}
+
+/// Reads the target of the symlink a `/proc/<pid>/fd/N` link leads to, by
+/// reopening it `O_PATH` here, which lands on that inode whether or not its
+/// name still exists.
+///
+/// # Arguments
+/// * `proc_link` - The `/proc` link.
+///
+/// # Errors
+/// The errno of the reopen, or `ENOENT` where the inode is no symlink, as
+/// the kernel answers an empty path on such a descriptor.
+fn readlink_reopened(proc_link: &str) -> Result<Vec<u8>> {
+    let c = CString::new(proc_link).map_err(|_| libc::EINVAL)?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(errno());
+    }
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    let n = unsafe { libc::readlinkat(fd, c"".as_ptr(), buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    let e = errno();
+    unsafe { libc::close(fd) };
+    if n < 0 {
+        return Err(if e == libc::EINVAL { libc::ENOENT } else { e });
+    }
+    buf.truncate(n as usize);
+    Ok(buf)
 }
 
 /// Replaces a path the guest stub staged with its host path and lets the
@@ -1057,5 +1325,86 @@ mod tests {
     #[test]
     fn ptrace_probe_does_not_panic() {
         let _ = ptrace_usable();
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("proot-direct-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn hard_link_alias_is_the_symlink_itself() {
+        use std::os::unix::fs::MetadataExt;
+        let d = scratch("hardlink");
+        let link = d.join("link");
+        std::os::unix::fs::symlink("target", &link).unwrap();
+        let alias_dir = d.join("alias");
+        std::fs::create_dir(&alias_dir).unwrap();
+        let (dir, host) = (alias_dir.as_os_str().as_bytes(), link.as_os_str().as_bytes());
+        let name = acquire_alias().unwrap();
+        let want = std::fs::symlink_metadata(&link).unwrap();
+        let placed = place_alias(dir, name, b"link\0".len(), host, Form::Dir, &[]).unwrap();
+        assert_eq!(placed.repl, vec![name]);
+        let got = std::fs::symlink_metadata(alias_dir.join(OsStr::from_bytes(&[name]))).unwrap();
+        assert!(got.file_type().is_symlink());
+        assert_eq!((got.dev(), got.ino()), (want.dev(), want.ino()));
+        assert_eq!(std::fs::symlink_metadata(&link).unwrap().nlink(), 2);
+        unstage(&placed);
+        assert_eq!(std::fs::symlink_metadata(&link).unwrap().nlink(), 1);
+        assert_eq!(
+            place_alias(dir, name, b"\0".len(), host, Form::Dir, &[]).err(),
+            Some(libc::ENAMETOOLONG)
+        );
+        let fits = place_alias(dir, name, b"./link\0".len(), host, Form::Dir, &[]).unwrap();
+        assert!(fits.staged.is_none());
+        assert_eq!(fits.repl, [&[name, b'/'][..], b"link"].concat());
+        release_alias(name);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn staging_directory_holds_a_link_on_the_symlinks_mount() {
+        use std::os::unix::fs::MetadataExt;
+        let d = scratch("staging");
+        let link = d.join("link");
+        std::os::unix::fs::symlink("target", &link).unwrap();
+        let host = link.as_os_str().as_bytes();
+        let name = acquire_alias().unwrap();
+        let staged =
+            stage_hard_link(host, name, &[d.join("missing"), d.clone()]).expect("a staging directory");
+        let stage_dir = staged.parent().unwrap().to_path_buf();
+        assert_eq!(stage_dir.parent(), Some(d.as_path()));
+        let (want, got) = (
+            std::fs::symlink_metadata(&link).unwrap(),
+            std::fs::symlink_metadata(&staged).unwrap(),
+        );
+        assert_eq!((got.dev(), got.ino()), (want.dev(), want.ino()));
+        assert!(under_alias(staged.as_os_str().as_bytes()));
+        assert!(!under_alias(host));
+        assert_eq!(stage_hard_link(host, name, &[]), Some(staged.clone()));
+        remove_staging();
+        assert!(!stage_dir.exists());
+        release_alias(name);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn kernel_walks_a_single_component_from_a_directory_descriptor() {
+        let d = scratch("walk");
+        std::os::unix::fs::symlink("target", d.join("link")).unwrap();
+        let c = CString::new(d.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        assert!(fd >= 0);
+        let host = d.join("link");
+        let host = host.as_os_str().as_bytes();
+        let pid = std::process::id();
+        assert!(kernel_walks_alike(pid, fd, b"link", host));
+        assert!(!kernel_walks_alike(pid, fd, b"./link", host));
+        assert!(!kernel_walks_alike(pid, fd, b"link", b"/elsewhere/link"));
+        assert!(!kernel_walks_alike(pid, -1, b"link", host));
+        unsafe { libc::close(fd) };
+        std::fs::remove_dir_all(d).unwrap();
     }
 }

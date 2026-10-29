@@ -938,6 +938,28 @@ fn do_access(r: &Req, dirfd: i32, path: &[u8], mode: i64, flags: i64) -> Result<
 /// An empty path names the link `dirfd` was opened on.  Where that is no
 /// link, the answer is `ENOENT`, as the kernel's is.
 fn do_readlink(r: &Req, dirfd: i32, path: &[u8], buf: u64, bufsiz: usize) -> Result<Outcome> {
+    let target = match direct::readlink_alias_fd(r, dirfd, path) {
+        Some(target) => target?,
+        None => readlink_by_path(r, dirfd, path)?,
+    };
+    let len = target.len().min(bufsiz);
+    if len > 0 {
+        r.write(buf, &target[..len])?;
+    }
+    Ok(Outcome::Value(Ok(len as i64)))
+}
+
+/// The target of the link `path` names, or `dirfd` was opened on for an
+/// empty path, read by its path.
+///
+/// # Arguments
+/// * `r` - The notification.
+/// * `dirfd` - Base descriptor for a relative path, or `libc::AT_FDCWD`.
+/// * `path` - Path bytes as read from the tracee, without NUL.
+///
+/// # Errors
+/// As the translation, or the errno of reading the link.
+fn readlink_by_path(r: &Req, dirfd: i32, path: &[u8]) -> Result<Vec<u8>> {
     let resolved = r.translate_or_dirfd(dirfd, path, false)?;
     r.valid()?;
     let read = || -> Result<Vec<u8>> {
@@ -967,11 +989,7 @@ fn do_readlink(r: &Req, dirfd: i32, path: &[u8], buf: u64, bufsiz: usize) -> Res
         },
         None => read()?,
     };
-    let len = target.len().min(bufsiz);
-    if len > 0 {
-        r.write(buf, &target[..len])?;
-    }
-    Ok(Outcome::Value(Ok(len as i64)))
+    Ok(target)
 }
 
 /// `getcwd`: the tracee's cwd as a guest path, NUL-terminated.

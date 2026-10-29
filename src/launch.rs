@@ -412,6 +412,9 @@ pub fn run(config: Config) -> Result<i32, String> {
     let keep = std::env::var_os("PROOT_BWRAP_KEEP").is_some();
     ctx.root.remove_placeholders();
     let _ = std::fs::remove_dir_all(crate::exec::alias_dir());
+    if no_ptrace {
+        direct::remove_staging();
+    }
     if let Some(dir) = shim::path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
         let _ = std::fs::remove_dir_all(dir);
     }
