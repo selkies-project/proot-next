@@ -233,6 +233,7 @@ pub fn run(config: Config) -> Result<i32, String> {
         become_subreaper();
         Some(CString::new(dir.into_os_string().into_vec()).map_err(|_| "alias directory contains NUL")?)
     } else {
+        let _ = shim::install();
         None
     };
     let initial_cwd: Vec<u8> = if host_cwd_exists {

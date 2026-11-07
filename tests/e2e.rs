@@ -1253,6 +1253,51 @@ fn origin_rpath_resolves_through_a_symlinked_program() {
     assert_eq!(stdout(&o), "answer 42", "{}", String::from_utf8_lossy(&o.stderr));
 }
 
+/// A dynamically linked position-independent program lies where the kernel
+/// puts one, below its break and far from what it maps later.  A JIT that
+/// calls into its program with a 32-bit displacement whenever the target is
+/// less than 4 GiB ahead aborts when the program, mapped by the guest's
+/// dynamic loader among the libraries, lies 2 to 4 GiB above its code cache.
+#[test]
+fn dynamic_program_lies_below_its_break_far_from_later_mappings() {
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: no C compiler for the layout probe");
+        return;
+    }
+    let d = tmpdir("layout");
+    std::fs::write(
+        d.join("lay.c"),
+        "#include <stdio.h>\n#include <unistd.h>\n#include <sys/mman.h>\n\
+         int main(void) {\n\
+         void *m = mmap(0, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\n\
+         printf(\"%lu %lu %lu\\n\", (unsigned long)main, (unsigned long)sbrk(0), (unsigned long)m);\n\
+         return 0;\n}\n",
+    )
+    .unwrap();
+    let o = Command::new("cc")
+        .current_dir(&d)
+        .args(["-O2", "-fPIE", "-pie", "-o", "lay", "lay.c"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = run(&[
+        "-r",
+        "/",
+        "-b",
+        &format!("{}:/pn-lay", d.display()),
+        "/pn-lay/lay",
+    ]);
+    let out = stdout(&o);
+    let v: Vec<u64> = out.split_whitespace().filter_map(|n| n.parse().ok()).collect();
+    assert_eq!(v.len(), 3, "{out:?} {}", String::from_utf8_lossy(&o.stderr));
+    let (text, brk, map) = (v[0], v[1], v[2]);
+    assert!(text < brk, "program at {text:#x} not below its break at {brk:#x}");
+    assert!(
+        map.abs_diff(text) > 1 << 32,
+        "program at {text:#x} within 4 GiB of a new mapping at {map:#x}"
+    );
+}
+
 /// Dynamic programs, scripts, argv[0] and /proc/self/exe all go through the
 /// exec shim; a script without `#!` is refused with ENOEXEC so the shell
 /// runs it itself.

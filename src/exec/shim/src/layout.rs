@@ -153,6 +153,22 @@ pub const EXEC_TRUNCATED_ARG: usize = 5;
 /// Name of the 32-bit trampoline in the alias directory, next to `e`.
 pub const SHIM32_NAME: &str = "e32";
 
+/// Name of the loader in the alias directory, next to `e`: a copy of the trampoline whose
+/// [`ROLE_MARK`] ends in [`ROLE_LOADER`].  An exec of a dynamically linked program of the host's
+/// own machine is re-targeted at it outside the guest-stub mode, and it loads the program and its
+/// interpreter in place, where the kernel would have put them.
+pub const LOADER_NAME: &str = "l";
+
+/// Bytes the trampoline carries once in its file, the last of them naming the role of that copy:
+/// [`ROLE_EXEC`] as built, [`ROLE_LOADER`] in the copy the supervisor installs as [`LOADER_NAME`].
+pub const ROLE_MARK: &[u8; 24] = b"\0proot-next shim role: e";
+
+/// Role of the trampoline as built: carry out a record.
+pub const ROLE_EXEC: u8 = b'e';
+
+/// Role of the copy installed as [`LOADER_NAME`]: load the program its arguments name.
+pub const ROLE_LOADER: u8 = b'l';
+
 /// A trampoline's path relative to the alias directory, `.` and slashes before its name filling
 /// a [`PATH_AREA`], for `execve`.
 ///

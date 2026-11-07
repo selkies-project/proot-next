@@ -669,9 +669,11 @@ fn fake_proc_status(text: &[u8], fake_root: Option<crate::procs::Ids>) -> Result
 /// Serves `/proc/<pid>/cmdline` as the process was started, without the
 /// loader the exec was retargeted at.
 ///
-/// The kernel's file names the loader alias, `--argv0`, the name and the
-/// program before the real arguments; `ps`, `pgrep -f` and programs reading
-/// their own command line expect the argv the tracee passed.  A process in
+/// The kernel's file names the dynamic loader's alias, `--argv0`, the name
+/// and the program before the real arguments, or the shim loader's alias,
+/// the program and its `AT_EXECFN` before the whole argv; `ps`, `pgrep -f`
+/// and programs reading their own command line expect the argv the tracee
+/// passed.  A process in
 /// the no-ptrace trampoline, or one that rewrote its own argv, is left as is.
 ///
 /// In the guest-stub restricted mode no loader is exec'd, so the kernel's
@@ -716,6 +718,12 @@ fn fake_proc_cmdline(ctx: &Ctx, rest: &[u8], text: &[u8]) -> Result<Option<i32>>
         return Ok(None);
     }
     let tail: Vec<&[u8]> = match args.as_slice() {
+        [alias, ..] if crate::exec::is_loader_alias(alias) => {
+            let Some(rest) = args.get(crate::exec::LOADER_ARGS..) else {
+                return Ok(None);
+            };
+            rest.to_vec()
+        }
         [_, b"--argv0", argv0, _, rest @ ..] => std::iter::once(*argv0).chain(rest.iter().copied()).collect(),
         [_, prog, rest @ ..] => std::iter::once(*prog).chain(rest.iter().copied()).collect(),
         _ => return Ok(None),

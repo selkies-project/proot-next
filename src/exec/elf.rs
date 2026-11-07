@@ -12,6 +12,8 @@ const MAX_PHNUM: usize = 512;
 pub struct ElfInfo {
     /// Path of the dynamic loader named by `PT_INTERP`, or `None` for a static executable.
     pub interp: Option<Vec<u8>>,
+    /// `e_machine`: `EM_X86_64` (62), `EM_386` (3), `EM_AARCH64` (183), `EM_ARM` (40), ...
+    pub machine: u16,
 }
 
 /// Classification of the first bytes of an executable file.
@@ -60,6 +62,7 @@ pub fn classify(head: &[u8], read_at: &mut dyn FnMut(u64, usize) -> Result<Vec<u
         // Big-endian ELF on x86_64 cannot run anyway.
         return FileKind::Other;
     }
+    let machine = u16::from_le_bytes(head[18..20].try_into().unwrap());
     let wrap = |info: ElfInfo| {
         if is64 {
             FileKind::Elf64(info)
@@ -91,7 +94,10 @@ pub fn classify(head: &[u8], read_at: &mut dyn FnMut(u64, usize) -> Result<Vec<u
         )
     };
     if phentsize < min_ent || phnum == 0 || phnum > MAX_PHNUM {
-        return wrap(ElfInfo { interp: None });
+        return wrap(ElfInfo {
+            interp: None,
+            machine,
+        });
     }
     let table = match read_at(phoff, phentsize * phnum) {
         Ok(t) if t.len() == phentsize * phnum => t,
@@ -121,9 +127,15 @@ pub fn classify(head: &[u8], read_at: &mut dyn FnMut(u64, usize) -> Result<Vec<u
         while interp.last() == Some(&0) {
             interp.pop();
         }
-        return wrap(ElfInfo { interp: Some(interp) });
+        return wrap(ElfInfo {
+            interp: Some(interp),
+            machine,
+        });
     }
-    wrap(ElfInfo { interp: None })
+    wrap(ElfInfo {
+        interp: None,
+        machine,
+    })
 }
 
 /// Classifies the file at `host_path` by reading it.
@@ -173,6 +185,7 @@ mod tests {
         f[..4].copy_from_slice(b"\x7fELF");
         f[4] = 2;
         f[5] = 1;
+        f[18..20].copy_from_slice(&62u16.to_le_bytes());
         f[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
         f[54..56].copy_from_slice(&56u16.to_le_bytes()); // phentsize
         f[56..58].copy_from_slice(&1u16.to_le_bytes()); // phnum
@@ -213,7 +226,8 @@ mod tests {
         assert_eq!(
             classify(&file[..64], &mut read_at),
             FileKind::Elf32(ElfInfo {
-                interp: Some(b"/lib/ld-linux.so.2".to_vec())
+                interp: Some(b"/lib/ld-linux.so.2".to_vec()),
+                machine: 0,
             })
         );
     }
@@ -225,7 +239,8 @@ mod tests {
         assert_eq!(
             classify(&file[..64], &mut read_at),
             FileKind::Elf64(ElfInfo {
-                interp: Some(b"/lib64/ld-linux-x86-64.so.2".to_vec())
+                interp: Some(b"/lib64/ld-linux-x86-64.so.2".to_vec()),
+                machine: 62,
             })
         );
     }
@@ -245,7 +260,10 @@ mod tests {
         // No program headers: a static 32-bit executable as far as we can tell.
         assert_eq!(
             classify(&e32, &mut nop),
-            FileKind::Elf32(ElfInfo { interp: None })
+            FileKind::Elf32(ElfInfo {
+                interp: None,
+                machine: 0
+            })
         );
     }
 

@@ -1,16 +1,22 @@
-//! The exec shim's ELF loader, used in the guest-stub restricted mode, for
-//! the programs of each build's own ABI: ELF64 x86_64 or aarch64, ELF32
-//! i386 or ARM.
+//! The exec shim's ELF loader, for the programs of each build's own ABI:
+//! ELF64 x86_64 or aarch64, ELF32 i386 or ARM.  The guest-stub restricted
+//! mode loads every program with it, and the other modes the dynamically
+//! linked programs of the host's machine, through the copy installed as the
+//! loader (`layout::LOADER_NAME`).
 //!
-//! `execve` would reset the stub's `SIGSYS` handler and drop the mailbox, so
-//! the shim maps the program into its own process the way the kernel's
-//! `binfmt_elf` would and jumps to it.  A position-independent program is
-//! placed where `mmap` finds room, a fixed-address one where it asks to be,
-//! refusing rather than replacing anything already mapped there (the shim
-//! itself is position independent and lies elsewhere).  The program's
-//! interpreter is opened through an ordinary, trapped `open`, so the
-//! supervisor translates it as it would the kernel's own lookup, and loaded
-//! the same way.
+//! In the guest-stub mode `execve` would reset the stub's `SIGSYS` handler
+//! and drop the mailbox; elsewhere exec'ing the guest's dynamic loader with
+//! the program as its argument would have the dynamic loader map the program
+//! among the libraries.  So the shim maps the program into its own process
+//! the way the kernel's `binfmt_elf` would and jumps to it.  A
+//! position-independent program with an interpreter goes where the kernel
+//! puts one, below the initial break (see [`program_slot`]); one without, an
+//! interpreter itself, where `mmap` finds room; a fixed-address one where it
+//! asks to be, refusing rather than replacing anything already mapped there
+//! (the shim itself is position independent and lies elsewhere).  The
+//! program's interpreter is opened through an ordinary `open`, trapped or
+//! traced, so the supervisor translates it as it would the kernel's own
+//! lookup, and loaded the same way.
 //!
 //! The new stack is built below the shim's own frames, on the main thread
 //! stack: `argc`, the argument and environment pointers, which point at the
@@ -19,7 +25,7 @@
 //! replaced.  The vDSO, `AT_RANDOM`, the ids and the hardware capabilities
 //! therefore stay what the kernel gave.
 
-use crate::stub::{failed, sys};
+use crate::stub::failed;
 use core::ffi::c_char;
 
 /// The page size the kernel uses, from the shim's auxiliary vector.
@@ -211,6 +217,19 @@ struct Image {
     phnum: usize,
 }
 
+/// A raw syscall: through the allow gate when the gates are mapped, as in
+/// the guest-stub mode, directly otherwise.
+///
+/// # Arguments
+/// * `nr` - Syscall number.
+/// * `a` - Its six arguments.
+///
+/// # Returns
+/// The raw result, a negative errno on failure.
+fn sys(nr: isize, a: [usize; 6]) -> isize {
+    crate::sc(nr as libc::c_long, a)
+}
+
 /// Reads exactly `buf.len()` bytes at `off`.  The offset fits a word on
 /// every ABI; on i386 the next argument is its high half, zero, and ARM
 /// EABI passes it in an even register pair after a padding argument.
@@ -359,7 +378,7 @@ fn page_up(v: usize) -> usize {
     (v + page() - 1) & !(page() - 1)
 }
 
-/// `mmap` through the allow gate, with a page-aligned byte offset.
+/// `mmap` through [`sys`], with a page-aligned byte offset.
 ///
 /// # Arguments
 /// * `addr` - Address hint, or the fixed address.
@@ -383,7 +402,7 @@ fn mmap(addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize) -> 
     if failed(r) { Err(-r as i32) } else { Ok(r as usize) }
 }
 
-/// `munmap` through the allow gate.
+/// `munmap` through [`sys`].
 ///
 /// # Arguments
 /// * `addr` - Start of the range.
@@ -392,7 +411,7 @@ fn munmap(addr: usize, len: usize) {
     sys(libc::SYS_munmap as isize, [addr, len, 0, 0, 0, 0]);
 }
 
-/// `close` through the allow gate.
+/// `close` through [`sys`].
 ///
 /// # Arguments
 /// * `fd` - The descriptor.
@@ -400,11 +419,87 @@ fn close(fd: i32) {
     sys(libc::SYS_close as isize, [fd as usize, 0, 0, 0, 0, 0]);
 }
 
+/// Most the initial break lies above the kernel's base for position-independent programs when
+/// it was moved there, the kernel randomizing it by up to 1 GiB.
+#[cfg(target_pointer_width = "64")]
+const BRK_SPREAD: usize = 1 << 34;
+
+/// Where the kernel would load a position-independent program with an interpreter, of `span`
+/// bytes aligned to `align`.
+///
+/// The kernel loads such a program at `ELF_ET_DYN_BASE`, two thirds of the default address
+/// window, plus a random offset, and starts the break after it, far below the libraries and
+/// every later `mmap`.  Programs rely on that distance: a JIT that calls into its own program
+/// with a 32-bit displacement when it thinks the target is near breaks when the program lies
+/// among the libraries, within a few GiB of its code cache.  The shim was
+/// itself exec'd without an interpreter, so the kernel placed it in the `mmap` area and moved
+/// its break to `ELF_ET_DYN_BASE` instead, randomized; the program goes right below that break,
+/// which then follows the program as it would have.  A kernel that left the break after the
+/// shim gets the program at `ELF_ET_DYN_BASE` itself.  The default window is the power of two
+/// above the stack, on which the kernel builds it.
+///
+/// In 32 bits a 32-bit displacement reaches the whole address space, and the compat layouts
+/// differ, so 32-bit builds keep the `mmap` placement.
+///
+/// # Arguments
+/// * `span` - Bytes to reserve.
+/// * `align` - Alignment of the start, a power of two.
+///
+/// # Returns
+/// The start address, or `None` to leave the placement to `mmap`.
+#[cfg(target_pointer_width = "64")]
+fn program_slot(span: usize, align: usize) -> Option<usize> {
+    let window = stack_pointer().checked_next_power_of_two()?;
+    let dyn_base = page_down((window - page()) / 3 * 2);
+    let brk = sys(libc::SYS_brk as isize, [0; 6]);
+    let brk = if failed(brk) { 0 } else { brk as usize };
+    let start = if brk > dyn_base && brk - dyn_base < BRK_SPREAD {
+        brk.checked_sub(page() + span)? & !(align - 1)
+    } else {
+        dyn_base.checked_add(align - 1)? & !(align - 1)
+    };
+    (start >= 1 << 32).then_some(start)
+}
+
+/// Where the kernel would load a position-independent program with an interpreter; 32-bit
+/// builds leave it to `mmap`, see the 64-bit version.
+///
+/// # Arguments
+/// * `_span` - Bytes to reserve.
+/// * `_align` - Alignment of the start.
+///
+/// # Returns
+/// `None`.
+#[cfg(target_pointer_width = "32")]
+fn program_slot(_span: usize, _align: usize) -> Option<usize> {
+    None
+}
+
+/// Reserves `span` bytes at exactly `at`, without replacing anything mapped there.
+///
+/// # Arguments
+/// * `at` - The start, page-aligned.
+/// * `span` - Bytes to reserve.
+///
+/// # Returns
+/// `at` once reserved, or `None` when something is in the way.
+fn reserve_at(at: usize, span: usize) -> Option<usize> {
+    let anon = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+    let got = mmap(at, span, libc::PROT_NONE, anon | libc::MAP_FIXED_NOREPLACE, -1, 0).ok()?;
+    if got != at {
+        munmap(got, span);
+        return None;
+    }
+    Some(at)
+}
+
 /// Maps every `PT_LOAD` segment of a file.
 ///
 /// The whole span is reserved first, so segments keep their distances and
 /// nothing else lands between them; the reservation of a position-independent
-/// file is aligned to its largest segment alignment, as the kernel does.  A
+/// file is aligned to its largest segment alignment, as the kernel does, and
+/// made where [`program_slot`] says for a program with an interpreter, where
+/// `mmap` finds room otherwise or when that slot is taken.  A
 /// segment with a bss has the rest of its last file page zeroed, to the end
 /// of the page and not only of the segment, as the kernel does too: glibc's
 /// dynamic loader allocates its first objects from that tail and takes them
@@ -413,6 +508,7 @@ fn close(fd: i32) {
 /// # Arguments
 /// * `fd` - The file.
 /// * `h` - Its headers.
+/// * `program` - The file is the program and has an interpreter.
 ///
 /// # Returns
 /// Where the image landed.
@@ -420,7 +516,7 @@ fn close(fd: i32) {
 /// # Errors
 /// The errno of a mapping that failed; `EEXIST` when a fixed-address program
 /// collides with something already mapped.
-fn map(fd: i32, h: &Headers) -> Result<Image, Failure> {
+fn map(fd: i32, h: &Headers, program: bool) -> Result<Image, Failure> {
     let loads = || {
         h.ph[..h.phnum]
             .iter()
@@ -440,23 +536,33 @@ fn map(fd: i32, h: &Headers) -> Result<Image, Failure> {
             .max()
             .unwrap_or(page())
             .max(page());
-        let slack = align - page();
-        let at = mmap(
-            0,
-            span + slack,
-            libc::PROT_NONE,
-            anon | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
-        .map_err(|e| fail(e, b"cannot reserve address space"))?;
-        let start = (at + align - 1) & !(align - 1);
-        if start > at {
-            munmap(at, start - at);
-        }
-        if at + span + slack > start + span {
-            munmap(start + span, at + span + slack - start - span);
-        }
+        let slot = program
+            .then(|| program_slot(span, align))
+            .flatten()
+            .and_then(|at| reserve_at(at, span));
+        let start = match slot {
+            Some(start) => start,
+            None => {
+                let slack = align - page();
+                let at = mmap(
+                    0,
+                    span + slack,
+                    libc::PROT_NONE,
+                    anon | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+                .map_err(|e| fail(e, b"cannot reserve address space"))?;
+                let start = (at + align - 1) & !(align - 1);
+                if start > at {
+                    munmap(at, start - at);
+                }
+                if at + span + slack > start + span {
+                    munmap(start + span, at + span + slack - start - span);
+                }
+                start
+            }
+        };
         start - lo
     } else {
         let at = mmap(
@@ -557,16 +663,18 @@ pub fn run(
     kernel_envp: *const *const c_char,
     execfn: *const c_char,
 ) -> Failure {
-    let prog = match headers(fd).and_then(|h| map(fd, &h).map(|img| (img, h))) {
+    let prog = headers(fd).and_then(|h| {
+        let interp_hdr = h.ph[..h.phnum].iter().find(|p| p.kind == PT_INTERP).copied();
+        map(fd, &h, interp_hdr.is_some()).map(|img| (img, interp_hdr))
+    });
+    let (img, interp_hdr) = match prog {
         Ok(v) => v,
         Err(f) => {
             close(fd);
             return f;
         }
     };
-    let (img, h) = prog;
     let mut interp = [0u8; INTERP_MAX];
-    let interp_hdr = h.ph[..h.phnum].iter().find(|p| p.kind == PT_INTERP).copied();
     if let Some(p) = interp_hdr {
         let n = p.filesz;
         if n == 0 || n > INTERP_MAX || pread(fd, &mut interp[..n], p.offset).is_err() || interp[n - 1] != 0 {
@@ -583,7 +691,7 @@ pub fn run(
                 b"cannot open its interpreter",
             );
         }
-        let loaded = headers(ifd).and_then(|ih| map(ifd, &ih));
+        let loaded = headers(ifd).and_then(|ih| map(ifd, &ih, false));
         close(ifd);
         match loaded {
             Ok(i) => (i.entry, i.base),

@@ -5,10 +5,15 @@
 //!
 //! 1. the program path is translated, and `#!` scripts are expanded into
 //!    interpreter plus argument, repeatedly, until an ELF is reached;
-//! 2. a dynamically linked ELF is not executed directly: the exec is
-//!    re-targeted at the host copy of its dynamic loader, with the program's
-//!    guest path as the loader's argument.  The loader then opens the program
-//!    and its libraries through `openat`, which the notify handlers translate;
+//! 2. a dynamically linked ELF is not executed directly.  One of the host's
+//!    machine is exec'd through the loader the exec shim installs (see
+//!    [`shim::loader_path`]), with the program's guest path as an argument:
+//!    the loader opens the program and the interpreter its `PT_INTERP` names
+//!    through `openat`, which the handlers translate, maps them where the
+//!    kernel would and jumps to the interpreter, which then runs as if the
+//!    kernel had loaded the program.  Any other, a 32-bit one or one where
+//!    the loader cannot run, is re-targeted at the host copy of its dynamic
+//!    loader, with the program's guest path as the dynamic loader's argument;
 //! 3. the new argv is written on the tracee's stack and the registers point
 //!    at it.  `envp` is untouched.
 //!
@@ -19,10 +24,11 @@
 //! bwrap themselves is a nested launch, planned by [`nested`] and carried out
 //! by the trampoline in both modes.
 //!
-//! Known gaps: at the kernel level `/proc/<pid>/exe` and `AT_EXECFN` name the
-//! loader; the supervisor answers `readlink` on `/proc/self/exe` from the
-//! record kept here, but a program reading `AT_EXECFN` from its auxv sees the
-//! loader.
+//! Known gaps: at the kernel level `/proc/<pid>/exe` names the loader, or
+//! the dynamic loader; the supervisor answers `readlink` on `/proc/self/exe`
+//! from the record kept here.  A program the loader started reads the path
+//! its caller named as `AT_EXECFN`; one started by its dynamic loader reads
+//! the alias it was exec'd through.
 //!
 //! Both ABIs are handled: argv is read and written with the *caller's* pointer
 //! width (the kernel interprets `execve` arguments in the caller's ABI), and a
@@ -48,6 +54,15 @@ use std::sync::{Arc, Mutex};
 
 /// Upper bound on argv entries read from the tracee.
 const MAX_ARGV: usize = 1 << 18;
+/// `e_machine` of the host's programs, the ones the loader maps.
+#[cfg(target_arch = "x86_64")]
+const HOST_MACHINE: u16 = 62;
+/// `e_machine` of the host's programs, the ones the loader maps.
+#[cfg(target_arch = "aarch64")]
+const HOST_MACHINE: u16 = 183;
+/// Number of entries the loader takes before the program's own argument vector: its alias, the
+/// program and the path to report as `AT_EXECFN`.
+pub const LOADER_ARGS: usize = 3;
 /// Maximum nesting of `#!` interpreters (the kernel allows 4).
 const MAX_SHEBANG_DEPTH: usize = 4;
 
@@ -131,19 +146,29 @@ impl ExecPlan {
 /// Works out what to exec for a program the tracee named.
 ///
 /// `#!` scripts are expanded into interpreter plus argument, repeatedly,
-/// until an ELF is reached; a dynamically linked ELF is re-targeted at the
-/// host copy of its loader with the program's guest path as the loader's
-/// argument.  The loader takes the program's `$ORIGIN` from the path it is
-/// given, where the kernel would take it from the resolved executable, so a
-/// loader that accepts `--argv0` gets the canonical path and the name as
-/// typed separately; a loader without it uses the path as `argv[0]`, on
+/// until an ELF is reached.  A dynamically linked ELF of the host's machine
+/// is re-targeted at the shim's loader, given its alias, the program's
+/// canonical guest path, the path to report as `AT_EXECFN` (the one the
+/// caller named) and then the caller's argument vector whole; the loader
+/// maps the program where the kernel would, below the break, far from the
+/// libraries and from what the program maps later.  The dynamic loader then
+/// takes `$ORIGIN` from `/proc/self/exe`, answered with the canonical path.
+///
+/// Any other dynamically linked ELF is re-targeted at the host copy of its
+/// dynamic loader with the program's guest path as the dynamic loader's
+/// argument.  The dynamic loader takes the program's `$ORIGIN` from the
+/// path it is given, where the kernel would take it from the resolved
+/// executable, so one that accepts `--argv0` gets the canonical path and the
+/// name as typed separately; one without it uses the path as `argv[0]`, on
 /// which multi-call binaries (busybox) dispatch, so it gets the name as
 /// typed unless that name is dirfd-relative and meaningless after the
-/// rewrite.  The loader is reached through an alias named as the tracee
-/// named the program, which is where the kernel takes `comm` from, so a
-/// script keeps its own name rather than its interpreter's.  In the
-/// guest-stub restricted mode the program itself is the plan: the
-/// trampoline loads it and its interpreter the way the kernel would.
+/// rewrite.
+///
+/// Either loader is reached through an alias named as the tracee named the
+/// program, which is where the kernel takes `comm` from, so a script keeps
+/// its own name rather than its interpreter's.  In the guest-stub restricted
+/// mode the program itself is the plan: the trampoline loads it and its
+/// interpreter the way the kernel would.
 ///
 /// An exec of proot or bwrap is a nested launch and is planned by
 /// [`nested::plan`] in the view it describes.
@@ -244,9 +269,24 @@ pub fn plan_in(
         return nested::plan(ctx, view, pid, front, argv, env);
     }
     let mut changed = depth > 0 || argv_was_null;
+    let native = matches!(&kind, Ok(FileKind::Elf64(info)) if info.machine == HOST_MACHINE);
+    let loader = shim::loader_path().filter(|_| native && !fs.identity && !ctx.trap_mode());
     let (exec_path, new_argv): (Vec<u8>, Vec<Vec<u8>>) = match kind {
-        Ok(FileKind::Elf64(info)) | Ok(FileKind::Elf32(info)) => match info.interp {
-            Some(interp) if !fs.identity && !ctx.trap_mode() => {
+        Ok(FileKind::Elf64(info)) | Ok(FileKind::Elf32(info)) => match (info.interp, loader) {
+            (Some(_), Some(loader)) => {
+                let alias = loader_alias(loader.as_os_str().as_bytes(), exec_name(user_path, &guest_prog))
+                    .unwrap_or_else(|| loader.as_os_str().as_bytes().to_vec());
+                let execfn = if user_path.is_empty() {
+                    guest_prog.clone()
+                } else {
+                    user_path.to_vec()
+                };
+                let mut v = vec![alias.clone(), guest_prog.clone(), execfn, argv[0].clone()];
+                v.extend(argv[1..].iter().cloned());
+                changed = true;
+                (alias, v)
+            }
+            (Some(interp), None) if !fs.identity && !ctx.trap_mode() => {
                 let host_interp = translate_path(fs, pid, libc::AT_FDCWD, &interp, true)?;
                 let mut v = vec![host_interp.clone()];
                 let argv0_supported = loader_supports_argv0(&host_interp);
@@ -504,25 +544,22 @@ fn push_argv(
 /// A symlink to `host_interp` whose basename is the program's, for `execve`.
 ///
 /// The kernel names a process after the basename of the path it exec'd and
-/// exposes that path as `AT_EXECFN`.  Exec'ing the loader directly would make
-/// every dynamic program show up as `ld-linux-x86-64.so.2`, so the loader is
-/// reached through `<alias dir>/<hash of loader>/<program name>` instead.  One
+/// exposes that path as `AT_EXECFN`.  Exec'ing a loader directly would make
+/// every dynamic program show up as `ld-linux-x86-64.so.2` or `l`, so the
+/// loader is reached through `<alias dir>/<hash of loader>/<program name>`
+/// instead.  One
 /// alias per (loader, name), created on first use; the directory lives for
 /// the supervisor's life (see [`alias_dir`]).
 ///
 /// # Arguments
-/// * `host_interp` - Host path of the dynamic loader.
+/// * `host_interp` - Host path of the loader or the dynamic loader.
 /// * `name` - Name to give the alias, or a path whose last component is taken.
 ///
 /// # Returns
 /// The alias path, or `None` when the directory or link cannot be created.
 fn loader_alias(host_interp: &[u8], name: &[u8]) -> Option<Vec<u8>> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     let name = name.rsplit(|&b| b == b'/').next().filter(|n| !n.is_empty())?;
-    let mut h = DefaultHasher::new();
-    host_interp.hash(&mut h);
-    let dir = alias_dir().join(format!("{:016x}", h.finish()));
+    let dir = alias_subdir(host_interp);
     let link = dir.join(std::ffi::OsStr::from_bytes(name));
     match std::fs::read_link(&link) {
         Ok(target) if target.as_os_str().as_bytes() == host_interp => {}
@@ -541,6 +578,36 @@ fn loader_alias(host_interp: &[u8], name: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(link.as_os_str().as_bytes().to_vec())
+}
+
+/// The directory of the aliases of one target, named by a hash of its path.
+///
+/// # Arguments
+/// * `target` - Host path the aliases point to.
+///
+/// # Returns
+/// `<alias dir>/<hash of target>`.
+fn alias_subdir(target: &[u8]) -> std::path::PathBuf {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    target.hash(&mut h);
+    alias_dir().join(format!("{:016x}", h.finish()))
+}
+
+/// Whether `path` is an alias of the loader, the `argv[0]` of a program it loaded.
+///
+/// # Arguments
+/// * `path` - A path, typically the first entry of a process's command line.
+///
+/// # Returns
+/// `true` when `path` lies in the loader's alias directory.
+pub fn is_loader_alias(path: &[u8]) -> bool {
+    let Some(loader) = shim::loader_path() else {
+        return false;
+    };
+    let dir = alias_subdir(loader.as_os_str().as_bytes());
+    std::path::Path::new(std::ffi::OsStr::from_bytes(path)).parent() == Some(dir.as_path())
 }
 
 static ALIAS_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();

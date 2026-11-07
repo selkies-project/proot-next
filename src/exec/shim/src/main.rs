@@ -84,6 +84,17 @@ const FDS_MAX: usize = 32;
 /// `seccomp(2)` operation installing a filter.
 const SECCOMP_SET_MODE_FILTER: libc::c_long = 1;
 
+/// The role marker, read through [`role`]; the supervisor rewrites its last byte in the copy it
+/// installs as the loader.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "arm"
+))]
+#[used]
+static ROLE: [u8; 24] = *layout::ROLE_MARK;
+
 /// The record as read, which the plan's pointers point into.
 static mut RECORD: [u8; RECORD_MAX] = [0; RECORD_MAX];
 /// Whether the gate page is mapped, making [`sc`] go through the allow gate.
@@ -142,11 +153,95 @@ fn sc(nr: libc::c_long, a: [usize; 6]) -> isize {
         return stub::sys(nr as isize, a);
     }
     let r = unsafe { libc::syscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]) };
-    if r < 0 {
+    if r == -1 {
         -(unsafe { *libc::__errno_location() } as isize)
     } else {
         r as isize
     }
+}
+
+/// The role of this copy, the last byte of [`ROLE`], read so the compiler cannot assume it.
+///
+/// # Returns
+/// [`layout::ROLE_EXEC`] or [`layout::ROLE_LOADER`].
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "arm"
+))]
+fn role() -> u8 {
+    unsafe { core::ptr::read_volatile(&ROLE[ROLE.len() - 1]) }
+}
+
+/// The loader's entry: loads the program its arguments name in place of an exec, so that it lands
+/// where the kernel would put it rather than where the guest's dynamic loader would map a
+/// program given as its argument.
+///
+/// The arguments are the alias it was exec'd through, the guest path of the program, the path to
+/// report as `AT_EXECFN`, then the program's own argument vector.  Its syscalls are the guest's,
+/// translated by the supervisor like any other: the program and the interpreter its `PT_INTERP`
+/// names are opened by their guest paths.
+///
+/// # Arguments
+/// * `argc` - Number of entries in `argv`.
+/// * `argv` - The arguments.
+/// * `envp` - The environment, passed on.
+///
+/// # Returns
+/// An exit status, only when the program could not be loaded.
+///
+/// # Safety
+/// `argv` and `envp` must be the vectors the kernel passed.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "arm"
+))]
+unsafe fn load(argc: i32, argv: *const *const c_char, envp: *const *const c_char) -> i32 {
+    if argc < 4 {
+        say(&[b"proot: loader: no program to load\n"]);
+        return 126;
+    }
+    unsafe {
+        let prog = *argv.add(1);
+        let path = core::slice::from_raw_parts(prog.cast::<u8>(), libc::strlen(prog));
+        let fd = open(prog, libc::O_RDONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return cannot(path, b"execute", -fd);
+        }
+        let f = loader::run(fd, argc as usize - 3, argv.add(3), envp, envp, *argv.add(2));
+        load_failed(path, f)
+    }
+}
+
+/// Reports a program the loader could not load.
+///
+/// # Arguments
+/// * `path` - The program.
+/// * `f` - Why.
+///
+/// # Returns
+/// 127 for a missing file, else 126.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "arm"
+))]
+fn load_failed(path: &[u8], f: loader::Failure) -> i32 {
+    let mut ebuf = [0u8; 20];
+    say(&[
+        b"proot: exec shim: cannot load ",
+        path,
+        b": ",
+        f.what,
+        b" (errno ",
+        itoa(f.errno as u64, &mut ebuf),
+        b")\n",
+    ]);
+    if f.errno == libc::ENOENT { 127 } else { 126 }
 }
 
 /// `open` through [`sc`].
@@ -375,6 +470,9 @@ extern "C" fn main(argc: i32, argv: *const *const c_char, envp: *const *const c_
             target_arch = "arm"
         ))]
         {
+            if role() == layout::ROLE_LOADER {
+                return load(argc, argv, envp);
+            }
             GATES = stub::map_gates();
         }
         let pid = libc::getpid() as u64;
@@ -675,17 +773,7 @@ extern "C" fn main(argc: i32, argv: *const *const c_char, envp: *const *const c_
                 return cannot(path, b"execute", -fd);
             }
             let f = loader::run(fd, plan.argc, out.cast_const(), env, envp, plan.execfn);
-            let mut ebuf = [0u8; 20];
-            say(&[
-                b"proot: exec shim: cannot load ",
-                path,
-                b": ",
-                f.what,
-                b" (errno ",
-                itoa(f.errno as u64, &mut ebuf),
-                b")\n",
-            ]);
-            return if f.errno == libc::ENOENT { 127 } else { 126 };
+            return load_failed(path, f);
         }
         libc::execve(plan.path, out.cast_const(), env);
         cannot(path, b"execute", *libc::__errno_location())

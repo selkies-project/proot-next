@@ -533,20 +533,39 @@ instead would need the tracee's directory position, which only
 ## execve
 
 The kernel resolves `PT_INTERP` itself, which would escape the guest.  The
-exec handler translates the program, expands `#!` interpreters, reads
-`PT_INTERP`, and re-targets the exec at the host path of the guest's dynamic
-loader with the program as its argument (`--argv0` on glibc).  Three things
-the kernel would have taken from the program are taken care of: the loader is
+exec handler translates the program, expands `#!` interpreters and reads
+`PT_INTERP`.  A dynamically linked program of the host's machine is exec'd
+through `l`, a copy of the exec trampoline whose role byte the supervisor
+rewrites when it installs it.  `l` is given the program's canonical guest
+path, the path the caller named and then the caller's argv; it opens the
+program and its interpreter by guest path, through ordinary translated
+`openat`s, maps them the way `binfmt_elf` would (see the guest-stub loader
+below) and jumps to the interpreter with an auxiliary vector describing the
+program, so the dynamic loader runs as if the kernel had loaded it and takes
+`$ORIGIN` from `/proc/self/exe`.  The program goes where the kernel puts a
+position-independent program: `l` was exec'd without an interpreter, so the
+kernel moved its break down to `ELF_ET_DYN_BASE`, and the program is mapped
+right below that break, terabytes from the libraries and from everything
+mapped later.  Handing the program to the dynamic loader as an argument
+instead has the dynamic loader map it among the libraries, and a JIT that
+calls into its program with a 32-bit displacement whenever the target is
+less than 4 GiB ahead then aborts once its code cache lands 2 to 4 GiB below
+the program.
+
+Programs of another class or machine, and every program where `l` does not
+run, have the exec re-targeted at the host path of the guest's dynamic
+loader with the program as its argument (`--argv0` on glibc); that loader is
 given the resolved program path, since that is where it takes `$ORIGIN`
 from (Electron apps started through a `/usr/bin` symlink find their bundled
-libraries that way); it is reached through an alias named as the tracee
-named the program, so `comm` reads as the kernel would set it, a script
-keeping its own name (glibc's loader reports the program path in
-`AT_EXECFN` by itself); and `/proc/<pid>/cmdline` is served
-with the loader prefix removed, so `ps` and `pgrep -f` see the argv the
-tracee passed.  The guest path of the program is remembered per process so
-`readlink(/proc/self/exe)` is answered truthfully.  Known gap: the kernel's
-own notion of the exe, seen from outside the guest, is the alias.
+libraries that way), and glibc's reports the program path in `AT_EXECFN` by
+itself, where `l` writes the path the caller named.  Either loader is reached
+through an alias named as the tracee named the program, so `comm` reads as
+the kernel would set it, a script keeping its own name, and
+`/proc/<pid>/cmdline` is served with the loader prefix removed, so `ps` and
+`pgrep -f` see the argv the tracee passed.  The guest path of the program is
+remembered per process so `readlink(/proc/self/exe)` is answered truthfully.
+Known gap: the kernel's own notion of the exe, seen from outside the guest,
+is the alias.
 
 ## Looking like nothing is there
 

@@ -18,6 +18,11 @@
 //! it (see `guest_stub`); its record then also names the mailbox descriptor,
 //! the `AT_EXECFN` path and the process name, see [`Trapped`].
 //!
+//! Outside the guest-stub mode a dynamically linked program of the host's
+//! machine is exec'd through a copy of the trampoline installed as `l`, the
+//! loader, which maps the program where the kernel would and its interpreter
+//! after it (see [`loader_path`] and `ExecPlan`).
+//!
 //! The binaries under `shim/bin/` are built by `shim/build.sh` from the
 //! `no_std` crate in `shim/` and embedded here; one per host architecture.
 
@@ -47,6 +52,9 @@ static INSTALLED: OnceLock<PathBuf> = OnceLock::new();
 
 /// Whether the i386 trampoline was installed and runs here.
 static HAS_32BIT: OnceLock<bool> = OnceLock::new();
+
+/// Whether the loader was installed and runs here.
+static HAS_LOADER: OnceLock<bool> = OnceLock::new();
 
 /// Installs the trampoline and returns the directory holding it.
 ///
@@ -115,7 +123,46 @@ fn install_in(dir: &Path) -> std::io::Result<()> {
             runs(crate::guest_stub::layout::SHIM32_NAME, bytes).is_ok_and(|o| o.status.code() == Some(126));
         let _ = HAS_32BIT.set(ok);
     }
+    let ok = loader_bytes(SHIM).is_some_and(|bytes| {
+        runs(crate::guest_stub::layout::LOADER_NAME, &bytes).is_ok_and(|o| o.status.code() == Some(126))
+    });
+    let _ = HAS_LOADER.set(ok);
     Ok(())
+}
+
+/// The loader: a copy of the trampoline `shim` with the last byte of its role marker rewritten.
+///
+/// # Arguments
+/// * `shim` - The trampoline's file.
+///
+/// # Returns
+/// The copy, or `None` when the marker is not in the file exactly once.
+fn loader_bytes(shim: &[u8]) -> Option<Vec<u8>> {
+    use crate::guest_stub::layout::{ROLE_LOADER, ROLE_MARK};
+    let mut at = shim
+        .windows(ROLE_MARK.len())
+        .enumerate()
+        .filter(|(_, w)| *w == ROLE_MARK);
+    let (first, _) = at.next()?;
+    if at.next().is_some() {
+        return None;
+    }
+    let mut bytes = shim.to_vec();
+    bytes[first + ROLE_MARK.len() - 1] = ROLE_LOADER;
+    Some(bytes)
+}
+
+/// Path of the installed loader, when it runs here.
+///
+/// # Returns
+/// The loader's path, or `None` before [`install`] or where it did not run.
+pub fn loader_path() -> Option<PathBuf> {
+    if !HAS_LOADER.get().copied().unwrap_or(false) {
+        return None;
+    }
+    INSTALLED
+        .get()
+        .map(|d| d.join(crate::guest_stub::layout::LOADER_NAME))
 }
 
 /// Whether the 32-bit trampoline is installed and runs here, which takes a
