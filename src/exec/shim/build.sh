@@ -10,7 +10,8 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$here/bin" "$here/.cargo"
-cp "$here/.cargo-config.toml" "$here/.cargo/config.toml"
+crt="$(cd "$here" && rustc --print target-libdir --target aarch64-unknown-linux-musl)/self-contained"
+sed "s|@AARCH64_CRT@|$crt|g" "$here/.cargo-config.toml" > "$here/.cargo/config.toml"
 for arch in ${@:-x86_64 i686 aarch64 armv7}; do
   case $arch in
     armv7) target=armv7-unknown-linux-musleabihf ;;

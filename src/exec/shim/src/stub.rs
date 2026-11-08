@@ -561,10 +561,10 @@ pub fn install(mail_fd: i32) -> Result<(), i32> {
         [stack.as_ptr() as usize, 0, 0, 0, 0, 0],
     );
     let act = KernelAction {
-        handler: handler as usize,
+        handler: handler as *const () as usize,
         flags: (libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_NODEFER | libc::SA_RESTART) as usize
             | SA_RESTORER,
-        restorer: proot_stub_restore as usize,
+        restorer: proot_stub_restore as *const () as usize,
         mask: [0, 0],
     };
     let mut old = KernelAction::DEFAULT;
@@ -1126,7 +1126,7 @@ unsafe fn chain(sig: i32, si: *mut u8, uc: *mut u8) {
         SIG_DFL => {
             let dfl = KernelAction {
                 flags: SA_RESTORER,
-                restorer: proot_stub_restore as usize,
+                restorer: proot_stub_restore as *const () as usize,
                 ..KernelAction::DEFAULT
             };
             sys(

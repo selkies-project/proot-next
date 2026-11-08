@@ -1,12 +1,15 @@
-# Copied to .cargo/config.toml by build.sh: self-contained static linking, no system cross toolchain.
+# Copied to .cargo/config.toml by build.sh, which fills in @AARCH64_CRT@: self-contained static linking, no system cross toolchain.
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "linker=rust-lld", "-C", "relocation-model=pie"]
 
-# rustc links aarch64 musl statically but not position independent either,
-# so the aarch64 shim sits within 4 GiB of address 0, which its startup code
-# needs, at the 32-bit shims' address: above non-PIE programs, far below PIE ones.
+# rustc has no static position-independent output for aarch64 musl, so the
+# aarch64 shim is linked as one by hand: no CRT objects from rustc, and
+# musl's self-relocating rcrt1.o with the CRT objects rustc would pick for
+# x86_64, from the directory build.sh puts in place of @AARCH64_CRT@.  The
+# kernel then places it in the mmap area and moves its break to where
+# position-independent programs go, as for x86_64.
 [target.aarch64-unknown-linux-musl]
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "linker=rust-lld", "-C", "relocation-model=static", "-C", "link-arg=--image-base=0xd0000000"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=no", "-C", "linker=rust-lld", "-C", "relocation-model=pie", "-C", "link-arg=-pie", "-C", "link-arg=--no-dynamic-linker", "-C", "link-arg=-z", "-C", "link-arg=text", "-C", "link-arg=-L@AARCH64_CRT@", "-C", "link-arg=@AARCH64_CRT@/rcrt1.o", "-C", "link-arg=@AARCH64_CRT@/crti.o", "-C", "link-arg=@AARCH64_CRT@/crtbeginS.o", "-C", "link-arg=@AARCH64_CRT@/crtendS.o", "-C", "link-arg=@AARCH64_CRT@/crtn.o"]
 
 # Like i686: static, at an address 32-bit ARM programs leave alone.
 [target.armv7-unknown-linux-musleabihf]

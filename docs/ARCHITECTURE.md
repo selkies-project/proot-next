@@ -336,11 +336,12 @@ through the allow gate with the caller's own vectors.  For a 32-bit
 program the record says so, and `e` execs `e32`, the i386 or 32-bit ARM
 build of the same trampoline, with its own vectors, leaving the record for
 it; the other way round, a 32-bit process's stub execs `e` like any other.
-rustc links i686, armv7 and aarch64 musl statically but not
-position-independent, so those trampolines are linked at `0xd0000000`,
-above where fixed-address programs load and far below position-independent
-ones (the aarch64 startup code also needs to be within 4 GiB of address
-0); the x86_64 one is position-independent.
+rustc links i686 and armv7 musl statically but not position-independent,
+so those trampolines are linked at `0xd0000000`, above where fixed-address
+programs load and far below position-independent ones.  The x86_64 one is
+position-independent, and so is the aarch64 one, for which rustc has no
+static position-independent output either: `build.sh` links it by hand with
+musl's self-relocating `rcrt1.o`.
 
 The trampoline maps the gates first and makes its own syscalls through the
 allow gate until the stub is armed, maps the mailbox from the descriptor
@@ -546,7 +547,9 @@ program, so the dynamic loader runs as if the kernel had loaded it and takes
 position-independent program: `l` was exec'd without an interpreter, so the
 kernel moved its break down to `ELF_ET_DYN_BASE`, and the program is mapped
 right below that break, terabytes from the libraries and from everything
-mapped later.  Handing the program to the dynamic loader as an argument
+mapped later.  The kernel moves the break only for a position-independent
+executable; a fixed-address `l` keeps its break right after itself, and the
+program, mapped at `ELF_ET_DYN_BASE` all the same, lies above its own heap.  Handing the program to the dynamic loader as an argument
 instead has the dynamic loader map it among the libraries, and a JIT that
 calls into its program with a 32-bit displacement whenever the target is
 less than 4 GiB ahead then aborts once its code cache lands 2 to 4 GiB below
